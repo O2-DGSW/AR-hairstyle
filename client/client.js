@@ -81,6 +81,64 @@ function fillSelect(sel, names) {
 }
 
 // 페이지 로드 즉시 목록을 채운다. 연결을 기다리지 않는다.
+/* ---- 참고 헤어스타일 등록/삭제 ----
+ * GAN 의 입력은 "각도별 에셋" 이 아니라 참고사진 한 장이다. 그래서 다른
+ * 헤어스타일을 시험하려면 여기서 사진을 갈아끼우면 된다. 서버가 등록 시점에
+ * 눈 간격을 재서 확대 배율을 알려준다 - 얼굴이 작은 사진은 1024 로 늘려 쓰느라
+ * 헤어 디테일이 뭉개지기 때문이다. */
+const refFile = el("ref-file"), refUpBtn = el("ref-upload"),
+      refDelBtn = el("ref-delete"), refStatus = el("ref-status");
+
+function refSay(msg, color) {
+  refStatus.textContent = msg;
+  refStatus.style.color = color || "#888";
+}
+
+refUpBtn.addEventListener("click", async () => {
+  const f = refFile.files && refFile.files[0];
+  if (!f) return refSay("사진 파일을 먼저 고르세요.", "#ffd400");
+  const fd = new FormData();
+  fd.append("file", f);
+  refUpBtn.disabled = true;
+  refSay(`업로드 중... (${(f.size / 1048576).toFixed(1)}MB)`);
+  try {
+    const r = await fetch("/references", { method: "POST", body: fd });
+    const d = await r.json();
+    if (!r.ok) {
+      refSay(d.message || `등록 실패 (HTTP ${r.status})`, "#ff5f56");
+    } else {
+      fillSelect(refSel, d.references);
+      refSel.value = d.name;
+      refsLoaded = true;
+      const base = `등록됨: ${d.name} · ${d.width}x${d.height} · ` +
+                   `눈 간격 ${d.eye_px}px · GAN 입력으로 ${d.upscale}배 확대`;
+      refSay(d.warning ? `${base}\n${d.warning}` : base,
+             d.warning ? "#ffd400" : "#4ade80");
+    }
+  } catch (e) {
+    refSay(`등록 실패: ${e.message}`, "#ff5f56");
+  } finally {
+    refUpBtn.disabled = false;
+  }
+});
+
+refDelBtn.addEventListener("click", async () => {
+  const name = refSel.value;
+  if (!name) return;
+  refDelBtn.disabled = true;
+  try {
+    const r = await fetch(`/references/${encodeURIComponent(name)}`,
+                          { method: "DELETE" });
+    const d = await r.json();
+    if (!r.ok) refSay(d.message || `삭제 실패 (HTTP ${r.status})`, "#ff5f56");
+    else { fillSelect(refSel, d.references); refSay(`삭제됨: ${d.deleted}`); }
+  } catch (e) {
+    refSay(`삭제 실패: ${e.message}`, "#ff5f56");
+  } finally {
+    refDelBtn.disabled = false;
+  }
+});
+
 (async function loadLists() {
   try {
     const r = await fetch("/references");

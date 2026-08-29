@@ -132,6 +132,22 @@ class Config:
     #: dlib 이 안정적으로 검출하는 눈 간격(px).
     target_eye_px: int = 130
 
+    #: 업로드된 참고사진을 두는 곳. server/references/ 를 그대로 쓰지 않는 이유는
+    #: 그 디렉터리가 git 에 추적되기 때문이다 - 업로드는 남의 얼굴 사진이라
+    #: 실수로 커밋되면 안 된다. 여기는 .gitignore 로 막혀 있다.
+    reference_upload_dir: str = os.path.join(ROOT, "references", "uploads")
+    #: 업로드 1장의 최대 크기(MB).
+    reference_max_mb: float = 20.0
+    #: 참고사진의 최소 눈 간격(px). 이보다 작으면 거절한다.
+    #:
+    #: GAN 은 참고사진을 FFHQ 1024(눈 간격 ~256px)로 정렬해서 쓴다. 눈 간격이
+    #: 작으면 그만큼 업스케일되어 헤어스타일 디테일이 뭉개진 채로 들어간다.
+    #: 실측: 기존 korean-frontal.png 은 눈 간격이 50px 밖에 안 돼 5배 업스케일된다
+    #: (korean-layered.png 은 320px). 그래서 결과가 흐릿했다.
+    reference_min_eye_px: int = 120
+    #: 이보다 작으면 경고만 한다(거절하지는 않음).
+    reference_warn_eye_px: int = 200
+
     #: GAN 이 만든 헤어에 곱하는 크기 보정.
     #:
     #: HairFastGAN 은 머리보다 큰 헤어를 만드는 경향이 있다. 실측으로 재봤다 -

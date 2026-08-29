@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
@@ -948,6 +949,133 @@ async def references_list(request):
     })
 
 
+_REF_NAME_OK = re.compile(r"^[A-Za-z0-9가-힣._-]{1,60}$")
+
+
+def _inspect_reference(img_bgr):
+    """참고사진의 품질을 잰다. (눈 간격 px, 경고 문구 또는 None)
+
+    GAN 은 참고사진을 FFHQ 1024(눈 간격 ~256px)로 정렬해서 쓴다. 눈 간격이
+    작으면 그만큼 업스케일되어 **헤어스타일 디테일이 뭉개진 채로** 들어간다.
+    기존 korean-frontal.png 이 50px 이라 5배 확대되고 있었고, 그게 결과가
+    흐릿했던 원인 중 하나다. 그래서 올릴 때 바로 알려준다.
+    """
+    from face_pose import FacePose
+    with FacePose() as poser:
+        pose = poser.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), 0)
+    if pose is None:
+        return None, "얼굴을 찾지 못했습니다."
+    return float(pose["d_measured"]), None
+
+
+async def references_upload(request):
+    """참고 헤어스타일 사진 업로드. multipart/form-data 의 'file' 필드.
+
+    선택 인자: 'name' (없으면 파일명에서 딴다)
+    """
+    app = request.app["state"]
+    cfg = app.cfg
+    limit = int(cfg.reference_max_mb * 1024 * 1024)
+    if request.content_length and request.content_length > limit:
+        return web.json_response(
+            {"error": "too_large",
+             "message": f"파일이 너무 큽니다 (상한 {cfg.reference_max_mb:.0f}MB)"},
+            status=413)
+
+    reader = await request.multipart()
+    data, name = None, None
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "file":
+            name = name or os.path.splitext(os.path.basename(part.filename or ""))[0]
+            data = await part.read(decode=False)
+            if len(data) > limit:
+                return web.json_response(
+                    {"error": "too_large", "message": "파일이 너무 큽니다"}, status=413)
+        elif part.name == "name":
+            name = (await part.text()).strip() or name
+
+    if not data:
+        return web.json_response(
+            {"error": "no_file", "message": "file 필드가 없습니다"}, status=400)
+
+    name = (name or "ref").strip().replace(" ", "_")
+    if not _REF_NAME_OK.match(name):
+        return web.json_response(
+            {"error": "bad_name",
+             "message": "이름에 쓸 수 없는 문자가 있습니다 (영문/숫자/한글/._- 만)"},
+            status=400)
+    if name in app.references:
+        # 덮어쓰기를 막는다. GAN 워커가 참고사진을 **경로로** 캐시하기 때문에
+        # (정규화 + FFHQ 정렬 결과), 같은 경로의 내용이 바뀌면 낡은 캐시가
+        # 계속 쓰인다. 다른 이름으로 올리게 하는 편이 안전하다.
+        return web.json_response(
+            {"error": "exists", "message": f"같은 이름이 이미 있습니다: {name}"},
+            status=409)
+
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return web.json_response(
+            {"error": "bad_image", "message": "이미지로 읽을 수 없습니다"}, status=400)
+
+    loop = asyncio.get_event_loop()
+    eye_px, err = await loop.run_in_executor(app.pose_executor, _inspect_reference, img)
+    if err:
+        return web.json_response({"error": "no_face", "message": err}, status=400)
+    if eye_px < cfg.reference_min_eye_px:
+        return web.json_response({
+            "error": "too_small",
+            "message": (f"얼굴이 너무 작습니다 (눈 간격 {eye_px:.0f}px, "
+                        f"최소 {cfg.reference_min_eye_px}px). GAN 이 이 사진을 "
+                        f"1024 로 확대해 쓰기 때문에 헤어 디테일이 뭉개집니다."),
+            "eye_px": round(eye_px, 1),
+        }, status=400)
+
+    os.makedirs(cfg.reference_upload_dir, exist_ok=True)
+    path = os.path.join(cfg.reference_upload_dir, name + ".png")
+    if not cv2.imwrite(path, img):
+        return web.json_response(
+            {"error": "write_failed", "message": "저장에 실패했습니다"}, status=500)
+
+    app.references = gan_process.list_references()
+    warn = None
+    if eye_px < cfg.reference_warn_eye_px:
+        warn = (f"눈 간격 {eye_px:.0f}px 은 권장({cfg.reference_warn_eye_px}px)보다 "
+                f"작습니다. 1024 로 {256/eye_px:.1f}배 확대되어 디테일이 줄어듭니다.")
+    logger.info("참고사진 등록: %s (%dx%d, 눈 간격 %.0fpx)",
+                name, img.shape[1], img.shape[0], eye_px)
+    return web.json_response({
+        "name": name, "width": img.shape[1], "height": img.shape[0],
+        "eye_px": round(eye_px, 1), "upscale": round(256.0 / eye_px, 2),
+        "warning": warn, "references": list(app.references.keys()),
+    })
+
+
+async def references_delete(request):
+    """업로드된 참고사진 삭제. 손으로 넣어 둔 것은 지우지 않는다."""
+    app = request.app["state"]
+    name = request.match_info["name"]
+    if not _REF_NAME_OK.match(name):
+        raise web.HTTPNotFound()
+    path = app.references.get(name)
+    updir = os.path.abspath(app.cfg.reference_upload_dir)
+    if not path or os.path.commonpath([os.path.abspath(path), updir]) != updir:
+        return web.json_response(
+            {"error": "not_uploaded",
+             "message": "업로드된 참고사진만 지울 수 있습니다"}, status=403)
+    try:
+        os.remove(path)
+    except OSError as e:
+        return web.json_response({"error": "delete_failed", "message": str(e)},
+                                 status=500)
+    app.references = gan_process.list_references()
+    logger.info("참고사진 삭제: %s", name)
+    return web.json_response({"deleted": name,
+                              "references": list(app.references.keys())})
+
+
 async def captures_file(request):
     name = request.match_info["name"]
     if "/" in name or "\\" in name or ".." in name:
@@ -1455,6 +1583,8 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
     app.router.add_get("/", index)
     app.router.add_post("/offer", offer)
     app.router.add_get("/references", references_list)
+    app.router.add_post("/references", references_upload)
+    app.router.add_delete("/references/{name}", references_delete)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", readyz)
     app.router.add_get("/metrics", metrics_handler)

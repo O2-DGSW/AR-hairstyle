@@ -159,6 +159,14 @@
       <label style="font-size:12.5px;color:#bbb">참고 헤어스타일
         <select id="reference" style="width:100%;margin-top:4px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:4px"></select>
       </label>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:8px">
+        <input type="file" id="ref-file" accept="image/*"
+               style="flex:1;min-width:0;font-size:11.5px;color:#999">
+        <button id="ref-upload" style="padding:0 10px;font-size:12px">등록</button>
+        <button id="ref-delete" title="업로드한 사진만 삭제됩니다"
+                style="padding:0 10px;font-size:12px;background:#3a2020">삭제</button>
+      </div>
+      <div id="ref-status" style="font-size:11.5px;color:#888;margin-top:6px;line-height:1.5;white-space:pre-line"></div>
       <div id="shoot-status" style="font-size:12px;color:#888;margin-top:10px;line-height:1.5">
         실시간 미리보기로 각도를 맞춘 뒤 [사진 찍기]를 누르세요.
       </div>

@@ -253,12 +253,22 @@ class GanWorker:
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR), took
 
 
+REF_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
 def list_references():
-    """server/references/*.jpg|png — GAN 은 오려낸 에셋이 아니라 원본 사진이 필요하다."""
-    if not os.path.isdir(REF_DIR):
-        return {}
+    """참고사진 목록 {이름: 경로}. GAN 은 오려낸 에셋이 아니라 원본 사진이 필요하다.
+
+    두 곳을 본다:
+      server/references/          손으로 넣어 둔 것 (git 추적)
+      server/references/uploads/  API 로 올라온 것 (git 제외 - 남의 얼굴 사진)
+    이름이 겹치면 업로드가 이긴다.
+    """
     out = {}
-    for fn in sorted(os.listdir(REF_DIR)):
-        if fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-            out[os.path.splitext(fn)[0]] = os.path.join(REF_DIR, fn)
+    for d in (REF_DIR, CONFIG.reference_upload_dir):
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if fn.lower().endswith(REF_EXTS):
+                out[os.path.splitext(fn)[0]] = os.path.join(d, fn)
     return out
