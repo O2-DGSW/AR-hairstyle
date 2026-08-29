@@ -602,7 +602,7 @@ def _dir_size_mb(path) -> float:
 # ---------------------------------------------------------------------------
 
 async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
-                                  yaw=None, bank=None):
+                                  yaw=None, bank=None, livebank=None):
     """GAN 결과 이미지에서 실시간 워핑용 헤어 에셋을 추출해 **이 세션에** 등록한다.
 
     yaw/bank 를 주면 다각도 뱅크의 한 칸으로 등록된다. 오프라인
@@ -641,6 +641,25 @@ async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
 
     asset.yaw = yaw
     asset.bank = bank
+
+    # 크기 정규화. 이게 없으면 각도 칸이 sec(yaw) 배로 부풀어 보인다.
+    #
+    # 렌더 배율은 (라이브 눈간격 / D_asset) 인데, D_asset 은 그 칸을 구울 때의
+    # **투영된** 눈 간격이라 고개를 돌린 각도일수록 짧다. 그대로 두면 나눗셈이
+    # 작아져서 헤어가 커진다. 오프라인 뱅크는 JSON 의 scaleAdjust 로 이걸
+    # 잡아뒀는데 라이브 뱅크는 아무도 설정하지 않아 전부 1.0 이었다.
+    # (증상: 왼쪽으로 크게 돌렸을 때 끝 칸의 헤어가 유독 커진다)
+    #
+    # 뱅크는 정면 칸부터 굽는다(run_bank_generation 이 abs 로 정렬). 그래서
+    # 첫 칸의 눈 간격을 기준 L 로 잡고 나머지를 그에 맞춘다.
+    d_asset = float(np.linalg.norm(np.asarray(asset.eye_r) - np.asarray(asset.eye_l)))
+    norm = 1.0
+    if livebank is not None and d_asset > 1e-3:
+        if livebank.ref_eye_len is None:
+            livebank.ref_eye_len = d_asset
+        norm = d_asset / livebank.ref_eye_len
+    asset.scale_adjust = norm * state.cfg.gan_asset_scale
+
     state.registry.add(asset)
     app.metrics.assets_generated_total += 1
 
@@ -691,6 +710,9 @@ class LiveBank:
         # generate: 모은 걸로 GAN 을 도는 중
         self.phase = "collect"
         self.frames = {}          # target -> 캡처된 원본 프레임
+        # 첫 칸(정면)의 눈 간격. 나머지 칸의 크기를 여기에 맞춰 정규화한다.
+        # build_asset_from_result 가 채운다.
+        self.ref_eye_len = None
 
     def next_target(self):
         """남은 칸 중 정면에 가까운 것부터. 정면이 가장 자주 보이는 각도다."""
@@ -756,7 +778,8 @@ async def run_bank_bucket(state: PeerState, lb: LiveBank, target: float, frame):
         app.metrics.gan_swaps_total += 1
         app.metrics.gan.observe(float(gan_ms))
         name = await build_asset_from_result(
-            state, result, lb.reference, yaw=float(target), bank=lb.name)
+            state, result, lb.reference, yaw=float(target), bank=lb.name,
+            livebank=lb)
         if not name:
             lb.status[target] = "failed"
             report(status="error", message=f"{target:+.0f}° 에서 머리를 찾지 못했습니다")
