@@ -62,7 +62,25 @@ class FacePose:
 
     @staticmethod
     def _euler(m):
-        """column-major 4x4 -> (yaw, pitch, roll) 도 단위."""
+        """4x4 flat -> (yaw, pitch, roll) 도 단위.
+
+        알려진 문제 (지금 고치지 않는다)
+        --------------------------------
+        아래는 column-major 를 가정하고 m[0], m[1], m[2], m[6], m[10] 을 읽는데,
+        MediaPipe 가 주는 행렬은 실제로는 **row-major** 다(tz 주석 참고).
+        그래서 회전행렬의 **전치**를 읽고 있고, 전치는 곧 역회전이라
+        **yaw/pitch/roll 의 부호가 뒤집혀 있다**(크기는 맞다).
+
+        그런데 이 부호는 지금 **일관되게** 뒤집혀 있다. 뱅크를 구울 때도
+        (make_asset_bank), 런타임에 칸을 고를 때도(pick_by_yaw_stable) 같은
+        함수를 쓰므로 같은 실제 포즈에 같은 에셋이 붙는다. 즉 기능상 문제가
+        없다.
+
+        여기서 부호만 고치면 런타임 yaw 가 뒤집혀서 **이미 구워진 뱅크의 라벨과
+        어긋난다** - 왼쪽으로 돌렸는데 오른쪽 칸이 붙는다. 고치려면 뱅크 JSON 의
+        yaw/measuredYaw 와 파일명을 함께 뒤집어야 하므로, 뱅크를 다시 구울 때
+        같이 처리한다.
+        """
         r00, r10, r20 = m[0], m[1], m[2]
         r21, r22 = m[6], m[10]
         deg = 180.0 / math.pi
@@ -112,7 +130,22 @@ class FacePose:
             m = np.asarray(res.facial_transformation_matrixes[0].data,
                            dtype=np.float32).reshape(-1)
             yaw, pitch, roll = self._euler(m)
-            tz = abs(float(m[14]))     # column-major 4x4 의 translation z
+            # MediaPipe 의 4x4 는 **row-major** 다. 평행이동이 마지막 '열'
+            # (인덱스 3, 7, 11)에 들어 있다. 실측으로 확인한 실제 행렬:
+            #     마지막 행 [0, 0, 0, 1]      <- 여기가 m[12..15]
+            #     마지막 열 [4.13, -2.08, -51.76, 1]
+            #
+            # 예전에는 column-major 로 보고 m[14] 를 읽었는데, 그 자리는 바닥 행의
+            # 0 이라 **tz 가 항상 0.0** 이었다. 그러면 아래 캘리브레이션 조건
+            # (tz > 1e-3)이 영원히 거짓이라 K 가 안 잡히고 d_corrected 가
+            # d_measured 를 그대로 통과했다. 즉 §4.7 의 거리 보정이 통째로
+            # 죽은 채로 돌고 있었다.
+            #
+            # 그 결과가 "고개를 완전히 돌리면 헤어가 작아진다" 였다. 눈 간격은
+            # 투영값이라 yaw 로 짧아지는데(실측: 정면 50.9px -> +60도에서 22.8px,
+            # 44.8%) 되돌릴 방법이 없으니 헤어가 그대로 반토막 났다.
+            # m[11] 로 고치면 전 구간 92.8~100.4% 로 유지된다.
+            tz = abs(float(m[11]))
 
         # --- 거리 기반 스케일 정규화 ---
         d_corrected = d_measured
