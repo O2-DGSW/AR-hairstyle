@@ -600,8 +600,24 @@ class GpuFaceParser:
             # 좌표계는 둘 다 이미지 픽셀이라 그대로 바꿔 끼울 수 있다.
             eye_l = eye_r = None
             if pose is not None:
-                eye_l, eye_r = pose["eye_l"], pose["eye_r"]
-                anchor_src = "landmark"
+                # 거리 보정을 **앵커 자체에** 반영한다. 눈 중점과 축 방향은
+                # 관측값 그대로 두고 두 점 사이 거리만 d_corrected 로 바꾼다.
+                #
+                # 예전에는 관측 눈 2점을 그대로 앵커로 쓰고, 크기만 나중에
+                # gain = d_corrected/d_measured 로 곱했다. 그런데 앵커는 아래에서
+                # **평활화**되고 gain 은 평활화되지 않은 순간값이라, 최종 배율이
+                #     (d_smoothed / D_asset) x (d_corrected / d_measured)
+                # 즉 d_smoothed / d_measured 에 비례했다. 정지 상태에서는 둘이
+                # 같아 상쇄되지만 고개를 빠르게 돌리면 d_measured 는 즉시 줄고
+                # (50->25) 평활화된 값은 뒤따라가느라 45 쯤에 머문다. 그 순간
+                # 배율이 1.8배로 튀어 헤어가 갑자기 커졌다(녹화로 확인).
+                # 완전 측면에서 d_measured -> 0 이면 아예 발산한다.
+                #
+                # 보정을 앵커에 먼저 넣고 그 결과를 평활화하면 값의 출처가
+                # 하나가 되어 이 불일치가 원천적으로 사라진다.
+                from face_pose import eyes_scaled
+                eye_l, eye_r = eyes_scaled(pose)
+                anchor_src = "landmark +거리보정"
             if eye_l is None:
                 # 얼굴을 놓친 프레임: 세그멘테이션 쪽으로 버틴다.
                 cent = self._centroids(cls, h, w)
@@ -616,13 +632,10 @@ class GpuFaceParser:
                     eye_l, eye_r = smoother.update(eye_l, eye_r)
                 eyes = (eye_l, eye_r)
 
-            # 크기: 랜드마커의 거리 기반 보정 배율. yaw로 눈 간격이 단축된 만큼을
-            # 되돌린다. 무차원 비율이라 세그멘테이션 눈 간격에 그대로 곱하면 된다.
+            # 거리 보정은 위에서 앵커에 이미 들어갔다(eyes_scaled). 여기서 또
+            # 곱하면 이중 적용이다. 세그멘테이션 폴백 경로는 pose 가 없어서
+            # 보정할 근거 자체가 없으므로 그대로 1.0 이다.
             gain = 1.0
-            if pose is not None and pose.get("d_measured", 0) > 1e-3:
-                gain = pose["d_corrected"] / pose["d_measured"]
-                if anchor_src:
-                    anchor_src += " +거리보정"
 
             if mode == "tryon" and asset is not None and eyes is not None:
                 # 에셋에 구워진 크기 보정까지 함께 적용한다.
