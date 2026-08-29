@@ -47,6 +47,8 @@ class GanWorker:
         self._hf = None
         self._poser = None
         self._ref_cache = {}     # 정규화된 참고사진 캐시 (경로 -> RGB 배열)
+        self._aligned_ref_cache = {}   # FFHQ 정렬까지 끝낸 참고사진 (경로 -> 텐서)
+        self._shape_predictor = None   # dlib 68점 예측기. 한 번만 만든다.
         self._lock = threading.Lock()
         self.load_seconds = None
 
@@ -93,6 +95,8 @@ class GanWorker:
             except Exception:
                 pass
         self._ref_cache.clear()
+        self._aligned_ref_cache.clear()
+        self._shape_predictor = None
 
     # ---------- 입력 준비 ----------
     @staticmethod
@@ -150,6 +154,43 @@ class GanWorker:
             crop = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
         return crop
 
+    # ---------- FFHQ 정렬 ----------
+    # 여기가 실제 병목이었다. 실측(warm, 3장 기준):
+    #   align_face  2,770ms  /  equal_replacer  50ms  /  실제 GAN  770ms
+    # 즉 시간의 77% 가 GAN 이 아니라 dlib 얼굴검출+정렬이다. 인터넷에 도는
+    # "장당 0.5초" 는 **이미 FFHQ 정렬된 1024 이미지**를 넣었을 때의 GAN
+    # 시간이라 이 단계가 아예 빠져 있다.
+    #
+    # 낭비가 두 군데 있었다:
+    #   1) align_face 는 predictor=None 이면 dlib .dat 를 매 호출 디스크에서
+    #      새로 읽는다 (실측 -644ms)
+    #   2) shape/color 로 넘기는 **참고사진은 바뀌지 않는데** 매번 다시 정렬된다.
+    #      3장 -> 1장으로 줄이면 -1,713ms
+    # 그래서 예측기를 한 번만 만들고, 정렬된 참고사진을 캐시하고, hf.swap 에는
+    # align=False 로 이미 정렬된 텐서를 넘긴다.
+    def _predictor(self):
+        if self._shape_predictor is None:
+            import dlib
+            path = os.path.join(HAIRFAST_DIR, "pretrained_models", "ShapeAdaptor",
+                                "shape_predictor_68_face_landmarks.dat")
+            self._shape_predictor = dlib.shape_predictor(path)
+        return self._shape_predictor
+
+    def _align(self, rgb: np.ndarray):
+        """RGB 배열 -> FFHQ 정렬된 (3,1024,1024) 텐서. 얼굴을 못 찾으면 예외."""
+        import torchvision.transforms.functional as TF
+        from utils.shape_predictor import align_face
+        # align_face 는 리스트를 받아 리스트를 준다. 한 장만 넘긴다.
+        return align_face([TF.to_tensor(rgb)], predictor=self._predictor())[0]
+
+    def _aligned_ref(self, path):
+        """참고사진의 정렬 결과. 파일이 안 바뀌므로 프로세스 수명 내내 캐시한다."""
+        cached = self._aligned_ref_cache.get(path)
+        if cached is None:
+            cached = self._align(self._prepare_ref(path))
+            self._aligned_ref_cache[path] = cached
+        return cached
+
     def _prepare_ref(self, path):
         """참고사진을 얼굴 사진과 같은 기준(눈간격 TARGET_EYE_PX)으로 맞춘다.
         같은 파일이 반복 사용되므로 캐시한다."""
@@ -180,23 +221,29 @@ class GanWorker:
         # 그 차이를 스케일로 흡수하지 못해 **헤어가 머리보다 크게 생성된다.**
         # (문서에 기록된 "참고사진과 대상사진의 프레임 내 얼굴 비율을 맞추라"는
         #  완화책을 사람이 손으로 하는 대신 여기서 자동으로 한다)
-        shape_img = self._prepare_ref(shape_path)
-        color_img = self._prepare_ref(color_path) if color_path != shape_path else shape_img
-
         # 추론 중에도 저장소가 상대경로로 가중치/캐시를 건드리므로 chdir 이 필요하다.
-        # 여기가 ~9초로 가장 긴 chdir 구간이다 - 이 사이에 상대경로를 쓰는 다른
-        # 스레드가 있으면 그쪽이 깨진다. _CHDIR_LOCK 설명은 모듈 상단 참고.
+        # 정렬도 안에서 한다 - align_face 가 상대경로로 모델을 찾을 수 있고,
+        # 참고사진 정렬은 첫 호출에만 도니 구간이 길어지지도 않는다.
+        # _CHDIR_LOCK 설명은 모듈 상단 참고.
         with _CHDIR_LOCK:
             cwd = os.getcwd()
             os.chdir(HAIRFAST_DIR)
             try:
                 t = time.perf_counter()
-                out = hf.swap(face_rgb, shape_img, color_img, align=True)
+                # 참고사진은 캐시된 정렬 결과를 그대로 쓴다(두 번째 호출부터 0ms).
+                shape_t = self._aligned_ref(shape_path)
+                color_t = (shape_t if color_path == shape_path
+                           else self._aligned_ref(color_path))
+                # 얼굴은 매번 달라지므로 이것만 정렬한다.
+                face_t = self._align(face_rgb)
+                # 이미 정렬했으므로 align=False. True 로 두면 안에서 3장을
+                # 다시 정렬해 2.7초가 그대로 붙는다.
+                out = hf.swap(face_t, shape_t, color_t, align=False)
                 took = time.perf_counter() - t
             finally:
                 os.chdir(cwd)
 
-        # align=True 면 (final, face, shape, color) 튜플로 돌아온다
+        # align=False 면 최종 이미지만 온다(align=True 였을 때는 튜플이었다)
         final = out[0] if isinstance(out, tuple) else out
 
         arr = final.detach().float().clamp(0, 1).cpu().numpy()
