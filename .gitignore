@@ -114,3 +114,10 @@ desktop.ini
 # 업로드된 참고 헤어스타일 사진. 남의 얼굴 사진이라 커밋하지 않는다.
 # (server/references/ 의 손으로 넣어 둔 것은 계속 추적한다)
 server/references/uploads/
+
+# 파인튜닝 데이터/산출물. FFHQ 샤드 1개만 27GB(zip+해제)라 절대 커밋하지 않는다.
+# (external/* 과 같은 이유로 `data/` 가 아니라 `data/*` 를 쓴다 - 디렉터리
+#  자체를 제외하면 아래 negation 이 안 먹는다.)
+data/*
+!data/fetch_ffhq.py
+server/train/finetune/runs/
