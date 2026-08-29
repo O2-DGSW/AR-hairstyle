@@ -15,5 +15,6 @@
   "yaw": 40.0,
   "measuredYaw": 32.45019760631955,
   "bank": "korean-frontal",
-  "source": "00119.png"
+  "source": "00119.png",
+  "scaleAdjust": 0.974
 }
