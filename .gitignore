@@ -1,0 +1,112 @@
+# heddy-v2 — 버전관리에서 제외하는 것들
+#
+# 원칙 세 가지:
+#   1) 재생성 가능한 것은 넣지 않는다 (가상환경, 캐시, 빌드 산출물)
+#   2) 큰 바이너리는 넣지 않는다 (모델 가중치 — 별도 배포)
+#   3) 사람 얼굴이 담긴 것은 넣지 않는다 (생체정보)
+# 각 줄에 왜 무시하는지 적어둔다. 이유 없이 늘리지 말 것.
+
+# ---------- 파이썬 환경 / 캐시 ----------
+# 6.0GB. requirements.txt 로 재생성 가능하고, CUDA 휠은 플랫폼 종속이라
+# 커밋해도 다른 PC 에서 못 쓴다.
+.venv/
+venv/
+env/
+
+# 바이트코드. 소스에서 자동 생성된다.
+__pycache__/
+*.py[cod]
+*.pyc
+*$py.class
+
+# 패키징/툴 산출물
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- 생체정보 (개인정보) ----------
+# !! 여기 있는 것들은 크기가 아니라 **성격** 때문에 무시한다.
+# 웹캠에서 캡처한 실제 사람의 얼굴 이미지다. 한 번 커밋하면 git 히스토리에서
+# 지우기가 대단히 어렵고, 공개 리모트에 올라가면 되돌릴 방법이 없다.
+# 실수로 강제 추가(git add -f)하지 말 것.
+
+# 99MB. 학습 데이터 수집용 얼굴 프레임.
+# (config.allow_frame_recording 이 기본 False 인 이유와 같다.)
+server/train/frames/
+
+# 합성 결과 + 그 원본이 된 얼굴 사진(before_*.png).
+server/captures/
+
+# 세션 중 사용자 얼굴로 생성된 헤어 에셋. 런타임에 만들어지는 캐시이기도 하다.
+# (config.generated_dir)
+server/assets_generated/
+
+# ---------- 모델 가중치 ----------
+# 20MB+. 바이너리라 diff 가 무의미하고 리포가 영구적으로 무거워진다.
+# 업스트림(MediaPipe / HF 허브)에서 받는 것이 정본이다. README.md 참고.
+server/models/*.task
+server/models/*.tflite
+server/models/*.onnx
+
+# 학습으로 만들어진 블렌더 체크포인트(server/train/blender.pt, 1.9MB).
+# train_blender.py 로 재생성 가능하다.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.pkl
+*.dat
+
+# ---------- 벤더링된 서드파티 ----------
+# external/ 은 통째로 무시한다. 15GB 이고, 두 디렉터리 모두 **자체 .git 을 갖고
+# 있다**. 그대로 add 하면 git 이 embedded repository 경고를 내고 내용 없는
+# 껍데기 gitlink 만 기록되어, 클론한 사람은 빈 디렉터리를 받는다.
+#
+# 지금 submodule 로 만들지 않는 이유: external/HairFastGAN 은 업스트림 그대로가
+# 아니다. patch_stylegan_ops.py 로 소스를 수정해 쓰고 있고(utils/shape_predictor.py.orig
+# 백업이 남아 있는 것도 그 흔적), pretrained_models/ 를 안에 옮겨 넣었다.
+# submodule 은 이런 로컬 수정을 담지 못한다.
+# 정식화한다면 fork -> submodule, 또는 패치를 리포에 두고 설치 스크립트로 적용하는
+# 방식이 맞다. 그 전까지는 README.md 의 설치 절차를 따라 각자 준비한다.
+# (`external/` 이 아니라 `external/*` 인 이유: 디렉터리 자체를 제외해 버리면
+#  git 이 그 안으로 들어가지 않아 아래 부정 규칙(!)이 절대 먹지 않는다.)
+external/*
+
+# 다만 patch_stylegan_ops.py 는 벤더링된 코드가 아니라 **우리가 쓴** 패치 스크립트다.
+# 이게 없으면 툴체인 없는 PC 에서 HairFastGAN 이 import 단계에서 죽는다. 반드시 추적한다.
+!external/patch_stylegan_ops.py
+
+# ---------- 로그 / 임시 ----------
+*.log
+tmp/
+.tmp/
+
+# ---------- 에디터 / OS ----------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 예외: 리포에 반드시 있어야 하는 것 ----------
+# server/assets/ 는 9MB 짜리 **정적** 헤어 에셋(*.png + *.json)이다.
+# 세션에서 생성된 것이 아니라 make_asset.py / make_asset_bank.py 로 미리 만들어
+# 커밋해 두는 산출물이고, 이게 없으면 서버가 보여줄 헤어가 하나도 없다.
+# 위의 어떤 규칙에도 걸리지 않지만, 혼동을 막으려고 명시적으로 되살려 둔다.
+!server/assets/
+!server/assets/*.png
+!server/assets/*.json
+
+# server/references/ (1.3MB) 도 무시하지 않는다. GAN 경로가 "오려낸 에셋" 이 아니라
+# 원본 사진을 입력으로 받기 때문에(gan_worker.list_references), 이게 없으면
+# /references 응답이 빈 목록이 된다. server/assets 의 결과물이 여기서 나온 것이라
+# 둘을 따로 두면 재현이 안 된다.
+# 단, 여기에 식별 가능한 실제 인물 사진을 추가한다면 그때는 이 판단을 다시 해야 한다.
