@@ -1,0 +1,94 @@
+# heddy-v2 서버 런타임 의존성
+#
+# 무엇을 커버하는가
+#   server/*.py 와 그 안에서 불러 쓰는 external/HairFastGAN 을 실행하는 데
+#   필요한 파이썬 패키지. 각 줄은 실제 import 문을 추적해서 고른 **직접
+#   의존성**이다. 전이 의존성(scikit-image, numba, tokenizers, matplotlib,
+#   scikit-learn 등)은 일부러 적지 않았다. pip freeze 를 통째로 박아두면
+#   패키지 하나 올릴 때마다 이 파일이 같이 썩고, 무엇이 진짜 필요한지
+#   아무도 알 수 없게 된다.
+#
+# 무엇을 커버하지 않는가
+#   **모델 가중치.** 리포에 없다. 따로 받아야 한다(README.md 참고).
+#     - server/models/face_landmarker.task            (MediaPipe Tasks)
+#     - server/models/selfie_multiclass_256x256.tflite (구 세그멘터 경로)
+#     - external/HairFastGAN/pretrained_models/**      (약 7GB)
+#   SegFormer(jonathandinu/face-parsing)만 예외로, 첫 실행 때 HF 허브에서
+#   자동으로 내려받아 로컬 캐시에 넣는다. 리비전은 config.py 에 고정돼 있다.
+#
+# 설치
+#   torch / torchvision 은 CUDA 휠(+cu124)이라 PyPI 기본 인덱스에 없다.
+#   아래 --extra-index-url 지시자가 이 파일 안에 있으므로 보통은
+#       python -m pip install -r requirements.txt
+#   로 충분하다. 지시자를 무시하는 도구를 쓴다면 직접 넘겨라:
+#       python -m pip install -r requirements.txt \
+#           --extra-index-url https://download.pytorch.org/whl/cu124
+#
+# 검증 환경: Windows 11 / Python 3.12.0 / RTX 4070 SUPER / 드라이버 591.86
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# ---------- 딥러닝 런타임 ----------
+# CUDA 12.4 빌드. CPU 휠(그냥 torch==2.6.0)로 깔면 gpu_segmenter 의 CUDA 그래프
+# 경로가 통째로 죽는다. 버전 뒤 "+cu124" 를 반드시 유지할 것.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# ---------- 세그멘테이션 (gpu_segmenter.py) ----------
+# SegformerForSemanticSegmentation 을 직접 import 한다.
+transformers==5.15.0
+# 아래 둘은 엄밀히는 transformers 의 전이 의존성이지만, 가중치 다운로드와
+# 리비전 핀(config.model_revision)이 이 둘의 동작에 직접 걸려 있어 명시 고정한다.
+huggingface_hub==1.27.0
+safetensors==0.8.0
+
+# ---------- 전송 / 서버 (server.py) ----------
+aiohttp==3.10.11
+aiortc==1.9.0
+av==12.3.0
+
+# ---------- 영상 / 랜드마크 ----------
+# face_pose.py, segmenter.py 가 mediapipe.tasks 를 쓴다.
+mediapipe==0.10.14
+opencv-python==4.10.0.84
+
+# numpy 는 2.x 로 올리지 못한다.
+#   mediapipe 0.10.14 의 확장 모듈(_framework_bindings.pyd)이 numpy 1.x ABI 로
+#   빌드돼 있어서, 2.x 를 깔면 import 시점에
+#   "compiled with NumPy 1.x cannot be run in NumPy 2.x" 로 죽는다.
+#   (패키지 메타데이터에는 상한이 없어서 pip 는 막아주지 않는다. 그래서 여기서 막는다.)
+#   external/HairFastGAN 도 numpy 1.23.5 를 전제로 쓰인 코드다.
+#   mediapipe 를 0.10.20+ 로 올리기 전에는 이 핀을 풀지 말 것.
+numpy==1.26.4
+
+# ---------- HairFastGAN 경로 (gan_worker.py -> external/HairFastGAN) ----------
+# 아래 목록은 external/HairFastGAN/hair_swap.py 를 실제로 import 시켜서
+# sys.modules 에 올라온 서드파티 top-level 만 추린 것이다.
+# (HairFastGAN 자체 pyproject.toml 은 python 3.10 / torch 1.13 기준이라
+#  그대로 못 쓴다. 여기 버전은 이 venv 에서 실제로 도는 조합이다.)
+#
+# utils/shape_predictor.py 의 얼굴 정렬. 업스트림은 dlib==19.24.1 소스 빌드를
+# 요구하는데 Windows 에 MSVC 가 없어 컴파일이 안 된다. dlib-bin 은 같은 API 의
+# 미리 빌드된 휠이라 툴체인 없이 설치된다.
+dlib-bin==20.0.1
+face_alignment==1.5.0
+# utils/shape_predictor.py 가 scipy.ndimage 를 직접 쓴다.
+# (face_alignment 의 전이 의존성이기도 하지만 직접 호출이므로 명시한다.)
+scipy==1.17.1
+# hair_swap.py 가 PIL.Image 를 직접 쓴다.
+pillow==12.3.0
+# models/CtrlHair/shape_branch/config.py 의 중첩 딕셔너리.
+addict==2.4.0
+# models/Net.py -> utils/drive.py 가 import 시점에 필요로 한다
+# (가중치가 이미 있으면 실제 다운로드는 하지 않지만 import 는 무조건 일어난다).
+gdown==6.1.0
+# models/CtrlHair/util/util.py 가 dill 을 pickle 대신 쓴다.
+dill==0.4.1
+# models/Encoders.py 의 CLIP 인코더. PyPI 에 없어 git 커밋 고정으로 설치한다.
+clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6
+
+# (선택) StyleGAN2 의 fused CUDA 확장을 JIT 컴파일하려면 ninja 가 필요하다.
+# 지금은 MSVC/CUDA 툴체인이 없어 컴파일이 어차피 실패하고,
+# external/patch_stylegan_ops.py 가 순수 PyTorch 구현으로 폴백시킨다(1.5~3배 느림).
+# 툴체인을 갖춘 환경이라면 주석을 풀어 빠른 경로를 쓸 수 있다.
+# ninja==1.13.0

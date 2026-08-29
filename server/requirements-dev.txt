@@ -1,0 +1,27 @@
+# heddy-v2 개발 / 테스트 의존성
+#
+# 런타임에는 필요 없다. 서버만 돌릴 거면 requirements.txt 만 설치하면 된다.
+#
+#   python -m pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+# ---------- 테스트 ----------
+# 테스트(server/tests/)는 표준 라이브러리 unittest 로 작성돼 있다.
+# 즉 아무것도 설치하지 않아도 다음 한 줄로 전부 돌아간다:
+#
+#   cd server && ..\.venv\Scripts\python.exe -m unittest discover -s tests -v
+#
+# pytest 는 **선택**이다 — 실패 출력(assert 재작성)과 -k 필터가 편해서 넣어뒀을 뿐,
+# 없어도 테스트는 통과한다. CI 를 만들 때 이걸 필수 의존성으로 착각하지 말 것.
+# 버전을 핀하지 않은 이유: 현재 이 venv 에 설치돼 있지 않아서 "이 조합이 실제로
+# 돈다" 고 확인해 줄 수 없다. 나머지 핀들은 전부 실측값인데 이것만 추측이면
+# 파일 전체의 신뢰도가 떨어진다. 실제로 쓰기 시작하면 그때 실측 버전으로 핀할 것.
+pytest
+
+# ---------- 학습 스크립트 (server/train/) ----------
+# train_blender.py 가 지각 손실(perceptual loss)에 쓴다.
+# 서버 런타임 경로에는 없다.
+# (주의: external/HairFastGAN 안에도 같은 이름의 로컬 패키지가 있어서
+#  그쪽을 cwd 로 두고 실행하면 로컬 사본이 이걸 가린다. 서로 다른 물건이다.)
+lpips==0.1.4
