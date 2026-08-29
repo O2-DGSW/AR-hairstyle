@@ -104,6 +104,10 @@ class AppState:
         #: 부족하다 - recv() 는 트랙마다 직렬이라 자기 세션 카운터는 거의 항상
         #: 0 이고, 실제로 대기열을 채우는 건 **다른 세션**이기 때문이다.
         self.gpu_inflight = 0
+        # 참고사진의 머리 마스크/눈 2점 캐시 (긴 머리 이어붙이기용).
+        # 파일이 안 바뀌므로 프로세스 수명 내내 유지한다. 업로드로 목록이
+        # 바뀌어도 경로가 키라서 낡은 항목이 잘못 쓰일 일은 없다.
+        self.ref_hair_cache = {}
         self.reaper = None
         self._closed = False
 
@@ -605,6 +609,42 @@ def _dir_size_mb(path) -> float:
 # 에셋 생성
 # ---------------------------------------------------------------------------
 
+async def _reference_hair(app: AppState, reference: str):
+    """참고사진의 (BGR, 머리 마스크, 눈 2점). 파일이 안 바뀌므로 캐시한다.
+
+    긴 머리 이어붙이기에 쓴다. 세그멘테이션과 랜드마커를 한 번씩만 돌면 되고,
+    같은 참고사진으로 뱅크 7칸을 구우면 6번은 캐시가 받는다.
+    """
+    path = app.references.get(reference)
+    if path is None:
+        return None
+    hit = app.ref_hair_cache.get(path)
+    if hit is not None:
+        return hit
+
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    seg = await app.get_segmenter()
+    loop = asyncio.get_event_loop()
+    cls = await loop.run_in_executor(app.gpu_executor, seg.class_map, img)
+    from gpu_segmenter import CLS_HAIR
+    mask = ((cls == CLS_HAIR).astype("uint8")) * 255
+
+    def _pose():
+        from face_pose import FacePose
+        with FacePose() as p:
+            return p.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), 0)
+
+    pose = await loop.run_in_executor(app.pose_executor, _pose)
+    if pose is None or mask.sum() < 500:
+        logger.warning("참고사진에서 얼굴/머리를 찾지 못했습니다: %s", reference)
+        return None
+    out = (img, mask, (pose["eye_l"], pose["eye_r"]))
+    app.ref_hair_cache[path] = out
+    return out
+
+
 async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
                                   yaw=None, bank=None, livebank=None):
     """GAN 결과 이미지에서 실시간 워핑용 헤어 에셋을 추출해 **이 세션에** 등록한다.
@@ -635,10 +675,29 @@ async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
         logger.warning("GAN 결과에서 얼굴을 찾지 못해 에셋 추출을 건너뜁니다")
         return None
 
+    # 잘린 긴 머리를 참고사진의 실제 픽셀로 이어붙인다. 자세한 이유는
+    # hair_asset.extend_hair_with_reference 참고 - 요약하면 GAN 이 FFHQ 크롭
+    # 밖의 머리를 애초에 보지 못한다.
+    src_bgr, src_hair = result_bgr, hair
+    eyes = (pose["eye_l"], pose["eye_r"])
+    if state.cfg.extend_long_hair:
+        try:
+            ref = await _reference_hair(app, reference)
+            if ref is not None:
+                ext = await loop.run_in_executor(
+                    app.gpu_executor, hair_asset.extend_hair_with_reference,
+                    result_bgr, hair, eyes, ref[0], ref[1], ref[2])
+                if ext is not None:
+                    src_bgr, src_hair = ext[0], ext[1]
+                    eyes = (ext[2], ext[3])
+        except Exception:
+            # 이어붙이기는 부가 기능이다. 실패하면 GAN 결과만으로 간다.
+            logger.exception("긴 머리 이어붙이기 실패 - GAN 결과만 사용")
+
     tag = "" if yaw is None else f"-yaw{int(round(yaw)):+03d}"
     name = f"gan-{reference}{tag}-{int(time.time() * 1000) % 1000000}"
     asset, _, px = hair_asset.build_from_photo(
-        result_bgr, hair, pose["eye_l"], pose["eye_r"], name, ref_skin=ref_skin)
+        src_bgr, src_hair, eyes[0], eyes[1], name, ref_skin=ref_skin)
     if asset is None or px < 500:
         logger.warning("GAN 결과에서 머리를 찾지 못했습니다 (%s px)", px)
         return None
