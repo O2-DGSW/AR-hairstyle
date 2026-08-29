@@ -15,6 +15,7 @@ METRICS = [
     ("pose_err", True),
     ("pose_excess", True),      # 인버전 오차를 뺀 값. Rotate 자체의 기여.
     ("id_cos", False),
+    ("rot_norm", None),        # 회전량. 0 으로 줄면 항등함수 붕괴다.
     ("cycle_mse", True),
     ("hair_ratio", None),       # 1 에 가까울수록 좋다 - 방향이 아니라 거리
 ]

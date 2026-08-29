@@ -76,7 +76,7 @@ def resolve(p):
 
 
 BUCKETS = ((0, 10), (10, 20), (20, 30), (30, 40), (40, 200))
-KEYS = ["pose_err", "pose_err_inv", "pose_excess", "id_cos", "id_cos_inv", "cycle_mse", "hair_ratio"]
+KEYS = ["pose_err", "pose_err_inv", "pose_excess", "id_cos", "rot_norm", "cycle_mse", "hair_ratio"]
 
 
 def bucket_of(d):
@@ -180,6 +180,11 @@ def main(args):
 
             pe = float(F.mse_loss(kp_gen, kp_B))
             pe_inv = float(F.mse_loss(kp_recB, kp_B))
+            # RotateModel 은 output = latent_from + 0.1*dt_latent 라, dt_latent 가
+            # 0 으로 줄면 "회전 안 함"(항등함수)으로 붕괴한다. 그러면 타깃 포즈를
+            # 못 맞추면서(pose_err 상승) 원본 정체성은 그대로 남아(id_cos 상승)
+            # 지표만 보면 반쯤 좋아진 것처럼 보인다. 실제 회전량을 재서 구분한다.
+            rot_norm = float((lat_in[:, :6] - W_A[:, :6]).norm() / W_A[:, :6].norm())
             rows.append({
                 "bucket": p["bucket"], "dyaw": p["dyaw"],
                 "pose_err": pe,
@@ -190,6 +195,7 @@ def main(args):
                 "id_cos": cos(gen, A),
                 "id_cos_inv": cos(recA, A),
                 "cycle_mse": float(F.mse_loss(cyc, W_A[:, :6])),
+                "rot_norm": rot_norm,
                 # 소스에 머리가 거의 없으면(모자/대머리/분할 실패) 비율이 폭발한다.
                 # 전체의 1% 미만이면 표본에서 뺀다.
                 "hair_ratio": (hp_g / hp_a) if hp_a > 0.01 * tot else float("nan"),

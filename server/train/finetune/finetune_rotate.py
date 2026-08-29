@@ -124,10 +124,14 @@ class YawPairDataset(Dataset):
 class FTTrainer(RT.Trainer):
     """원본 Trainer 를 그대로 쓰되 페어링과 그래디언트 누적만 바꾼다."""
 
-    def __init__(self, *a, accum=8, max_steps=0, **kw):
+    def __init__(self, *a, accum=8, max_steps=0, ckpt_every=0, **kw):
         super().__init__(*a, **kw)
         self.accum = accum
         self.max_steps = max_steps
+        # 에폭이 19분이라 에폭 단위로만 저장하면 그동안 평가할 산출물이 없다.
+        # 가설 검증이 목적이라 중간 체크포인트가 있어야 빨리 판단할 수 있다.
+        self.ckpt_every = ckpt_every
+        self.global_step = 0
 
     def train_one_epoch(self):
         self.model.to(self.device).train()
@@ -154,6 +158,10 @@ class FTTrainer(RT.Trainer):
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 self.logger.log("grad", gn.item())
+
+            self.global_step += 1
+            if self.ckpt_every and self.global_step % self.ckpt_every == 0:
+                self.save_model(f"step{self.global_step:06d}", save_online=False)
 
             self.logger.next_step()
             for k, v in info.items():
@@ -219,7 +227,8 @@ def main(args):
     RT.args = targs          # 원본 validate() 가 모듈 전역 args 를 참조한다
 
     tr = FTTrainer(model, targs, optimizer, None, train_dl, test_dl, logger,
-                   accum=args.accum, max_steps=args.max_steps)
+                   accum=args.accum, max_steps=args.max_steps,
+                   ckpt_every=args.ckpt_every)
     t0 = time.perf_counter()
     tr.train_loop(args.epochs)
     print(f"\n총 {time.perf_counter()-t0:.0f}s  -> {logger.run_dir}")
@@ -238,6 +247,7 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--test-size", type=int, default=512)
     p.add_argument("--max-steps", type=int, default=0, help="에폭당 스텝 제한 (스모크 테스트용)")
+    p.add_argument("--ckpt-every", type=int, default=1000, help="N 스텝마다 중간 체크포인트 (0=끄기)")
     p.add_argument("--no-hair-loss", dest="use_hair_loss", action="store_false")
     a = p.parse_args()
     a.dataset = resolve(a.dataset)
