@@ -33,6 +33,12 @@ function send(obj) {
 
 modeSel.addEventListener("change", () => send({ type: "mode", mode: modeSel.value }));
 
+/* 프로덕션 플로우는 "헤어 고르기 -> 각도 수집 -> 생성 -> 씌우기" 하나뿐이라
+ * 진단용 뷰는 감춘다. 서버에는 그대로 남아 있으므로 ?debug=1 로 되살린다. */
+if (!new URLSearchParams(location.search).has("debug")) {
+  modeSel.querySelectorAll("option[data-debug]").forEach((o) => o.remove());
+}
+
 function sendFit() {
   send({
     type: "fit",

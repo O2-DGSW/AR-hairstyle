@@ -499,9 +499,14 @@ class GpuFaceParser:
         """BGR 프레임 -> (합성된 BGR 프레임, 타이밍/상태 dict).
 
         mode:
-          seg    - 세그멘테이션 색칠 (머리=마젠타, 얼굴피부=시안)
-          remove - 기존 머리를 누적된 플레이트로 지움 (Phase 1 검증용)
-          plate  - 누적된 플레이트 자체를 표시 (디버깅)
+          raw    - 원본 그대로 (기본). 플레이트는 계속 쌓는다.
+          tryon  - 기존 머리 제거 + 새 헤어 씌우기 (프로덕션 화면)
+          seg    - 세그멘테이션 색칠 (머리=마젠타, 얼굴피부=시안)  [디버그]
+          remove - 기존 머리를 누적된 플레이트로 지움              [디버그]
+          plate  - 누적된 플레이트 자체를 표시                     [디버그]
+
+        어느 모드든 plate.update() 는 돈다. 플레이트는 시간에 걸쳐 쌓이는
+        것이라, 나중에 tryon 으로 바꿨을 때 바로 쓰려면 그 전부터 채워둬야 한다.
         """
         t0 = time.perf_counter()
         h, w = frame_bgr.shape[:2]
@@ -699,6 +704,16 @@ class GpuFaceParser:
             out = frame_f * (1 - a) + fill * a
         elif mode == "plate" and plate is not None and plate.seen is not None:
             out = plate.plate * plate.seen.unsqueeze(-1)
+        elif mode == "raw":
+            # 원본을 그대로 내보낸다. 라이브 뱅크가 각도를 모으는 동안 쓰는
+            # 화면이다 - 아직 씌울 헤어가 없으니 보여줄 것도 없다.
+            #
+            # 그런데 세그멘테이션은 **건너뛰지 않는다.** 위에서 plate.update()
+            # 가 이미 돌았고, 그게 기존 머리를 지울 때 쓰는 배경 플레이트를
+            # 채운다. 여기서 GPU 를 아끼면 tryon 으로 넘어가는 순간 플레이트가
+            # 비어 있어 원래 머리가 안 지워진다. 게다가 수집 단계는 사용자가
+            # 고개를 크게 돌리는 구간이라 플레이트를 채우기에 가장 좋은 시간이다.
+            out = frame_f
         else:
             color = self._color[cls]                       # (h, w, 3) BGR
             a = self._alpha_cls[cls].unsqueeze(-1)         # (h, w, 1)

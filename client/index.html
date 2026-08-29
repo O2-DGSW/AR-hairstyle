@@ -47,10 +47,13 @@
   <button id="start">연결 시작</button>
   <button id="stop" disabled>종료</button>
   <select id="mode" style="background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:0 10px;font-size:13px">
-    <option value="seg" selected>세그멘테이션 색칠</option>
-    <option value="remove">기존 머리 지우기</option>
+    <option value="raw" selected>원본</option>
     <option value="tryon">새 헤어 씌우기</option>
-    <option value="plate">누적 플레이트 보기</option>
+    <!-- 아래는 디버그용. ?debug=1 없이 접속하면 client.js 가 지운다.
+         오늘 버그를 찾을 때 이 뷰들이 결정적이어서 서버에는 그대로 남겨 뒀다. -->
+    <option value="seg" data-debug>세그멘테이션 색칠</option>
+    <option value="remove" data-debug>기존 머리 지우기</option>
+    <option value="plate" data-debug>누적 플레이트 보기</option>
   </select>
   <select id="capres" style="background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:0 10px;font-size:13px">
     <option value="1280x720" selected>캡처 1280×720</option>

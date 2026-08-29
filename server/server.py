@@ -192,7 +192,10 @@ class PeerState:
         self.channel = None
         self.track = None          # 최초 1회만 설정. cleanup 에서 끊는다.
         self.capturing = False
-        self.mode = "seg"
+        # 기본은 원본 패스스루. 프로덕션 플로우는 "헤어 고르기 -> 각도 수집
+        # -> 생성 -> tryon" 이라, 에셋이 생기기 전까지 보여줄 것은 원본뿐이다.
+        # (seg/plate/remove 는 디버그용으로 남아 있고 클라이언트가 요청하면 된다)
+        self.mode = "raw"
         self.asset_name = None      # None이면 첫 번째 에셋
         self.bank = None            # 다각도 뱅크 이름 (설정 시 yaw로 자동 선택)
         self.scale_mul = 1.0
@@ -1239,7 +1242,7 @@ async def offer(request):
                 channel.send(json.dumps({"type": "pong", "t_client": data.get("t_client")}))
             elif data.get("type") == "mode":
                 m = data.get("mode")
-                if m in ("seg", "remove", "plate", "tryon"):
+                if m in ("raw", "seg", "remove", "plate", "tryon"):
                     state.mode = m
                     logger.info("mode -> %s", m)
             elif data.get("type") == "livebank":
