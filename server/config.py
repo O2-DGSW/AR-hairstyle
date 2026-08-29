@@ -1,0 +1,216 @@
+"""중앙 설정.
+
+왜 필요한가
+-----------
+튜닝 상수가 각 모듈의 모듈 전역에 흩어져 있으면 값을 하나 바꿀 때마다 코드를
+고치고 프로세스를 재시작해야 한다. 이 서버는 재시작 비용이 크다(SegFormer 수 초,
+HairFastGAN ~90초). 그래서 모든 튜닝 값을 한 곳에 모으고 환경변수로 덮어쓸 수
+있게 한다.
+
+사용법
+------
+    from config import CONFIG
+    CONFIG.input_size
+
+환경변수는 `HEDDY_` 접두사 + 대문자 필드명이다:
+
+    HEDDY_MAX_SESSIONS=3  HEDDY_GAN_BACKEND=thread  python server.py
+
+값 파싱은 필드의 타입 힌트를 따른다(bool 은 1/true/yes/on 을 참으로 본다).
+tuple[float, ...] 필드는 쉼표로 구분한다: `HEDDY_LIVE_TARGETS=-30,0,30`
+
+규칙
+----
+- 새 튜닝 상수는 여기에 넣는다. 모듈 전역 상수로 되돌리지 않는다.
+- frozen 이다. 런타임에 바꾸지 않는다(스레드 사이에서 값이 갈리면 CUDA 그래프
+  캡처 크기 같은 것이 어긋난다).
+"""
+from __future__ import annotations
+
+import os
+import typing
+from dataclasses import dataclass, fields
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+@dataclass(frozen=True)
+class Config:
+    # ---------- 전송 / 세션 ----------
+    host: str = "0.0.0.0"
+    port: int = 8080
+    #: 동시에 받을 수 있는 피어 수. GPU 워커가 1개라 초과분은 거절하는 편이
+    #: 전부 같이 느려지는 것보다 낫다.
+    max_sessions: int = 2
+    #: 이 시간 동안 프레임이 한 장도 안 들어오면 세션을 정리한다.
+    #: 브라우저를 그냥 닫으면 ICE 가 failed 로 갈 때까지 리소스가 남는다.
+    session_idle_timeout_s: float = 90.0
+    #: 세션 정리 주기.
+    session_reaper_interval_s: float = 15.0
+
+    #: 내보내는 RTP 패킷의 최대 페이로드 크기(바이트). 0 이면 aiortc 기본값(1300).
+    #:
+    #: aiortc 기본 1300 은 RTP 헤더 12 + SRTP 태그 ~10 + UDP 8 + IP 20 을 더하면
+    #: 회선상 약 1350 바이트가 된다. Chrome 은 1200(회선상 ~1250)을 쓴다.
+    #: 경로 MTU 가 그 사이에 있으면 **Chrome 이 보낸 건 통과하는데 서버가 보낸
+    #: 것만 버려진다.** 실측된 증상이 정확히 이랬다: 브라우저→서버는 30fps 로
+    #: 멀쩡한데 서버→브라우저는 패킷 10개 중 4개가 사라지고 프레임이 한 장도
+    #: 조립되지 않았다(코덱을 VP8 로 바꿔도 동일).
+    #: 1100 은 터널/VPN 이 낀 경로까지 여유를 둔 값이다. 패킷 수가 조금 늘 뿐
+    #: 화질/지연에는 사실상 영향이 없다.
+    rtp_packet_max: int = 1100
+
+    #: 서버가 내보낼 비디오 코덱. "vp8" | "h264" | "auto"
+    #:
+    #: aiortc 가 지원하는 건 VP8 과 H.264 둘뿐이고, 코덱은 **브라우저 offer 의
+    #: 순서**대로 정해진다. Chrome 이 H.264 를 앞에 두면 그쪽으로 붙는데, 그러면
+    #: 패킷은 도착하는데 framesDecoded 가 0 인 채로 검은 화면이 된다(실측).
+    #: aiortc 의 H.264 출력에서 Chrome 이 디코딩 가능한 키프레임을 못 얻는
+    #: 것으로 보인다. VP8 로 고정하면 정상 재생된다.
+    #: "auto" 는 예전 동작(브라우저가 고르는 대로)이다.
+    video_codec: str = "vp8"
+
+    # ---------- 세그멘테이션 ----------
+    model_id: str = "jonathandinu/face-parsing"
+    #: 허브 리비전 고정. 핀이 없으면 업스트림이 바뀐 날 결과가 조용히 달라진다.
+    #: 로컬 HF 캐시에 실제로 받아둔 스냅샷 해시.
+    model_revision: str = "758b82e15a0178c9db39c1ff666a8b56e3a550c8"
+    #: CUDA 그래프 때문에 고정. 로짓은 이것의 1/4 해상도로 나온다.
+    input_size: int = 512
+    use_cuda_graph: bool = True
+    #: 경계 알파의 급격함. 작을수록 부드럽게 번진다.
+    soft_k: float = 1.5
+    #: 조명 정합 배율의 상/하한. 세그멘테이션이 흔들려 피부 평균이 튀는 순간
+    #: 헤어 색이 통째로 날아가는 걸 막는 안전장치.
+    harmonize_min: float = 0.65
+    harmonize_max: float = 1.55
+    #: 헤어라인 그림자 띠의 폭(픽셀).
+    shadow_k: int = 21
+    #: 통계용 GPU 동기화는 이 프레임 수마다 한 번만.
+    stats_every: int = 5
+    #: 이보다 작은 영역은 무게중심을 믿지 않는다.
+    min_anchor_px: int = 20
+    #: 단계별 시간 측정을 CUDA 이벤트 대신 torch.cuda.synchronize() 로 한다.
+    #: 디바이스 전체를 멈추므로 기본은 끔. 이벤트로도 같은 숫자가 나온다.
+    profile_blocking_sync: bool = False
+
+    # ---------- 헤어 에셋 ----------
+    #: GPU 에 올려둘 에셋 텐서 상한(개). 512^2 RGBA float32 = 약 4MB/개.
+    asset_cache_max: int = 48
+    #: 세션 하나가 만들 수 있는 에셋 상한. 라이브 뱅크 1회가 7칸이다.
+    session_asset_max: int = 32
+    #: 세션에서 생성된 에셋을 여기에 저장해 재시작 후에도 살린다.
+    generated_dir: str = os.path.join(ROOT, "assets_generated")
+    #: 생성 에셋 저장소 상한(MB). 넘으면 오래된 것부터 지운다.
+    generated_dir_max_mb: int = 512
+
+    # ---------- 얼굴 포즈 ----------
+    #: 이보다 정면이면 거리 캘리브레이션을 갱신한다.
+    frontal_yaw_deg: float = 10.0
+    cal_alpha: float = 0.08
+
+    # ---------- GAN (HairFastGAN) ----------
+    #: "process" = 별도 프로세스에서 실행(권장). 실시간 경로가 GAN 로딩/추론에
+    #: 절대 막히지 않고, GAN 이 죽어도 서버가 안 죽는다.
+    #: "thread"  = 기존처럼 같은 프로세스의 전용 스레드.
+    #: 프로세스 기동에 실패하면 자동으로 thread 로 폴백한다.
+    gan_backend: str = "process"
+    #: 모델 적재 대기 상한(초). 실측 ~90초.
+    gan_load_timeout_s: float = 420.0
+    #: 합성 1회 대기 상한(초). 실측 ~9초.
+    gan_call_timeout_s: float = 240.0
+    #: GAN 이 도는 동안에도 실시간 영상을 계속 내보낼지.
+    #: 예전에는 검은 프레임을 흘려보냈다. GAN 이 같은 프로세스에 있어서 이벤트
+    #: 루프와 GPU 를 통째로 잡아먹었기 때문인데, 별도 프로세스로 분리한 지금은
+    #: 실시간 경로가 막히지 않는다. 하드웨어 경합으로 fps 는 떨어지지만, 검은
+    #: 화면보다는 느린 화면이 낫다. 경합이 심하면 False 로 되돌린다.
+    stream_during_gan: bool = True
+    #: 머리 위/양옆 여백 비율. 웹캠 클로즈업은 여백이 부족해 블렌딩이 배경을 침범한다.
+    pad_ratio: float = 0.35
+    #: 눈 간격 대비 크롭 반폭.
+    crop_half_eyes: float = 2.6
+    #: dlib 이 안정적으로 검출하는 눈 간격(px).
+    target_eye_px: int = 130
+
+    # ---------- 라이브 뱅크 ----------
+    #: 검출기(dlib CNN) 한계가 ±40도라 그 안쪽에서 12도 간격으로 잡는다.
+    live_targets: tuple[float, ...] = (-36.0, -24.0, -12.0, 0.0, 12.0, 24.0, 36.0)
+    #: 목표 각도 허용 오차(도).
+    live_tol: float = 7.0
+    #: 측정 yaw 가 EMA 에서 이만큼 벌어져 있으면 아직 움직이는 중.
+    live_steady: float = 3.0
+
+    # ---------- 프레임 루프 ----------
+    #: 소수. --infer-every-n 과 배수 관계가 생기면 로그 통계가 편향된다.
+    log_every: int = 31
+    #: 학습 데이터 수집 시 이 프레임 수마다 한 장씩 저장.
+    rec_every: int = 5
+    #: GPU 워커 대기열이 이만큼 밀려 있으면 새 프레임을 버린다(최신 우선).
+    #: 버퍼는 지연을 줄이지 못한다 - 밀린 프레임을 계속 처리하면 지연만 누적된다.
+    max_inflight_frames: int = 1
+
+    # ---------- 디스크 쿼터 ----------
+    #: 클라이언트가 DataChannel 명령 하나로 디스크를 무한히 채울 수 있으면 안 된다.
+    capture_dir_max_mb: int = 512
+    record_dir_max_mb: int = 2048
+    record_max_frames: int = 5000
+
+    # ---------- 관측 ----------
+    metrics_enabled: bool = True
+    #: 얼굴 프레임을 디스크에 남기는 기능(학습 데이터 수집)을 켤지.
+    #: 생체정보라 기본은 끄고, 명시적으로 켜야 쓰이게 한다.
+    allow_frame_recording: bool = False
+
+
+_TRUE = frozenset(("1", "true", "yes", "on", "y", "t"))
+_FALSE = frozenset(("0", "false", "no", "off", "n", "f"))
+
+
+def _coerce(raw: str, ftype):
+    origin = typing.get_origin(ftype)
+    if ftype is bool:
+        # 모르는 값을 False 로 넘기지 않는다.
+        # 예전엔 `raw in _TRUE` 한 줄이라 오타가 조용히 False 가 됐다. 그런데
+        # 이 방식의 bool 은 대부분 **기본이 꺼짐인 안전장치**를 켜는 데 쓰인다
+        # (allow_frame_recording 처럼). 오타 하나로 "켰다고 생각했는데 안 켜진
+        # 채로 도는" 실패 모드가 생기고, 그건 로그에도 안 남는다.
+        v = raw.strip().lower()
+        if v in _TRUE:
+            return True
+        if v in _FALSE:
+            return False
+        raise ValueError(f"bool 로 읽을 수 없는 값: {raw!r} "
+                         f"(허용: {', '.join(sorted(_TRUE | _FALSE))})")
+    if ftype is int:
+        return int(raw)
+    if ftype is float:
+        return float(raw)
+    if origin is tuple:
+        (inner,) = {a for a in typing.get_args(ftype) if a is not Ellipsis} or {str}
+        return tuple(_coerce(p, inner) for p in raw.split(",") if p.strip())
+    return raw
+
+
+def load_config(env=None) -> Config:
+    """환경변수(HEDDY_*)로 덮어쓴 설정을 만든다.
+
+    잘못된 값은 조용히 무시하지 않고 예외를 낸다 - 오타 난 튜닝 값으로 몇 시간
+    실험하는 것보다 시작할 때 죽는 쪽이 낫다.
+    """
+    env = os.environ if env is None else env
+    hints = typing.get_type_hints(Config)
+    over = {}
+    for f in fields(Config):
+        raw = env.get("HEDDY_" + f.name.upper())
+        if raw is None:
+            continue
+        try:
+            over[f.name] = _coerce(raw, hints[f.name])
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"환경변수 HEDDY_{f.name.upper()}={raw!r} 를 "
+                f"{hints[f.name]} 로 읽을 수 없습니다") from e
+    return Config(**over)
+
+
+CONFIG = load_config()
