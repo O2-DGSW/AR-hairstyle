@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>3D 헤어 - GLB + 오클루더 + 스프링본</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; }
+  h1 { font-size: 15px; font-weight: 600; color: #aaa; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #666; margin-bottom: 18px; }
+  .layout { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+
+  .stage { position: relative; width: 640px; height: 480px; background: #000;
+           border-radius: 8px; overflow: hidden; }
+  .stage video, .stage canvas { position: absolute; top: 0; left: 0; width: 640px; height: 480px; }
+  .stage video { object-fit: cover; }
+
+  .side { display: flex; flex-direction: column; gap: 14px; min-width: 260px; }
+  .panel { background: #1b1b1b; border-radius: 8px; padding: 14px 16px; font-size: 13px; }
+  .panel h2 { font-size: 12px; margin: 0 0 10px; color: #888; font-weight: 600;
+              text-transform: uppercase; letter-spacing: .04em; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; }
+  dt { color: #999; }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; color: #fff; }
+  dd.warn { color: #ff5f56; }
+  dd.good { color: #4ade80; }
+
+  .ctl { display: flex; flex-direction: column; gap: 9px; }
+  .ctl label { display: flex; align-items: center; gap: 8px; color: #bbb; font-size: 12.5px; }
+  .ctl input[type=range] { flex: 1; }
+  .ctl .val { width: 40px; text-align: right; color: #fff; font-variant-numeric: tabular-nums; }
+
+  button { padding: 9px 16px; font-size: 13px; border-radius: 6px; border: none;
+           background: #ff2fc8; color: #fff; cursor: pointer; }
+  button:disabled { background: #444; cursor: default; }
+  .row { display: flex; gap: 10px; margin-bottom: 14px; align-items: center; }
+  #status { font-size: 12.5px; color: #999; margin-top: 10px; max-width: 640px; line-height: 1.5; }
+  .hint { font-size: 11.5px; color: #666; line-height: 1.6; margin-top: 10px; max-width: 640px; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14"
+  }
+}
+</script>
+</head>
+<body>
+
+<h1>3D 헤어 — GLB + 오클루더 + 스프링본 + 라이팅 매칭</h1>
+<div class="sub">
+  머리 3D 포즈로 메시를 직접 렌더합니다. 평면 밖 회전이 원리적으로 해결되므로
+  각도별 에셋 뱅크가 필요 없습니다. 2D 워핑 비교군: <a href="/warp.html" style="color:#ff2fc8">/warp.html</a>
+</div>
+
+<div class="row">
+  <button id="start">시작</button>
+  <button id="stop" disabled>정지</button>
+  <label style="font-size:12.5px;color:#bbb">GLB 헤어:
+    <input type="file" id="glb" accept=".glb,.gltf" style="font-size:11px;color:#888">
+  </label>
+</div>
+
+<div class="layout">
+  <div>
+    <div class="stage">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="gl"></canvas>
+    </div>
+    <div id="status">대기 중 — [시작]을 누르면 웹캠 권한을 요청합니다.</div>
+    <div class="hint">
+      GLB를 안 넣으면 <b>절차적 헤어 메시</b>로 동작합니다. 파이프라인(포즈 추적·오클루전·
+      스프링본)이 먼저 되는지 확인하고 에셋은 나중에 끼우는 순서입니다.<br>
+      확인할 것 ① 고개를 돌리면 헤어가 <b>같이 돌아가는가</b> ② 뒤통수 쪽 머리가
+      얼굴을 뚫고 나오지 않는가(오클루더) ③ 고개를 흔들면 머리카락이 <b>따라 흔들리는가</b>(스프링본)
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="panel">
+      <h2>추적</h2>
+      <dl>
+        <dt>델리게이트</dt><dd id="s-delegate">-</dd>
+        <dt>fps</dt><dd id="s-fps">-</dd>
+        <dt>랜드마크</dt><dd id="s-detect">-</dd>
+        <dt>yaw / pitch / roll</dt><dd id="s-ypr">-</dd>
+        <dt>거리 (tz)</dt><dd id="s-tz">-</dd>
+        <dt>자동 스케일</dt><dd id="s-scale">-</dd>
+      </dl>
+    </div>
+
+    <div class="panel">
+      <h2>헤어</h2>
+      <div class="ctl">
+        <label>크기 <input type="range" id="c-size" min="60" max="160" value="100"><span class="val" id="v-c-size">100</span></label>
+        <label>앞뒤 <input type="range" id="c-fwd" min="-60" max="60" value="0"><span class="val" id="v-c-fwd">0</span></label>
+        <label>상하 <input type="range" id="c-up" min="-60" max="60" value="0"><span class="val" id="v-c-up">0</span></label>
+        <label>좌우돌림 <input type="range" id="c-yaw" min="-180" max="180" value="0"><span class="val" id="v-c-yaw">0</span></label>
+        <label>앞뒤기울기 <input type="range" id="c-pitch" min="-90" max="90" value="0"><span class="val" id="v-c-pitch">0</span></label>
+        <label><input type="checkbox" id="c-occ" checked> 오클루더 (머리 뒤 가리기)</label>
+        <label><input type="checkbox" id="c-occ-show"> 오클루더 보이기 (디버그)</label>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>스프링본 물리</h2>
+      <div class="ctl">
+        <label><input type="checkbox" id="c-spring" checked> 사용</label>
+        <label>강성 <input type="range" id="c-stiff" min="1" max="60" value="22"><span class="val" id="v-c-stiff">22</span></label>
+        <label>감쇠 <input type="range" id="c-damp" min="50" max="99" value="82"><span class="val" id="v-c-damp">82</span></label>
+        <label>중력 <input type="range" id="c-grav" min="0" max="60" value="18"><span class="val" id="v-c-grav">18</span></label>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>라이팅 매칭</h2>
+      <div class="ctl">
+        <label><input type="checkbox" id="c-light" checked> 영상에서 추정</label>
+        <label>세기 <input type="range" id="c-lint" min="0" max="200" value="100"><span class="val" id="v-c-lint">100</span></label>
+      </div>
+      <dl style="margin-top:10px">
+        <dt>추정 색</dt><dd id="s-lcolor">-</dd>
+        <dt>방향</dt><dd id="s-ldir">-</dd>
+      </dl>
+    </div>
+  </div>
+</div>
+
+<script src="preflight.js"></script>
+<script type="module" src="hair3d.js"></script>
+</body>
+</html>

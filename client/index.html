@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>서버 합성 - GPU 얼굴파싱 세그멘테이션</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; }
+  h1 { font-size: 15px; font-weight: 600; color: #aaa; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #666; margin-bottom: 18px; }
+  .sub a { color: #ff2fc8; }
+  .layout { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+
+  .main { display: flex; flex-direction: column; gap: 8px; }
+  .cap { font-size: 12px; color: #777; }
+  video { background: #000; border-radius: 8px; display: block; }
+  #remote { width: 640px; height: 480px; transform: scaleX(-1); }
+  #local { width: 200px; height: 150px; transform: scaleX(-1); opacity: .75; }
+
+  .side { display: flex; flex-direction: column; gap: 14px; min-width: 250px; }
+  .panel { background: #1b1b1b; border-radius: 8px; padding: 14px 16px; font-size: 13px; }
+  .panel h2 { font-size: 12px; margin: 0 0 10px; color: #888; font-weight: 600;
+              text-transform: uppercase; letter-spacing: .04em; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; }
+  dt { color: #999; }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; color: #fff; }
+  dd.warn { color: #ff5f56; }
+  dd.good { color: #4ade80; }
+
+  button { padding: 9px 16px; font-size: 13px; border-radius: 6px; border: none;
+           background: #ff2fc8; color: #fff; cursor: pointer; }
+  button:disabled { background: #444; cursor: default; }
+  .row { display: flex; gap: 10px; margin-bottom: 14px; }
+  #status { font-size: 12.5px; color: #999; margin-top: 10px; max-width: 640px; line-height: 1.5; }
+  .hint { font-size: 11.5px; color: #666; line-height: 1.6; margin-top: 10px; max-width: 640px; }
+</style>
+</head>
+<body>
+
+<h1>서버 합성 — GPU 얼굴파싱 (SegFormer 19클래스 + CUDA 그래프)</h1>
+<div class="sub">
+  서버가 세그멘테이션과 오버레이 합성을 모두 끝낸 <b>완성된 영상</b>을 내려보냅니다 —
+  클라이언트 레이어가 하나뿐이라 어긋남이 구조적으로 불가능합니다.
+  로컬 비교군: <a href="/warp.html">/warp.html</a>
+</div>
+
+<div class="row">
+  <button id="start">연결 시작</button>
+  <button id="stop" disabled>종료</button>
+  <select id="mode" style="background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:0 10px;font-size:13px">
+    <option value="seg" selected>세그멘테이션 색칠</option>
+    <option value="remove">기존 머리 지우기</option>
+    <option value="tryon">새 헤어 씌우기</option>
+    <option value="plate">누적 플레이트 보기</option>
+  </select>
+  <select id="capres" style="background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:0 10px;font-size:13px">
+    <option value="1280x720" selected>캡처 1280×720</option>
+    <option value="640x480">캡처 640×480</option>
+    <option value="1920x1080">캡처 1920×1080</option>
+  </select>
+  <button id="shoot" disabled style="background:#22c55e">📷 사진 찍기 (GAN)</button>
+  <button id="livebank" disabled style="background:#8b5cf6">🎞 라이브 뱅크 만들기</button>
+  <button id="record" disabled style="background:#444">⏺ 학습 프레임 수집</button>
+  <span id="rec-info" style="font-size:12px;color:#888;align-self:center"></span>
+</div>
+
+<div class="layout">
+  <div class="main">
+    <div class="cap">서버가 합성해서 보낸 영상 (머리=마젠타, 얼굴피부=시안)</div>
+    <div style="position:relative;width:640px;height:480px">
+      <video id="remote" autoplay playsinline></video>
+      <div id="lb-overlay" style="display:none;position:absolute;inset:0;border-radius:8px;
+           background:rgba(8,8,10,.94);color:#eee;flex-direction:column;
+           align-items:center;justify-content:center;gap:14px;text-align:center">
+        <div style="font-size:15px;font-weight:600" id="lb-ov-title">헤어를 생성하는 중입니다</div>
+        <div style="font-size:12.5px;color:#999" id="lb-ov-sub">잠시만 기다려 주세요</div>
+        <div style="width:280px;height:6px;background:#2a2a2e;border-radius:3px;overflow:hidden">
+          <div id="lb-ov-bar" style="width:0%;height:100%;background:#8b5cf6;transition:width .4s"></div>
+        </div>
+        <div style="font-size:11.5px;color:#666;max-width:340px;line-height:1.6">
+          생성 중에는 영상 전송을 멈춥니다 — GPU를 GAN에 몰아주면 더 빨리 끝납니다.
+        </div>
+      </div>
+    </div>
+    <div class="cap" style="margin-top:8px">
+      원본 (참고용) —
+      <label style="color:#999"><input type="checkbox" id="sync-preview" checked> 합성본에 지연 맞춤</label>
+      <span id="delay-label" style="color:#666"></span>
+    </div>
+    <div style="position:relative;width:200px;height:150px">
+      <video id="local" autoplay muted playsinline
+             style="position:absolute;top:0;left:0;opacity:0;pointer-events:none"></video>
+      <canvas id="local-canvas" width="200" height="150"
+              style="position:absolute;top:0;left:0;width:200px;height:150px;
+                     background:#000;border-radius:8px;transform:scaleX(-1)"></canvas>
+    </div>
+    <div id="status">대기 중.</div>
+    <div id="result-wrap" style="display:none;margin-top:18px">
+      <div class="cap" style="margin-bottom:6px">GAN 결과 <span id="result-meta" style="color:#4ade80"></span></div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div><div class="cap">촬영 원본</div><img id="result-before" style="width:300px;border-radius:8px;display:block" alt="촬영 원본"></div>
+        <div><div class="cap">합성 결과</div><img id="result-after" style="width:300px;border-radius:8px;display:block" alt="GAN 합성 결과"></div>
+      </div>
+    </div>
+
+    <div class="hint">
+      <b>[기존 머리 지우기]</b> — 정지 사진에서 인페인팅이 실패했던 이유는 머리 뒤에
+      뭐가 있었는지 정보가 아예 없어서였습니다(그래서 환각). 영상에서는 고개를 돌리면
+      가려졌던 픽셀이 실제로 드러나므로, 그 순간을 기록해 두면 <b>실제로 관측된 픽셀</b>로
+      채울 수 있습니다.<br>
+      → 켜고 나서 <b>고개를 좌우로 천천히 돌려 보세요.</b> 커버리지가 올라가면서
+      머리가 점점 지워집니다. 아직 한 번도 드러난 적 없는 부분은 근거가 없으므로
+      일부러 원본을 남깁니다(환각하지 않음).
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="panel">
+      <h2>서버</h2>
+      <dl>
+        <dt>디바이스</dt><dd id="s-device">-</dd>
+        <dt>CUDA 그래프</dt><dd id="s-graph">-</dd>
+        <dt>추론</dt><dd id="s-infer">-</dd>
+        <dt>전처리 / 후처리</dt><dd id="s-prepost">-</dd>
+        <dt>처리 합계</dt><dd id="s-proc">-</dd>
+        <dt>수신 대기</dt><dd id="s-wait">-</dd>
+        <dt>서버 fps</dt><dd id="s-fps">-</dd>
+        <dt>머리 픽셀</dt><dd id="s-hair">-</dd>
+        <dt>플레이트 커버리지</dt><dd id="s-cov">-</dd>
+        <dt>누적 프레임</dt><dd id="s-plateframes">-</dd>
+        <dt>frame #</dt><dd id="s-frame">-</dd>
+      </dl>
+    </div>
+    <div class="panel">
+      <h2>라이브 뱅크 (각도별 GAN 생성)</h2>
+      <label style="font-size:12.5px;color:#bbb;display:block;margin-bottom:8px">각도 칸 수
+        <select id="lb-count" style="width:100%;margin-top:4px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:4px">
+          <option value="7" selected>7칸 · 12° 간격 (약 70초, 가장 자연스러움)</option>
+          <option value="5">5칸 · 16° 간격 (약 50초)</option>
+          <option value="3">3칸 · 30° 간격 (약 30초, 가장 빠름)</option>
+        </select>
+      </label>
+      <div id="lb-buckets" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px"></div>
+      <div id="lb-status" style="font-size:12px;color:#888;line-height:1.5">
+        [라이브 뱅크 만들기]를 누르면 지금 앉은 사람 기준으로 좌·정면·우
+        헤어를 그 자리에서 생성합니다.
+      </div>
+      <div style="font-size:11.5px;color:#666;margin-top:8px;line-height:1.5">
+        안내하는 각도로 고개를 돌리고 <b>잠깐 멈추면</b> 자동으로 찍힙니다.
+        움직이는 중에는 흔들림 때문에 안 찍습니다. 한 칸이 완성되는 즉시
+        각도가 다 모이면 영상이 멈추고 생성 화면으로 넘어갑니다.
+        칸이 많을수록 전환이 덜 보이지만 생성 시간이 그만큼 늘어납니다.
+      </div>
+    </div>
+    <div class="panel">
+      <h2>사진 찍기 (GAN 고화질)</h2>
+      <label style="font-size:12.5px;color:#bbb">참고 헤어스타일
+        <select id="reference" style="width:100%;margin-top:4px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:4px"></select>
+      </label>
+      <div id="shoot-status" style="font-size:12px;color:#888;margin-top:10px;line-height:1.5">
+        실시간 미리보기로 각도를 맞춘 뒤 [사진 찍기]를 누르세요.
+      </div>
+      <div style="font-size:11.5px;color:#666;margin-top:8px;line-height:1.5">
+        GAN은 장당 약 9초입니다. 최초 1회는 모델 적재로 90초쯤 더 걸립니다.
+        정면을 보고, 머리 위·양옆에 여백이 남도록 조금 물러나면 결과가 좋아집니다.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>헤어 피팅</h2>
+      <dl>
+        <dt>앵커 소스</dt><dd id="s-anchor">-</dd>
+        <dt>yaw</dt><dd id="s-yaw2">-</dd>
+        <dt>거리 (tz)</dt><dd id="s-tz">-</dd>
+        <dt>눈간격 관측/보정</dt><dd id="s-dd">-</dd>
+      </dl>
+      <div style="display:flex;flex-direction:column;gap:9px;margin-top:12px">
+        <label style="font-size:12.5px;color:#bbb">다각도 뱅크
+          <select id="bank" style="width:100%;margin-top:4px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:4px"></select>
+        </label>
+        <label style="font-size:12.5px;color:#bbb">에셋 (뱅크 미사용 시)
+          <select id="asset" style="width:100%;margin-top:4px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:4px"></select>
+        </label>
+        <div style="font-size:11.5px;color:#666">사용 중: <span id="s-used" style="color:#4ade80">-</span></div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#bbb">크기
+          <input type="range" id="f-scale" min="60" max="180" value="100" style="flex:1">
+          <span id="v-f-scale" style="width:34px;text-align:right;color:#fff">100</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#bbb">상하
+          <input type="range" id="f-offset" min="-100" max="100" value="0" style="flex:1">
+          <span id="v-f-offset" style="width:34px;text-align:right;color:#fff">0</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#bbb">
+          <input type="checkbox" id="f-harmonize" checked> 조명/색 정합
+          <span id="s-harm" style="margin-left:auto;color:#666;font-size:11px"></span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#bbb">
+          <input type="checkbox" id="f-blend"> <b>증류 블렌더</b>
+          <span id="s-blend" style="margin-left:auto;color:#666;font-size:11px"></span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#bbb">떨림잡기
+          <input type="range" id="f-smooth" min="0" max="200" value="100" style="flex:1">
+          <span id="v-f-smooth" style="width:34px;text-align:right;color:#fff">100</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#bbb">그림자
+          <input type="range" id="f-shadow" min="0" max="100" value="35" style="flex:1">
+          <span id="v-f-shadow" style="width:34px;text-align:right;color:#fff">35</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>왕복 / 버퍼</h2>
+      <dl>
+        <dt>ping RTT</dt><dd id="s-rtt">-</dd>
+        <dt>지터버퍼 지연</dt><dd id="s-jb">-</dd>
+        <dt>수신 fps</dt><dd id="s-infps">-</dd>
+        <dt>프레임 손실</dt><dd id="s-drop">-</dd>
+        <dt>미리보기 지연</dt><dd id="s-pvdelay">-</dd>
+      </dl>
+    </div>
+  </div>
+</div>
+
+<script src="preflight.js"></script>
+<script src="client.js"></script>
+</body>
+</html>

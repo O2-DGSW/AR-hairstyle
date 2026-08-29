@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>Phase 0 - 헤어 워핑 추적 테스트 (브라우저 GPU)</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; }
+  h1 { font-size: 15px; font-weight: 600; color: #aaa; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #666; margin-bottom: 18px; }
+  .layout { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+
+  .stage { position: relative; width: 640px; height: 480px; background: #000; border-radius: 8px;
+           overflow: hidden; transform: scaleX(-1); }
+  .stage video, .stage canvas { position: absolute; top: 0; left: 0; width: 640px; height: 480px; }
+
+  .side { display: flex; flex-direction: column; gap: 14px; min-width: 250px; }
+  .panel { background: #1b1b1b; border-radius: 8px; padding: 14px 16px; font-size: 13px; }
+  .panel h2 { font-size: 12px; margin: 0 0 10px; color: #888; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; }
+  dt { color: #999; }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; color: #fff; }
+  dd.warn { color: #ff5f56; }
+  dd.good { color: #4ade80; }
+
+  .ctl { display: flex; flex-direction: column; gap: 9px; }
+  .ctl label { display: flex; align-items: center; gap: 8px; color: #bbb; font-size: 12.5px; }
+  .ctl input[type=range] { flex: 1; }
+  .ctl .val { width: 42px; text-align: right; color: #fff; font-variant-numeric: tabular-nums; }
+
+  button { padding: 9px 16px; font-size: 13px; border-radius: 6px; border: none;
+           background: #ff2fc8; color: #fff; cursor: pointer; }
+  button:disabled { background: #444; cursor: default; }
+  .row { display: flex; gap: 10px; margin-bottom: 14px; }
+  #status { font-size: 12.5px; color: #999; margin-top: 10px; max-width: 640px; line-height: 1.5; }
+  .hint { font-size: 11.5px; color: #666; line-height: 1.5; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h1>Phase 0 — 헤어 워핑 추적 테스트</h1>
+<div class="sub">MediaPipe Face Landmarker (WebGL GPU 델리게이트) · 서버 왕복 없음 · 전부 이 브라우저에서 처리</div>
+
+<div class="row">
+  <button id="start">시작</button>
+  <button id="stop" disabled>정지</button>
+</div>
+
+<div class="layout">
+  <div>
+    <div class="stage">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="overlay" width="640" height="480"></canvas>
+    </div>
+    <div id="status">대기 중 — [시작]을 누르면 웹캠 권한을 요청합니다.</div>
+    <div class="hint">
+      <b>[카메라 동기화]를 켰다 껐다 하며 비교해 보세요.</b>
+      끄면 비디오는 실시간인데 헤어만 늦게 따라옵니다(= 따로 논다).
+      켜면 화면 전체가 추론 시간만큼 같이 늦어지는 대신 헤어가 머리에서 떨어지지 않습니다.
+      단, 켜면 화면 갱신 속도가 추론 속도에 묶이므로 추론이 느리면 영상이 뚝뚝 끊깁니다.<br><br>
+      그 다음 확인할 것 ① 가만히 있을 때 jitter 값 ② yaw가 커질 때 어디서부터 부자연스러운가
+      → Phase 1(가림)·Phase 2(포즈) 설계 근거가 됩니다.
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="panel">
+      <h2>측정</h2>
+      <dl>
+        <dt>델리게이트</dt><dd id="s-delegate">-</dd>
+        <dt>프레임 소스</dt><dd id="s-src">-</dd>
+        <dt>렌더 fps</dt><dd id="s-fps">-</dd>
+        <dt>랜드마크 추론</dt><dd id="s-detect">-</dd>
+        <dt>프레임 지연</dt><dd id="s-age">-</dd>
+        <dt>중복 스킵</dt><dd id="s-dup">-</dd>
+        <dt>오버레이 늦음</dt><dd id="s-late">-</dd>
+        <dt>예측 horizon</dt><dd id="s-horizon">-</dd>
+        <dt>얼굴 검출</dt><dd id="s-face">-</dd>
+        <dt>jitter (RMS)</dt><dd id="s-jitter">-</dd>
+        <dt>yaw</dt><dd id="s-yaw">-</dd>
+        <dt>pitch</dt><dd id="s-pitch">-</dd>
+        <dt>roll</dt><dd id="s-roll">-</dd>
+      </dl>
+    </div>
+
+    <div class="panel">
+      <h2>표시</h2>
+      <div class="ctl">
+        <label><input type="checkbox" id="c-sync" checked> <b>카메라 동기화</b></label>
+        <label><input type="checkbox" id="c-hair" checked> 헤어 표시</label>
+        <label><input type="checkbox" id="c-marks"> 앵커점 3개 표시</label>
+        <label><input type="checkbox" id="c-mesh"> 랜드마크 전체 표시</label>
+        <label>필터
+          <select id="c-filter" style="flex:1;background:#222;color:#eee;border:1px solid #444;border-radius:4px;padding:3px">
+            <option value="ab" selected>알파-베타 (권장)</option>
+            <option value="ema">EMA (기존 / 비교용)</option>
+            <option value="none">없음 (생 랜드마크)</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>피팅</h2>
+      <div class="ctl">
+        <label>크기 <input type="range" id="c-scale" min="60" max="180" value="100"><span class="val" id="v-scale">100</span></label>
+        <label>상하 <input type="range" id="c-offset" min="-80" max="80" value="0"><span class="val" id="v-offset">0</span></label>
+        <label>투명도 <input type="range" id="c-alpha" min="10" max="100" value="90"><span class="val" id="v-alpha">90</span></label>
+        <label>필터강도 <input type="range" id="c-ema" min="10" max="90" value="45"><span class="val" id="v-ema">45</span></label>
+      </div>
+      <div class="hint">헤어 PNG(투명배경) 교체:<br><input type="file" id="c-file" accept="image/png,image/webp" style="margin-top:6px;font-size:11px;color:#888"></div>
+    </div>
+  </div>
+</div>
+
+<script src="preflight.js"></script>
+<script type="module" src="warp.js"></script>
+</body>
+</html>
