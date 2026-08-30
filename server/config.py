@@ -119,6 +119,16 @@ class Config:
     gan_load_timeout_s: float = 420.0
     #: 합성 1회 대기 상한(초). 실측 ~9초.
     gan_call_timeout_s: float = 240.0
+    #: 파인튜닝한 Rotate 체크포인트 경로. 빈 문자열이면 HairFastGAN 기본값
+    #: (pretrained_models/Rotate/rotate_best.pth)을 쓴다.
+    #:
+    #: Rotate 는 참고사진의 머리를 사용자 얼굴 각도로 돌리는 모듈이라
+    #: (models/Alignment.py:59) 큰 각도 품질을 좌우한다. 홀드아웃 600쌍 실측:
+    #:     |dyaw| 30~40도  16.29 -> 15.42  (-5.3%)
+    #:     |dyaw| 40도+    20.06 -> 19.15  (-4.5%)
+    #: 회전량(rot_norm)과 정체성(id_cos)은 그대로라 트레이드오프가 아니다.
+    #: 학습/평가 도구는 server/train/finetune/ 참고.
+    gan_rotate_checkpoint: str = ""
     #: GAN 이 도는 동안에도 실시간 영상을 계속 내보낼지.
     #: 예전에는 검은 프레임을 흘려보냈다. GAN 이 같은 프로세스에 있어서 이벤트
     #: 루프와 GPU 를 통째로 잡아먹었기 때문인데, 별도 프로세스로 분리한 지금은

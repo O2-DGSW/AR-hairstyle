@@ -67,7 +67,19 @@ class GanWorker:
                 os.chdir(HAIRFAST_DIR)
                 try:
                     from hair_swap import HairFast, get_parser
-                    self._hf = HairFast(get_parser().parse_args([]))
+                    opts = get_parser().parse_args([])
+                    ck = CONFIG.gan_rotate_checkpoint
+                    if ck:
+                        # 여기서 cwd 는 HAIRFAST_DIR 이다. 사용자가 준 상대경로는
+                        # 레포 루트 기준이므로 절대경로로 바꿔서 넘긴다.
+                        if not os.path.isabs(ck):
+                            ck = os.path.abspath(os.path.join(os.path.dirname(ROOT), ck))
+                        if not os.path.isfile(ck):
+                            raise FileNotFoundError(
+                                f"gan_rotate_checkpoint 를 찾을 수 없다: {ck}")
+                        opts.rotate_checkpoint = ck
+                        log(f"파인튜닝 Rotate 체크포인트 사용: {ck}")
+                    self._hf = HairFast(opts)
                 finally:
                     os.chdir(cwd)
 
