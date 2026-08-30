@@ -677,6 +677,28 @@ class GpuFaceParser:
                     new_rgb = (new_rgb * ratio.view(1, 1, 3)).clamp(0, 255)
                     harmonized = True
 
+        # --- 눈/눈썹 보호 ---
+        # 새 헤어 알파에서 이 영역을 깎아 둔다. 안 그러면 에셋에 앞머리가 있을 때
+        # 눈까지 통째로 덮어서 마네킹처럼 보인다. 파싱이 실제로 '눈'으로 분류한
+        # 픽셀에만 적용되므로, 원래 앞머리에 가려 안 보이던 눈썹은 여기에 안 잡힌다
+        # (애초에 관측된 적이 없어 되살릴 수 없다).
+        protect = None
+        if mode == "tryon" and (CONFIG.protect_eyes > 0 or CONFIG.protect_brows > 0):
+            p = torch.zeros_like(hair_a)
+            if CONFIG.protect_eyes > 0:
+                eye_m = ((cls == CLS_EYE_L) | (cls == CLS_EYE_R) |
+                         (cls == CLS_EYE_G)).float()
+                p = torch.maximum(p, eye_m * float(CONFIG.protect_eyes))
+            if CONFIG.protect_brows > 0:
+                brow_m = ((cls == CLS_BROW_L) | (cls == CLS_BROW_R)).float()
+                p = torch.maximum(p, brow_m * float(CONFIG.protect_brows))
+            k = max(1, int(CONFIG.protect_blur_k) | 1)          # 홀수로
+            p = F.avg_pool2d(p.unsqueeze(0).unsqueeze(0), k, stride=1,
+                             padding=k // 2).squeeze(0).squeeze(0)
+            protect = p.clamp(0.0, 1.0)
+            if new_a is not None:
+                new_a = new_a * (1.0 - protect).unsqueeze(-1)
+
         if mode in ("remove", "tryon") and plate is not None and plate.seen is not None:
             # 기존 머리를 "그 자리에서 실제로 관측된 적 있는" 픽셀로 채운다.
             # 두 가지 안전장치가 없으면 사고가 난다:
@@ -693,8 +715,25 @@ class GpuFaceParser:
             fill = plate.plate
             src_ok = plate.seen.float()
 
+            if protect is not None:
+                # 보이는 눈/눈썹 위에 피부톤을 칠하지 않는다.
+                erase = erase * (1.0 - protect)
+
             if eyes is not None:
                 zone = self._face_zone(eyes[0], eyes[1], h, w)          # (h,w) 0~1
+                if new_a is not None:
+                    # **새 헤어보다 위쪽은 얼굴이 아니라 배경이다.**
+                    # _face_zone 은 눈 위 2.35d 까지 뻗는데(불투명 구간만 1.73d),
+                    # 실측한 정수리 높이가 1.84d 라 타원이 머리를 넘어선다. 거기까지
+                    # 피부톤을 쓰면 원래 머리가 새 헤어보다 클 때 그 차이만큼
+                    # **살색 덩어리**가 헤어 위에 뜬다.
+                    #
+                    # 열마다 "이 픽셀 위쪽에서 새 헤어를 만난 적이 있는가"를
+                    # 누적최대로 구해서 그 아래로만 피부톤을 허용한다. 위쪽은
+                    # 아래 src_ok 가 플레이트 관측 여부를 그대로 따르므로
+                    # 배경으로 채워진다. (.item() 없이 GPU 에서 끝난다)
+                    below = torch.cummax(new_a.squeeze(-1), dim=0).values
+                    zone = zone * below
                 tone = self._skin_tone(frame_f, cls).view(1, 1, 3)
                 fill = fill * (1.0 - zone).unsqueeze(-1) + tone * zone.unsqueeze(-1)
                 # 얼굴 영역은 플레이트 관측 여부와 무관하게 피부톤으로 채울 수 있다
