@@ -51,6 +51,8 @@ class GanWorker:
         self._shape_predictor = None   # dlib 68점 예측기. 한 번만 만든다.
         self._lock = threading.Lock()
         self.load_seconds = None
+        #: 현재 적재된 Rotate 체크포인트 절대경로. 적재 전에는 None.
+        self.rotate_checkpoint = None
 
     # ---------- 모델 ----------
     def ensure_loaded(self, log=print):
@@ -80,6 +82,9 @@ class GanWorker:
                         opts.rotate_checkpoint = ck
                         log(f"파인튜닝 Rotate 체크포인트 사용: {ck}")
                     self._hf = HairFast(opts)
+                    # opts.rotate_checkpoint 는 기본값일 때 HAIRFAST_DIR 상대경로다.
+                    # 지금 cwd 가 거기라 abspath 가 올바르게 풀린다.
+                    self.rotate_checkpoint = os.path.abspath(opts.rotate_checkpoint)
                 finally:
                     os.chdir(cwd)
 
@@ -90,6 +95,31 @@ class GanWorker:
     @property
     def loaded(self):
         return self._hf is not None
+
+    def set_rotate(self, ckpt_path: str, log=print) -> str:
+        """Rotate 모듈 가중치만 갈아끼운다. -> 적용된 절대경로.
+
+        원본과 파인튜닝본을 번갈아 보려고 서버를 다시 띄우면 매번 모델 적재에
+        20~90초가 들고, 그 사이 조건도 흔들려 비교가 어렵다. Rotate 는 6.6M
+        (25MB)뿐이고 StyleGAN(30.4M)/e4e 와 독립이라 이것만 바꾸면 즉시 끝난다.
+
+        캐시는 건드리지 않아도 된다. _aligned_ref_cache 는 FFHQ 정렬 결과라
+        Rotate 와 무관하다. 이미 만들어 둔 에셋은 예전 모델의 산출물로 그대로
+        남으므로, 비교하려면 새로 촬영해야 한다.
+        """
+        import torch
+        hf = self.ensure_loaded(log)
+        ckpt_path = os.path.abspath(ckpt_path)
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"Rotate 체크포인트가 없다: {ckpt_path}")
+        with self._lock:
+            dev = hf.align.opts.device
+            sd = torch.load(ckpt_path, map_location=dev)["model_state_dict"]
+            hf.align.rotate_model.load_state_dict(sd)
+            hf.align.rotate_model.to(dev).eval()
+            self.rotate_checkpoint = ckpt_path
+        log(f"Rotate 체크포인트 교체: {ckpt_path}")
+        return ckpt_path
 
     def close(self):
         """들고 있는 보조 리소스를 놓는다. 여러 번 불러도 안전하다.

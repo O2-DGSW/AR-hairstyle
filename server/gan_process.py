@@ -219,6 +219,39 @@ class GanClient:
         return rep
 
     # ---------- 합성 ----------
+    def set_rotate(self, ckpt_path, log=print):
+        """Rotate 체크포인트만 교체한다 -> 적용된 절대경로.
+
+        GanWorker.set_rotate 와 시그니처가 같다. 모델이 아직 안 올라갔으면
+        이 호출이 적재(~90초)를 포함하므로 그때는 긴 타임아웃을 쓴다.
+        """
+        ckpt_path = os.path.abspath(ckpt_path)
+        if self._backend == "thread":
+            return self._thread_set_rotate(ckpt_path, log)
+
+        with self._io_lock:
+            child = self._ensure_child(log)
+            if child is None:                     # 기동 실패 -> thread 로 폴백됨
+                return self._thread_set_rotate(ckpt_path, log)
+            timeout = (self._cfg.gan_load_timeout_s if not self._loaded
+                       else self._cfg.gan_call_timeout_s)
+            rep = self._roundtrip(child, {"op": "set_rotate",
+                                          "checkpoint": ckpt_path}, timeout)
+
+        if not rep.get("ok"):
+            tb = rep.get("traceback")
+            if tb:
+                logger.error("Rotate 교체 실패:\n%s", tb)
+            self._last_error = rep.get("error") or "알 수 없는 Rotate 교체 실패"
+            raise RuntimeError(self._last_error)
+        self._loaded = True
+        self._rotate_checkpoint = rep["checkpoint"]
+        return rep["checkpoint"]
+
+    @property
+    def rotate_checkpoint(self):
+        return getattr(self, "_rotate_checkpoint", None)
+
     def swap(self, face_bgr, shape_path, color_path=None, log=print):
         """웹캠 BGR 프레임 + 헤어 참고사진 경로 -> (합성된 BGR 이미지, 소요 초).
 
@@ -260,6 +293,8 @@ class GanClient:
         self._loaded = True
         if rep.get("load_seconds") is not None:
             self._load_seconds = rep["load_seconds"]
+        if rep.get("rotate_checkpoint"):
+            self._rotate_checkpoint = rep["rotate_checkpoint"]
         return rep["result"], float(rep["seconds"])
 
     # ---------- 내부: 파이프 왕복 ----------
@@ -550,6 +585,15 @@ class GanClient:
             self._thread_worker = gan_worker.GanWorker()
         return self._thread_worker
 
+    def _thread_set_rotate(self, ckpt_path, log):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("이미 close() 된 GanClient 입니다")
+            worker = self._ensure_thread_worker()
+        path = worker.set_rotate(ckpt_path, log=log)
+        self._rotate_checkpoint = path
+        return path
+
     def _thread_swap(self, face_bgr, shape_path, color_path, log):
         with self._lock:
             if self._closed:
@@ -610,12 +654,22 @@ def _worker_main(host: str, port: int) -> int:
                     pass
                 log("종료 요청을 받았습니다.")
                 break
+            elif op == "set_rotate":
+                try:
+                    path = worker.set_rotate(req["checkpoint"], log=log)
+                    conn.send({"ok": True, "checkpoint": path, "loaded": True,
+                               "load_seconds": worker.load_seconds})
+                except Exception as e:
+                    conn.send({"ok": False, "error": "%s: %s" % (type(e).__name__, e),
+                               "traceback": traceback.format_exc(),
+                               "loaded": worker.loaded})
             elif op == "swap":
                 try:
                     out, seconds = worker.swap(req["face"], req["shape"],
                                                req.get("color"), log=log)
                     conn.send({"ok": True, "result": out, "seconds": float(seconds),
-                               "loaded": True, "load_seconds": worker.load_seconds})
+                               "loaded": True, "load_seconds": worker.load_seconds,
+                               "rotate_checkpoint": worker.rotate_checkpoint})
                 except Exception as e:
                     # 예외를 그대로 pickle 하면 사용자 정의 예외 클래스를 부모가
                     # import 못 해 recv 에서 다시 터진다. 문자열로 평탄화한다.

@@ -932,6 +932,97 @@ async def run_capture(state: PeerState, reference: str):
 # HTTP 핸들러
 # ---------------------------------------------------------------------------
 
+def rotate_variants():
+    """고를 수 있는 Rotate 체크포인트 -> {이름: 절대경로}.
+
+    **미리 정의한 것만 노출한다.** 클라이언트가 임의 경로를 주게 두면 디스크의
+    아무 파일이나 로드를 시도하게 되는데, 비교 UI 하나 만들자고 열어 줄 문이
+    아니다. 클라이언트는 이 이름 중에서만 고른다.
+    """
+    out = {"base": os.path.join(gan_process.gan_worker.HAIRFAST_DIR,
+                                "pretrained_models", "Rotate", "rotate_best.pth")}
+
+    def add(name, raw):
+        if not raw:
+            return
+        p = raw if os.path.isabs(raw) else os.path.abspath(
+            os.path.join(os.path.dirname(ROOT), raw))
+        if os.path.isfile(p):
+            out.setdefault(name, p)
+
+    add("finetuned", CONFIG.gan_rotate_finetuned)
+    # 기동 시 지정한 것이 위 둘과 다르면 "startup" 이라는 이름으로 함께 노출한다.
+    # 안 그러면 그 체크포인트로 띄웠을 때 되돌아갈 방법이 없다.
+    ck = CONFIG.gan_rotate_checkpoint
+    if ck:
+        p = ck if os.path.isabs(ck) else os.path.abspath(
+            os.path.join(os.path.dirname(ROOT), ck))
+        if os.path.isfile(p) and p not in out.values():
+            out["startup"] = p
+    return out
+
+
+def _variant_of(path):
+    if not path:
+        return None
+    for name, p in rotate_variants().items():
+        if os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(path)):
+            return name
+    return "custom"
+
+
+async def model_get(request):
+    """현재 Rotate 체크포인트와 고를 수 있는 목록."""
+    app = request.app["state"]
+    cur = app.gan.rotate_checkpoint if app.gan else None
+    return web.json_response({
+        "variant": _variant_of(cur),
+        "checkpoint": cur,
+        "available": sorted(rotate_variants().keys()),
+        "loaded": bool(app.gan and app.gan.loaded),
+    })
+
+
+async def model_set(request):
+    """Rotate 체크포인트 교체. body: {"variant": "base"|"finetuned"}
+
+    원본과 파인튜닝본을 번갈아 보려면 지금까지 서버를 재기동해야 했고 매번
+    모델 적재에 20~90초가 들었다. Rotate 는 25MB 라 이것만 갈아끼우면 된다.
+    """
+    app = request.app["state"]
+    if app.gan is None:
+        return web.json_response(
+            {"error": "no_gan", "message": "GAN 워커가 없습니다"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"error": "bad_json", "message": "JSON 본문이 필요합니다"}, status=400)
+
+    variants = rotate_variants()
+    name = str(body.get("variant") or "")
+    if name not in variants:
+        return web.json_response(
+            {"error": "bad_variant",
+             "message": "variant 는 %s 중 하나여야 합니다" % ", ".join(sorted(variants))},
+            status=400)
+
+    loop = asyncio.get_event_loop()
+    try:
+        # 모델이 아직 안 올라갔으면 여기서 적재까지 일어난다(최대 ~90초).
+        # 실시간 경로를 막지 않도록 GAN 전용 executor 에서 돌린다.
+        path = await loop.run_in_executor(
+            app.gan_executor, app.gan.set_rotate, variants[name], logger.info)
+    except Exception as e:
+        logger.exception("Rotate 교체 실패")
+        return web.json_response(
+            {"error": "swap_failed",
+             "message": "%s: %s" % (type(e).__name__, e)}, status=500)
+
+    logger.info("Rotate 체크포인트 -> %s (%s)", name, path)
+    return web.json_response({"variant": name, "checkpoint": path})
+
+
 async def references_list(request):
     """참고 헤어스타일 목록. 연결 전에도 UI를 채울 수 있도록 HTTP로 노출한다.
     (DataChannel 통계에만 실어 보내면 [연결 시작] 전에는 목록이 비어 보인다)
@@ -1582,6 +1673,8 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
 
     app.router.add_get("/", index)
     app.router.add_post("/offer", offer)
+    app.router.add_get("/model", model_get)
+    app.router.add_post("/model", model_set)
     app.router.add_get("/references", references_list)
     app.router.add_post("/references", references_upload)
     app.router.add_delete("/references/{name}", references_delete)

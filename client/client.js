@@ -94,6 +94,62 @@ function refSay(msg, color) {
   refStatus.style.color = color || "#888";
 }
 
+/* ---------- Rotate 모델 A/B ----------
+ * Rotate 는 참고사진의 머리를 사용자 얼굴 각도로 돌리는 모듈이라 큰 각도
+ * 품질을 좌우한다. 원본과 파인튜닝본을 번갈아 보려면 예전에는 서버를 다시
+ * 띄워야 했고 매번 모델 적재에 20~90초가 들었다. 25MB 짜리 Rotate 만
+ * 갈아끼우면 되므로 서버가 /model 로 런타임 교체를 받는다. */
+const rotSel = el("rotate-model"), rotStatus = el("rotate-status");
+const ROT_LABEL = { base: "원본 (HairFastGAN 배포본)", finetuned: "파인튜닝본",
+                    startup: "기동 시 지정본", custom: "직접 지정" };
+
+function rotSay(msg, color) {
+  rotStatus.textContent = msg;
+  rotStatus.style.color = color || "#888";
+}
+
+async function loadRotateModel() {
+  try {
+    const r = await fetch("/model");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    rotSel.innerHTML = "";
+    for (const name of d.available) {
+      const o = document.createElement("option");
+      o.value = name;
+      o.textContent = ROT_LABEL[name] || name;
+      rotSel.appendChild(o);
+    }
+    if (d.variant) rotSel.value = d.variant;
+    rotSay(d.loaded ? "적재됨" : "첫 촬영 때 적재됩니다 (약 20~90초)");
+  } catch (e) {
+    rotSay(`목록을 못 읽었습니다: ${e.message}`, "#ff5f56");
+  }
+}
+
+rotSel.addEventListener("change", async () => {
+  const want = rotSel.value;
+  rotSel.disabled = true;
+  rotSay("교체 중... (모델이 아직이면 적재까지 최대 90초)", "#ffd400");
+  try {
+    const r = await fetch("/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ variant: want }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.message || `HTTP ${r.status}`);
+    rotSay(`${ROT_LABEL[d.variant] || d.variant} 적용됨. 새로 촬영해 보세요.`, "#4ade80");
+  } catch (e) {
+    rotSay(`교체 실패: ${e.message}`, "#ff5f56");
+    await loadRotateModel();          // 서버의 실제 상태로 되돌린다
+  } finally {
+    rotSel.disabled = false;
+  }
+});
+
+loadRotateModel();
+
 refUpBtn.addEventListener("click", async () => {
   const f = refFile.files && refFile.files[0];
   if (!f) return refSay("사진 파일을 먼저 고르세요.", "#ffd400");

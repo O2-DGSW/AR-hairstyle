@@ -129,6 +129,14 @@ class Config:
     #: 회전량(rot_norm)과 정체성(id_cos)은 그대로라 트레이드오프가 아니다.
     #: 학습/평가 도구는 server/train/finetune/ 참고.
     gan_rotate_checkpoint: str = ""
+    #: A/B 비교용 후보. GET/POST /model 이 이걸 "finetuned" 로 노출한다.
+    #: 파일이 없으면 그냥 목록에서 빠진다(에러 아님).
+    #:
+    #: gan_rotate_checkpoint 와 나눈 이유: 저건 "기동 시 무엇을 올릴까"이고
+    #: 이건 "런타임에 무엇과 비교할까"다. 하나로 합치면 기본 모델로 띄웠을 때
+    #: 비교 대상이 사라져서 토글 자체가 불가능해진다.
+    gan_rotate_finetuned: str = (
+        "server/train/finetune/runs/HairFast-Rotate_control-random/step003000.pth")
     #: GAN 이 도는 동안에도 실시간 영상을 계속 내보낼지.
     #: 예전에는 검은 프레임을 흘려보냈다. GAN 이 같은 프로세스에 있어서 이벤트
     #: 루프와 GPU 를 통째로 잡아먹었기 때문인데, 별도 프로세스로 분리한 지금은
