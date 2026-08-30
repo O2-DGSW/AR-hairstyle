@@ -76,7 +76,8 @@ class YawPairDataset(Dataset):
     학습 손실이 그렇게 정의돼 있다(rotate_train.calc_loss).
     """
 
-    def __init__(self, images, key_points, latents, yaws, idx, weights, seed, fixed=False):
+    def __init__(self, images, key_points, latents, yaws, idx, weights, seed, fixed=False,
+                 pairing="stratified"):
         self.images, self.key_points, self.latents = images, key_points, latents
         self.yaws = yaws
         self.idx = np.asarray(idx)
@@ -84,6 +85,7 @@ class YawPairDataset(Dataset):
         self.weights /= self.weights.sum()
         self.fixed = fixed
         self.seed = seed
+        self.pairing = pairing
 
         ys = self.yaws[self.idx]
         o = np.argsort(ys)
@@ -99,6 +101,11 @@ class YawPairDataset(Dataset):
 
     def _sample(self, i, rng):
         a = int(self.idx[i])
+        if self.pairing == "random":
+            # 대조군. 원본 rotate_train.py:203 과 같은 완전 무작위 페어링이다.
+            # 층화 경로와 코드가 전부 같고 짝을 고르는 규칙만 다르므로,
+            # 두 실행의 차이는 오직 Δyaw 분포에서만 온다.
+            return a, int(self.idx[rng.integers(0, len(self.idx))])
         y = float(self.yaws[a])
         b = int(rng.choice(len(BUCKETS), p=self.weights))
         lo, hi = BUCKETS[b]
@@ -204,9 +211,10 @@ def main(args):
     w = [float(x) for x in args.dyaw_weights.split(",")]
     assert len(w) == len(BUCKETS), f"--dyaw-weights 는 {len(BUCKETS)}개여야 한다"
 
-    train_ds = YawPairDataset(images, kps, lats, yaws, train_idx, w, seed=3407)
+    train_ds = YawPairDataset(images, kps, lats, yaws, train_idx, w, seed=3407,
+                              pairing=args.pairing)
     test_ds = YawPairDataset(images, kps, lats, yaws, test_idx, w, seed=1234, fixed=True)
-    print(f"train {len(train_ds)} / test {len(test_ds)}   Δyaw 가중치 {w}")
+    print(f"train {len(train_ds)} / test {len(test_ds)}   페어링={args.pairing}  Δyaw 가중치 {w}")
     report_distribution(train_ds, tag="train")
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
@@ -239,6 +247,8 @@ if __name__ == "__main__":
     p.add_argument("--dataset", default="rotate_dataset.pt")
     p.add_argument("--name", default="flat-dyaw")
     p.add_argument("--init", default="pretrained_models/Rotate/rotate_best.pth")
+    p.add_argument("--pairing", choices=("stratified", "random"), default="stratified",
+                   help="random 은 원본과 같은 무작위 페어링 (대조군)")
     p.add_argument("--dyaw-weights", default="1,1,1,1,1",
                    help="Δyaw 버킷별 샘플링 가중치 (0-10,10-20,20-30,30-40,40+)")
     p.add_argument("--epochs", type=int, default=15)

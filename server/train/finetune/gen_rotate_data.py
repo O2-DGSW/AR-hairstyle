@@ -72,6 +72,30 @@ def main(args):
         print(f"홀드아웃 {before - len(files)}장 제외 -> {args.exclude}")
     rng = np.random.default_rng(args.seed)
     rng.shuffle(files)
+
+    if args.balance:
+        # |yaw| 버킷별 상한. 희귀한 극단 각도는 전부 살리고 흔한 정면만 잘라낸다.
+        #
+        # 왜 필요한가 - 두 가지 이유가 겹친다.
+        # 1) 메모리. FFHQ 전체 7만 장을 uint8 256px 로 올리면 이미지만 13.7GB 라
+        #    이 머신(15.6GB)에 안 들어간다.
+        # 2) 정면은 이미 남아돈다. 실측한 병목은 |yaw|>=40 이 8,792장 중 114장뿐
+        #    이라는 것이었고(40+ 구간에서 상위 100장이 등장의 32%를 차지),
+        #    정면을 더 넣는다고 그게 나아지지 않는다.
+        buckets = ((0, 10), (10, 20), (20, 30), (30, 40), (40, 400))
+        picked, stats = [], []
+        for lo, hi in buckets:
+            got = [f for f in files if lo <= abs(labels[f]["yaw"]) < hi]
+            keep = got[: args.balance]
+            picked.extend(keep)
+            stats.append((lo, hi, len(got), len(keep)))
+        print(f"|yaw| 버킷별 상한 {args.balance}장:")
+        for lo, hi, tot, keep in stats:
+            print(f"  {lo:3d}~{hi:<3d}도  보유 {tot:6d} -> 사용 {keep:6d}"
+                  + ("   (전량)" if keep == tot else ""))
+        files = picked
+        rng.shuffle(files)
+
     files = files[: args.size]
     yaws = np.array([labels[f]["yaw"] for f in files], dtype=np.float32)
     print(f"이미지 {len(files)}장 (yaw 라벨 있는 것만)")
@@ -123,6 +147,8 @@ if __name__ == "__main__":
     p.add_argument("--yaw", default="yaw.json")
     p.add_argument("--out", default="rotate_dataset.pt")
     p.add_argument("--size", type=int, default=10000)
+    p.add_argument("--balance", type=int, default=0,
+                   help="|yaw| 버킷(0-10/10-20/20-30/30-40/40+)별 최대 장수. 0=끄기")
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--exclude", default="", help="이 JSON 목록의 이미지를 학습에서 제외 (홀드아웃)")
     p.add_argument("--seed", type=int, default=3407)
