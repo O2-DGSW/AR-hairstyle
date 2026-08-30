@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -1055,8 +1056,8 @@ def _inspect_reference(img_bgr):
     with FacePose() as poser:
         pose = poser.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), 0)
     if pose is None:
-        return None, "얼굴을 찾지 못했습니다."
-    return float(pose["d_measured"]), None
+        return None, None, "얼굴을 찾지 못했습니다."
+    return float(pose["d_measured"]), float(pose["yaw"]), None
 
 
 async def references_upload(request):
@@ -1074,7 +1075,7 @@ async def references_upload(request):
             status=413)
 
     reader = await request.multipart()
-    data, name = None, None
+    data, name, force = None, None, False
     while True:
         part = await reader.next()
         if part is None:
@@ -1087,6 +1088,8 @@ async def references_upload(request):
                     {"error": "too_large", "message": "파일이 너무 큽니다"}, status=413)
         elif part.name == "name":
             name = (await part.text()).strip() or name
+        elif part.name == "force":
+            force = (await part.text()).strip().lower() in ("1", "true", "on", "yes")
 
     if not data:
         return web.json_response(
@@ -1112,16 +1115,30 @@ async def references_upload(request):
             {"error": "bad_image", "message": "이미지로 읽을 수 없습니다"}, status=400)
 
     loop = asyncio.get_event_loop()
-    eye_px, err = await loop.run_in_executor(app.pose_executor, _inspect_reference, img)
+    eye_px, yaw, err = await loop.run_in_executor(
+        app.pose_executor, _inspect_reference, img)
     if err:
         return web.json_response({"error": "no_face", "message": err}, status=400)
-    if eye_px < cfg.reference_min_eye_px:
+
+    # 거부는 최후의 수단이다. 이 가드는 "알려주기" 용도인데 예전 임계값(120px)이
+    # 상반신/전신 헤어 사진을 통째로 막았다. 게다가 눈 간격은 **투영값**이라
+    # 고개를 돌린 사진에서는 cos(yaw) 만큼 짧아져, 얼굴이 충분히 커도 걸린다.
+    # 그래서 (1) 각도를 감안해 정면 등가로 환산하고 (2) 그래도 걸리면 사유를
+    # 알려주되 force 로 넘어갈 수 있게 한다.
+    eff_px = eye_px / max(0.35, math.cos(math.radians(min(abs(yaw or 0.0), 70.0))))
+    if eff_px < cfg.reference_min_eye_px and not force:
+        hint = ""
+        if abs(yaw or 0.0) >= 20:
+            hint = (f" 고개가 {abs(yaw):.0f}도 돌아가 있어 눈 간격이 실제보다 "
+                    f"짧게 잡혔습니다 (정면 등가 {eff_px:.0f}px).")
         return web.json_response({
             "error": "too_small",
-            "message": (f"얼굴이 너무 작습니다 (눈 간격 {eye_px:.0f}px, "
-                        f"최소 {cfg.reference_min_eye_px}px). GAN 이 이 사진을 "
-                        f"1024 로 확대해 쓰기 때문에 헤어 디테일이 뭉개집니다."),
-            "eye_px": round(eye_px, 1),
+            "message": (f"얼굴이 작습니다 (눈 간격 {eye_px:.0f}px, 최소 "
+                        f"{cfg.reference_min_eye_px}px).{hint} GAN 이 1024 로 "
+                        f"확대해 쓰기 때문에 헤어 디테일이 뭉개집니다. "
+                        f"그래도 쓰려면 '작아도 등록'을 체크하세요."),
+            "eye_px": round(eye_px, 1), "yaw": round(yaw or 0.0, 1),
+            "effective_eye_px": round(eff_px, 1), "can_force": True,
         }, status=400)
 
     os.makedirs(cfg.reference_upload_dir, exist_ok=True)
@@ -1134,12 +1151,16 @@ async def references_upload(request):
     warn = None
     if eye_px < cfg.reference_warn_eye_px:
         warn = (f"눈 간격 {eye_px:.0f}px 은 권장({cfg.reference_warn_eye_px}px)보다 "
-                f"작습니다. 1024 로 {256/eye_px:.1f}배 확대되어 디테일이 줄어듭니다.")
+                f"작습니다. 1024 로 {256/max(eye_px,1.0):.1f}배 확대되어 디테일이 "
+                f"줄어듭니다.")
+        if abs(yaw or 0.0) >= 20:
+            warn += f" (고개 {abs(yaw):.0f}도 - 정면이면 더 크게 잡힙니다)"
     logger.info("참고사진 등록: %s (%dx%d, 눈 간격 %.0fpx)",
                 name, img.shape[1], img.shape[0], eye_px)
     return web.json_response({
         "name": name, "width": img.shape[1], "height": img.shape[0],
-        "eye_px": round(eye_px, 1), "upscale": round(256.0 / eye_px, 2),
+        "eye_px": round(eye_px, 1), "upscale": round(256.0 / max(eye_px, 1.0), 2),
+        "yaw": round(yaw or 0.0, 1),
         "warning": warn, "references": list(app.references.keys()),
     })
 

@@ -166,13 +166,19 @@ class Config:
     reference_upload_dir: str = os.path.join(ROOT, "references", "uploads")
     #: 업로드 1장의 최대 크기(MB).
     reference_max_mb: float = 20.0
-    #: 참고사진의 최소 눈 간격(px). 이보다 작으면 거절한다.
+    #: 참고사진의 최소 눈 간격(px). 이보다 작으면 경고와 함께 거절하되,
+    #: 업로드에 force 를 주면 통과한다.
     #:
     #: GAN 은 참고사진을 FFHQ 1024(눈 간격 ~256px)로 정렬해서 쓴다. 눈 간격이
     #: 작으면 그만큼 업스케일되어 헤어스타일 디테일이 뭉개진 채로 들어간다.
     #: 실측: 기존 korean-frontal.png 은 눈 간격이 50px 밖에 안 돼 5배 업스케일된다
     #: (korean-layered.png 은 320px). 그래서 결과가 흐릿했다.
-    reference_min_eye_px: int = 120
+    #:
+    #: 처음엔 120 이었는데 상반신/전신 헤어 사진을 통째로 막아서 60 으로 내렸다.
+    #: 이 가드의 목적은 **알려주는 것**이지 막는 것이 아니다. 판정에는 yaw 를
+    #: 감안한 정면 등가값을 쓴다 - 눈 간격은 투영값이라 고개를 돌린 사진에서는
+    #: 얼굴이 충분히 커도 cos(yaw) 만큼 짧게 잡힌다.
+    reference_min_eye_px: int = 60
     #: 이보다 작으면 경고만 한다(거절하지는 않음).
     reference_warn_eye_px: int = 200
 

@@ -87,7 +87,8 @@ function fillSelect(sel, names) {
  * 눈 간격을 재서 확대 배율을 알려준다 - 얼굴이 작은 사진은 1024 로 늘려 쓰느라
  * 헤어 디테일이 뭉개지기 때문이다. */
 const refFile = el("ref-file"), refUpBtn = el("ref-upload"),
-      refDelBtn = el("ref-delete"), refStatus = el("ref-status");
+      refDelBtn = el("ref-delete"), refStatus = el("ref-status"),
+      refForce = el("ref-force");
 
 function refSay(msg, color) {
   refStatus.textContent = msg;
@@ -155,6 +156,7 @@ refUpBtn.addEventListener("click", async () => {
   if (!f) return refSay("사진 파일을 먼저 고르세요.", "#ffd400");
   const fd = new FormData();
   fd.append("file", f);
+  if (refForce.checked) fd.append("force", "1");
   refUpBtn.disabled = true;
   refSay(`업로드 중... (${(f.size / 1048576).toFixed(1)}MB)`);
   try {
@@ -162,6 +164,8 @@ refUpBtn.addEventListener("click", async () => {
     const d = await r.json();
     if (!r.ok) {
       refSay(d.message || `등록 실패 (HTTP ${r.status})`, "#ff5f56");
+      // 얼굴이 작아서 막힌 경우엔 우회 경로를 바로 눈에 띄게 해준다.
+      if (d.can_force) refForce.parentElement.style.color = "#ffd400";
     } else {
       fillSelect(refSel, d.references);
       refSel.value = d.name;
