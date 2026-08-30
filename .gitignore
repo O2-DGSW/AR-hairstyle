@@ -121,3 +121,7 @@ server/references/uploads/
 data/*
 !data/fetch_ffhq.py
 server/train/finetune/runs/
+
+# 서버를 파일 로그로 띄웠을 때 생기는 것들
+server/*.log
+server/*.log.err
