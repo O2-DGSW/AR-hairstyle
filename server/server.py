@@ -1643,7 +1643,13 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
         _apply_rtp_packet_size(cfg)
 
         # 정적 에셋은 여기서 **한 번만** 읽어 전 세션이 공유한다(읽기 전용).
-        state.static_assets = hair_asset.load_assets()
+        # 끄면 아예 안 읽는다 - 목록에서 감추는 게 아니라 존재하지 않게 된다.
+        # 그래야 /references 와 stats.assets 양쪽에서 동시에 사라진다.
+        if cfg.serve_static_assets:
+            state.static_assets = hair_asset.load_assets()
+        else:
+            state.static_assets = {}
+            logger.info("정적 에셋 비활성 (serve_static_assets=False) - 라이브 뱅크만 씁니다")
         state.references = gan_process.list_references()
         logger.info("정적 에셋 %d개, 참고 사진 %d개",
                     len(state.static_assets), len(state.references))
