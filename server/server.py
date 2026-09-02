@@ -456,19 +456,27 @@ class SegmentedVideoTrack(VideoStreamTrack):
         # 앵커가 한 프레임(33ms) 늦지만 평활화가 이미 그보다 큰 지연을 만들고
         # 있어 체감 차이는 없다. MediaPipe VIDEO 모드는 내부 상태를 들고 있어
         # 워커가 반드시 1개여야 한다.
-        pose = None
-        if st.mode in ("tryon", "remove") or st.livebank is not None:
-            if st.pose_future is not None and st.pose_future.done():
-                try:
-                    self._last_pose = st.pose_future.result()
-                except Exception:
-                    logger.exception("랜드마커 실패")
-                st.pose_future = None
-            # 아직 안 끝났으면 새로 던지지 않는다(자연스러운 백프레셔).
-            if st.pose_future is None:
-                st.pose_future = loop.run_in_executor(app.pose_executor,
-                                                      self._pose_rgb, img)
-            pose = self._last_pose
+        # 모드와 무관하게 항상 잰다.
+        #
+        # 예전에는 tryon/remove/라이브뱅크일 때만 쟀다. 렌더에 앵커가 필요한
+        # 경우가 그것뿐이라서였는데, 그 결과 **기본 모드(raw)에서 stats.yaw 가
+        # 계속 null 로 나갔다.** 클라이언트가 각도 가이드를 그려야 하는 시점이
+        # 정확히 그때(라이브 뱅크 시작 전/직후)라, 가이드를 띄울 방법이 없었다.
+        # "원본 그대로 + 각도 가이드"가 수집 단계의 설계인데 구현이 어긋나 있었다.
+        #
+        # 비용은 프레임당 랜드마커 1회인데 전용 워커에서 돌고 아래 future
+        # 백프레셔가 막고 있어 실시간 경로를 늦추지 않는다.
+        if st.pose_future is not None and st.pose_future.done():
+            try:
+                self._last_pose = st.pose_future.result()
+            except Exception:
+                logger.exception("랜드마커 실패")
+            st.pose_future = None
+        # 아직 안 끝났으면 새로 던지지 않는다(자연스러운 백프레셔).
+        if st.pose_future is None:
+            st.pose_future = loop.run_in_executor(app.pose_executor,
+                                                  self._pose_rgb, img)
+        pose = self._last_pose
 
         # 다각도 뱅크: 측정된 yaw 에 가장 가까운 각도의 에셋으로 바꾼다.
         # 닮음변환으로는 만들 수 없는 평면 밖 회전을 '그 각도에서 생성된 헤어'로
@@ -1544,6 +1552,33 @@ def _apply_rtp_packet_size(cfg) -> None:
     logger.info("RTP 페이로드 상한: %d 바이트 (aiortc 기본 1300)", cfg.rtp_packet_max)
 
 
+def _apply_video_bitrate(cfg) -> None:
+    """서버가 내보내는 영상의 비트레이트 상한을 올린다.
+
+    aiortc 는 설정 API 없이 코덱 모듈의 전역 상수로 들고 있다. 세터가 매번
+    그 전역을 읽으므로(vpx.py: `max(MIN_BITRATE, min(bitrate, MAX_BITRATE))`)
+    여기서 바꿔 두면 이후 만들어지는 인코더 전부에 적용된다. PACKET_MAX 와
+    같은 방식이다.
+
+    DEFAULT_BITRATE 는 인코더 생성 시점에 한 번 읽히므로 시작값이 되고,
+    MAX_BITRATE 는 REMB 가 올라올 때마다 상한으로 쓰인다.
+
+    **다운링크에만 적용된다.** 올라오는 영상은 클라이언트 인코더와 aiortc 가
+    수신자로서 보내는 REMB 가 정하므로 이 상수와 무관하다.
+    """
+    if not cfg.video_max_bitrate:
+        return
+    from aiortc.codecs import vpx as _vpx
+    lo = int(cfg.video_start_bitrate or _vpx.DEFAULT_BITRATE)
+    hi = int(cfg.video_max_bitrate)
+    # 시작값이 상한보다 크면 세터가 상한으로 깎아 버려 의도가 뒤집힌다.
+    lo = min(lo, hi)
+    _vpx.MAX_BITRATE = hi
+    _vpx.DEFAULT_BITRATE = lo
+    logger.info("영상 비트레이트: 시작 %.1f Mbps / 상한 %.1f Mbps "
+                "(aiortc 기본 0.5 / 1.5)", lo / 1e6, hi / 1e6)
+
+
 def _prefer_codec(pc, want: str) -> None:
     """보낼 비디오 코덱을 고정한다. setRemoteDescription 뒤, createAnswer 앞에서.
 
@@ -1805,6 +1840,7 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
         # 첫 피어가 붙기 전에 해둬야 한다. 패킷을 자를 때 읽히는 전역이라
         # 세션이 이미 돌고 있으면 그 세션에는 안 먹는다.
         _apply_rtp_packet_size(cfg)
+        _apply_video_bitrate(cfg)
 
         # 정적 에셋은 여기서 **한 번만** 읽어 전 세션이 공유한다(읽기 전용).
         # 끄면 아예 안 읽는다 - 목록에서 감추는 게 아니라 존재하지 않게 된다.
