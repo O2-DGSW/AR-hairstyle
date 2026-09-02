@@ -129,3 +129,12 @@ server/supervise.pid
 
 # 참고사진 썸네일은 원본에서 자동 생성된다
 server/references/thumbs/
+
+# 실제 사람 얼굴이 들어간 것은 추적하지 않는다.
+# server/references/ 는 참고사진 원본(식별 가능한 인물), server/assets/ 는
+# 그 얼굴에서 구운 헤어 에셋이다. 참고사진은 API 로 올리면 되고
+# (POST /references), 정적 에셋은 serve_static_assets=False 라 기본으로 안 쓴다.
+server/references/*.png
+server/references/*.jpg
+server/references/*.jpeg
+server/assets/*.png
