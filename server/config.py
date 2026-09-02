@@ -178,6 +178,22 @@ class Config:
     reference_upload_dir: str = os.path.join(ROOT, "references", "uploads")
     #: 업로드 1장의 최대 크기(MB).
     reference_max_mb: float = 20.0
+
+    #: 클라이언트에 내려줄 이미지 URL 의 앞부분. 비우면 요청의 Host 로 만든다.
+    #:
+    #: 네이티브 앱은 상대경로를 해석할 기준이 없으므로 절대 URL 이 필요하다.
+    #: 리버스 프록시나 도메인 뒤에 있으면 요청 Host 가 내부 주소일 수 있어
+    #: 그때 여기에 공개 주소를 박는다. 예: https://heddy.example.com
+    public_base_url: str = ""
+    #: 헤어스타일 원형 미리보기의 한 변(px).
+    reference_thumb_px: int = 320
+    #: 썸네일 크롭 반폭(눈 간격 배수).
+    #:
+    #: 실측한 눈-정수리가 1.84, 눈-턱이 1.6 이지만 그 값으로 자르면 **머리가
+    #: 잘린다.** 정수리는 두피 기준이고 헤어는 그 위로 더 솟기 때문이다.
+    #: 헤어스타일 미리보기에서 헤어가 잘리면 아무 소용이 없어 여유를 크게 둔다.
+    #: 원형으로 표시되면 모서리가 어차피 잘리므로 조금 넉넉한 편이 낫다.
+    reference_thumb_half_eyes: float = 2.2
     #: 참고사진의 최소 눈 간격(px). 이보다 작으면 경고와 함께 거절하되,
     #: 업로드에 force 를 주면 통과한다.
     #:

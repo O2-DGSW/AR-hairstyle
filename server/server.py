@@ -37,6 +37,7 @@ import math
 import os
 import re
 import time
+import urllib.parse
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -1034,6 +1035,10 @@ async def references_list(request):
     """
     app = request.app["state"]
     return web.json_response({
+        # styles 가 클라이언트가 쓸 것이다. id/표시명/썸네일/원본 URL 이 들어 있다.
+        "styles": _style_entries(app, request),
+        # references 는 이름만 있는 예전 형식이다. 웹 클라이언트와 이미 배포한
+        # 연동 문서가 이걸 쓰고 있어서 남겨 둔다. styles 로 옮기고 나면 뺀다.
         "references": list(app.references.keys()),
         "assets": list(app.static_assets.keys()),
         "banks": hair_asset.list_banks(app.static_assets),
@@ -1161,8 +1166,167 @@ async def references_upload(request):
         "name": name, "width": img.shape[1], "height": img.shape[0],
         "eye_px": round(eye_px, 1), "upscale": round(256.0 / max(eye_px, 1.0), 2),
         "yaw": round(yaw or 0.0, 1),
+        # 방금 올린 것의 썸네일 URL 까지 같이 준다. 안 그러면 클라이언트가
+        # 목록을 다시 받아야 새 스타일을 캐러셀에 그릴 수 있다.
+        "style": next((s for s in _style_entries(app, request) if s["id"] == name), None),
+        "styles": _style_entries(app, request),
         "warning": warn, "references": list(app.references.keys()),
     })
+
+
+THUMB_DIR = os.path.join(ROOT, "references", "thumbs")
+
+
+def _meta_path(img_path):
+    return os.path.splitext(img_path)[0] + ".meta.json"
+
+
+def _read_ref_meta(name, img_path):
+    """<이름>.meta.json 이 있으면 읽는다. 없으면 파일명에서 표시명을 만든다.
+
+    별도 DB 를 두지 않는 이유: 참고사진은 파일 하나로 추가/삭제되는데 메타만
+    다른 곳에 있으면 곧 어긋난다. 사진 옆에 두면 같이 움직인다.
+    """
+    meta = {}
+    p = _meta_path(img_path)
+    if os.path.isfile(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                meta = raw
+        except (OSError, ValueError):
+            logger.warning("참고사진 메타를 읽지 못했습니다: %s", p)
+    # 표시명이 없으면 id 를 사람이 읽을 만하게 다듬는다. 어디까지나 임시값이라
+    # 앱에 그대로 내보낼 이름은 meta.json 에 적어 주는 게 맞다.
+    if not meta.get("name"):
+        pretty = name.replace("-", " ").replace("_", " ").strip()
+        meta["name"] = pretty.title() if pretty.isascii() else pretty
+    return meta
+
+
+def _make_thumb(img_bgr, size, half_eyes):
+    """머리 전체가 들어가는 정사각 썸네일 (BGR).
+
+    원형 캐러셀에 쓰이므로 얼굴이 가운데 오고 머리가 잘리지 않아야 한다.
+    그냥 가운데를 자르면 상반신 사진에서 얼굴이 위쪽에 치우쳐 잘린다.
+    그래서 눈 위치를 재서 머리를 중심에 놓는다. 얼굴을 못 찾으면 가운데를 자른다.
+    """
+    h, w = img_bgr.shape[:2]
+    eye_l = eye_r = None
+    try:
+        from face_pose import FacePose
+        with FacePose() as poser:
+            pose = poser.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), 0)
+        if pose is not None:
+            eye_l, eye_r = pose["eye_l"], pose["eye_r"]
+    except Exception:
+        logger.exception("썸네일용 얼굴 검출 실패 - 가운데 크롭으로 대체")
+
+    if eye_l is not None:
+        cx = float(eye_l[0] + eye_r[0]) / 2.0
+        cy = float(eye_l[1] + eye_r[1]) / 2.0
+        d = max(1.0, float(np.hypot(eye_r[0] - eye_l[0], eye_r[1] - eye_l[1])))
+        half = d * float(half_eyes)
+        # 눈은 머리 한가운데가 아니라 아래쪽에 있다. 헤어까지 담으려면 위로 민다.
+        cy -= d * 0.30
+    else:
+        cx, cy = w / 2.0, h / 2.0
+        half = min(w, h) / 2.0
+
+    x0, y0 = int(round(cx - half)), int(round(cy - half))
+    x1, y1 = int(round(cx + half)), int(round(cy + half))
+    # 사진 밖으로 나가면 가장자리를 늘려 채운다. 검은 여백보다 낫다.
+    pl, pt = max(0, -x0), max(0, -y0)
+    pr, pb = max(0, x1 - w), max(0, y1 - h)
+    if pl or pt or pr or pb:
+        img_bgr = cv2.copyMakeBorder(img_bgr, pt, pb, pl, pr, cv2.BORDER_REPLICATE)
+        x0 += pl; x1 += pl; y0 += pt; y1 += pt
+    crop = img_bgr[y0:y1, x0:x1]
+    if crop.size == 0:
+        crop = img_bgr
+    return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+
+
+def _thumb_path(name, img_path):
+    """썸네일 경로. 원본보다 오래됐으면 다시 만든다."""
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    out = os.path.join(THUMB_DIR, name + ".png")
+    try:
+        if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(img_path):
+            return out
+    except OSError:
+        pass
+    img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    thumb = _make_thumb(img, CONFIG.reference_thumb_px,
+                        CONFIG.reference_thumb_half_eyes)
+    if not cv2.imwrite(out, thumb):
+        return None
+    logger.info("참고사진 썸네일 생성: %s", name)
+    return out
+
+
+def _base_url(request):
+    """이미지 URL 앞부분. 네이티브 앱은 상대경로를 못 푸니 절대 URL 로 준다."""
+    if CONFIG.public_base_url:
+        return CONFIG.public_base_url.rstrip("/")
+    # 프록시 뒤라면 원래 스킴/호스트가 여기 실려 온다.
+    fwd_host = request.headers.get("X-Forwarded-Host")
+    fwd_proto = request.headers.get("X-Forwarded-Proto")
+    host = fwd_host or request.host
+    scheme = fwd_proto or request.scheme
+    return f"{scheme}://{host}"
+
+
+def _style_entries(app, request):
+    """클라이언트가 캐러셀을 그리는 데 필요한 것 전부."""
+    base = _base_url(request)
+    out = []
+    for name, path in sorted(app.references.items()):
+        meta = _read_ref_meta(name, path)
+        q = urllib.parse.quote(name, safe="")
+        entry = {
+            "id": name,
+            "name": meta.get("name") or name,
+            "thumbnailUrl": f"{base}/references/{q}/thumbnail",
+            "referenceImageUrl": f"{base}/references/{q}/image",
+        }
+        for k in ("description", "category", "gender"):
+            if meta.get(k):
+                entry[k] = meta[k]
+        out.append(entry)
+    return out
+
+
+async def reference_image(request):
+    """참고사진 원본. 인증 없이 열려 있다(서버 전체가 그렇다)."""
+    app = request.app["state"]
+    name = request.match_info["name"]
+    if not _REF_NAME_OK.match(name):
+        raise web.HTTPNotFound()
+    path = app.references.get(name)
+    if not path or not os.path.isfile(path):
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=300"})
+
+
+async def reference_thumbnail(request):
+    """원형 캐러셀용 정사각 썸네일. 처음 요청될 때 만들어 두고 재사용한다."""
+    app = request.app["state"]
+    name = request.match_info["name"]
+    if not _REF_NAME_OK.match(name):
+        raise web.HTTPNotFound()
+    path = app.references.get(name)
+    if not path or not os.path.isfile(path):
+        raise web.HTTPNotFound()
+    loop = asyncio.get_event_loop()
+    # 얼굴 검출이 들어가므로 이벤트 루프에서 돌리면 안 된다.
+    out = await loop.run_in_executor(app.pose_executor, _thumb_path, name, path)
+    if not out:
+        raise web.HTTPInternalServerError(reason="썸네일 생성 실패")
+    return web.FileResponse(out, headers={"Cache-Control": "public, max-age=300"})
 
 
 async def references_delete(request):
@@ -1704,6 +1868,8 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
     app.router.add_post("/model", model_set)
     app.router.add_get("/references", references_list)
     app.router.add_post("/references", references_upload)
+    app.router.add_get("/references/{name}/image", reference_image)
+    app.router.add_get("/references/{name}/thumbnail", reference_thumbnail)
     app.router.add_delete("/references/{name}", references_delete)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", readyz)
