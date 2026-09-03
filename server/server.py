@@ -1331,6 +1331,16 @@ def _style_entries(app, request):
             "name": meta.get("name") or name,
             "thumbnailUrl": f"{base}/references/{q}/thumbnail",
             "referenceImageUrl": f"{base}/references/{q}/image",
+            # 절대 URL 과 **상대경로를 함께** 준다.
+            #
+            # 절대 URL 은 요청 Host 로 만드는데, 클라이언트가 프록시를 거쳐
+            # 들어오면(웹 dev 의 /ar-server 같은) 그 URL 이 프록시를 우회한다.
+            # 앱이 HTTPS 인데 서버가 HTTP 면 혼합 콘텐츠로 차단되기도 한다.
+            # 상대경로가 있으면 클라이언트가 자기 base 에 붙여 쓸 수 있다.
+            #   웹(프록시)  : `${base}${thumbnailPath}`
+            #   네이티브     : thumbnailUrl 그대로
+            "thumbnailPath": f"/references/{q}/thumbnail",
+            "referenceImagePath": f"/references/{q}/image",
         }
         for k in ("description", "category", "gender"):
             if meta.get(k):
