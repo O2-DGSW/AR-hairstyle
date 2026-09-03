@@ -512,7 +512,14 @@ class SegmentedVideoTrack(VideoStreamTrack):
         #
         # 얼굴 각도는 위에서 이미 갱신됐고(CPU) 칸 포착도 끝났으므로, 각도
         # 가이드와 수집은 이 분기와 무관하게 매 프레임 동작한다.
+        #
+        # **raw 모드에서만** 건너뛴다. 여기서 내보내는 건 원본 프레임인데,
+        # 출력이 원본과 같은 모드는 raw 뿐이다. tryon 상태에서 건너뛰면 6프레임
+        # 중 5장이 헤어 없는 원본, 1장만 합성본이 되어 헤어가 초당 5번 깜빡인다
+        # (두 번째 라이브 뱅크를 만들 때 실제로 이렇게 됐다 - 서버가 첫 칸에서
+        #  tryon 으로 바꿔 두기 때문에 모드가 raw 로 돌아가 있지 않다).
         if (st.livebank is not None and st.livebank.phase == "collect"
+                and st.mode == "raw"
                 and cfg.collect_seg_every > 1
                 and self._frame_idx % cfg.collect_seg_every != 0):
             return img
@@ -1718,11 +1725,18 @@ async def offer(request):
                             "message": f"참고 사진을 찾을 수 없습니다: {ref}"}))
                     else:
                         state.livebank = LiveBank(ref, data.get("targets"))
+                        # 수집 중에는 원본을 그대로 보여준다.
+                        # 각도를 맞춰야 하는 단계라 예전 헤어를 씌워 둘 이유가
+                        # 없고, 무엇보다 raw 여야 세그멘테이션을 건너뛸 수 있다
+                        # (collect_seg_every). 두 번째 뱅크를 만들 때는 이미
+                        # tryon 상태라 서버가 여기서 되돌려 주지 않으면 GPU 를
+                        # 계속 쓰게 된다.
+                        state.mode = "raw"
                         logger.info("라이브 뱅크 시작: %s (각도 %s)",
                                     state.livebank.name, list(state.livebank.targets))
                         notify_peer(state, {"type": "livebank",
                                             **state.livebank.report(),
-                                            "status": "started"})
+                                            "status": "started", "mode": "raw"})
                 else:
                     lb = state.livebank
                     state.livebank = None

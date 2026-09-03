@@ -283,6 +283,9 @@ function lbGuide(next) {
 }
 
 function onLiveBank(d) {
+  // 서버가 단계에 맞춰 모드를 바꾼다(수집=raw, 첫 칸 완성=tryon).
+  // 드롭다운이 서버 상태와 어긋나면 사용자가 바꿨을 때 엉뚱한 값이 간다.
+  if (d.mode) modeSel.value = d.mode;
   if (Array.isArray(d.buckets)) {
     lbBuckets.innerHTML = "";
     for (const b of d.buckets) {
