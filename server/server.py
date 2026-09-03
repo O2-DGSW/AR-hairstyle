@@ -410,9 +410,14 @@ class SegmentedVideoTrack(VideoStreamTrack):
         # 진행률은 이 경로와 무관하게 run_bank_generation 이 DataChannel 로
         # 계속 보낸다. 검은 프레임을 내보내는 이유는 트랙을 살려 두기 위해서다 -
         # 아무것도 안 보내면 연결 상태 판정이 애매해진다.
+        #
+        # **여기는 recv() 다. VideoFrame 을 돌려줘야 한다.** _compose() 처럼
+        # ndarray 를 반환하면 인코더가 pts 를 찾다가 죽고(AttributeError),
+        # 송신 태스크가 끝나면서 세션째 정리된다. 그러면 생성 중이던 라이브
+        # 뱅크도 "세션 종료로 중단" 되어 첫 칸만 만들어지고 멈춘다.
         if (not cfg.stream_during_gan and st.livebank is not None
                 and st.livebank.phase == "generate"):
-            return np.zeros_like(img)
+            return self._wrap(np.zeros_like(img), frame)
 
         self._record_frame(img)
 
@@ -436,11 +441,22 @@ class SegmentedVideoTrack(VideoStreamTrack):
             prev = self._last_out
             out = prev if (prev is not None and prev.shape == img.shape) else img
 
-        new_frame = VideoFrame.from_ndarray(out, format="bgr24")
+        return self._wrap(out, frame)
+
+    @staticmethod
+    def _wrap(arr, src_frame):
+        """내보낼 ndarray -> VideoFrame. recv() 의 **모든** 반환은 이걸 거친다.
+
+        포장을 한 곳에 모아 둔 이유: recv() 안에서 ndarray 를 그대로 반환하면
+        인코더가 pts 를 찾다가 AttributeError 로 죽고, 송신 태스크가 끝나면서
+        세션째 정리된다. 실제로 그렇게 만들어서 라이브 뱅크가 첫 칸만 생성하고
+        멈췄다. _compose() 는 ndarray 를 반환해도 되므로 헷갈리기 쉽다.
+        """
+        new_frame = VideoFrame.from_ndarray(arr, format="bgr24")
         # pts/time_base 는 반드시 원본 것을 유지한다. 새로 만들면 수신 측
         # 지터 버퍼가 타임라인을 다시 맞추느라 영상이 튄다.
-        new_frame.pts = frame.pts
-        new_frame.time_base = frame.time_base
+        new_frame.pts = src_frame.pts
+        new_frame.time_base = src_frame.time_base
         return new_frame
 
     async def _compose(self, img, wait_ms):
