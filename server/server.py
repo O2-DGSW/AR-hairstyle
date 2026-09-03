@@ -1477,6 +1477,42 @@ async def metrics_handler(request):
     e.gauge("heddy_ready", "세그멘터가 적재되고 CUDA 그래프까지 준비됐으면 1.",
             1 if ok else 0, {"reason": reason})
 
+    # --- 다운링크 품질 (서버 -> 클라이언트) ---
+    #
+    # "영상이 끊긴다" 의 원인이 GPU 인지 회선인지 구분하려면 이게 필요하다.
+    # 지금까지는 클라이언트에 getStats() 를 물어봐야만 알 수 있었는데, 앱이든
+    # 웹이든 붙어 있기만 하면 서버가 직접 볼 수 있다 - 수신 측이 RTCP Receiver
+    # Report 로 유실률을 계속 보내주고 aiortc 가 그걸 remote-inbound-rtp 로
+    # 노출한다.
+    #
+    # fraction_lost 는 직전 보고 구간의 유실 비율(0~1)이다. 0.02 를 넘기면
+    # 비트레이트가 회선을 넘어선 것으로 보면 된다.
+    for st_ in list(app.sessions):
+        pc = getattr(st_, "pc", None)
+        if pc is None:
+            continue
+        try:
+            report = await pc.getStats()
+        except Exception:
+            continue
+        for stat in report.values():
+            if getattr(stat, "type", None) != "remote-inbound-rtp":
+                continue
+            lbl = {"sid": str(getattr(st_, "sid", "?"))}
+            e.gauge("heddy_downlink_fraction_lost",
+                    "수신 측이 보고한 직전 구간 유실 비율(0~1).",
+                    round(float(getattr(stat, "fractionLost", 0.0) or 0.0), 4), lbl)
+            e.gauge("heddy_downlink_packets_lost",
+                    "수신 측이 보고한 누적 유실 패킷 수.",
+                    int(getattr(stat, "packetsLost", 0) or 0), lbl)
+            e.gauge("heddy_downlink_jitter_seconds",
+                    "수신 측이 보고한 지터(초).",
+                    round(float(getattr(stat, "jitter", 0.0) or 0.0), 5), lbl)
+            rtt = getattr(stat, "roundTripTime", None)
+            if rtt is not None:
+                e.gauge("heddy_downlink_rtt_seconds", "RTCP 로 잰 왕복 시간(초).",
+                        round(float(rtt), 4), lbl)
+
     e.gauge("heddy_sessions_active", "지금 붙어 있는 피어 수.", len(app.sessions))
     e.gauge("heddy_sessions_max", "동시 접속 상한(CONFIG.max_sessions).", cfg.max_sessions)
     e.counter("heddy_sessions_total", "수락된 세션 누적 수.", m.sessions_total)
