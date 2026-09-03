@@ -326,6 +326,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
 
         lb.status[target] = "captured"
         lb.frames[target] = st.last_raw.copy()
+        lb.measured[target] = float(self._yaw_ema)
         notify_peer(st, {"type": "livebank", **lb.report(),
                          "status": "captured", "captured_yaw": target})
 
@@ -398,6 +399,20 @@ class SegmentedVideoTrack(VideoStreamTrack):
         self._frame_idx += 1
         st.frames = self._frame_idx
         app.metrics.frames_total += 1
+
+        # 생성 단계에서는 **아무것도 하지 않는다.**
+        #
+        # GAN 7칸이 같은 4070 을 1분 동안 쓴다. 그 옆에서 세그멘테이션과
+        # 랜드마커를 돌리면 양쪽 다 느려지는데, 그동안 사용자는 진행률만 보면
+        # 되고(클라이언트가 오버레이를 덮는다) 영상을 볼 이유가 없다.
+        # 포즈 계산보다 **앞에** 두어 CPU 도 안 쓴다.
+        #
+        # 진행률은 이 경로와 무관하게 run_bank_generation 이 DataChannel 로
+        # 계속 보낸다. 검은 프레임을 내보내는 이유는 트랙을 살려 두기 위해서다 -
+        # 아무것도 안 보내면 연결 상태 판정이 애매해진다.
+        if (not cfg.stream_during_gan and st.livebank is not None
+                and st.livebank.phase == "generate"):
+            return np.zeros_like(img)
 
         self._record_frame(img)
 
@@ -488,15 +503,19 @@ class SegmentedVideoTrack(VideoStreamTrack):
             self._yaw_ema = y if self._yaw_ema is None else self._yaw_ema * 0.75 + y * 0.25
         self._collect_for_bank(pose)
 
-        # 예전에는 생성 중에 검은 프레임을 흘렸다. GAN 이 같은 프로세스에 있어서
-        # 이벤트 루프와 GPU 를 통째로 잡아먹었기 때문인데, gan_process 로 자식
-        # 프로세스에 분리한 지금은 실시간 경로가 GIL 로 막히는 일이 구조적으로
-        # 없다. 같은 4070 을 공유하므로 fps 는 떨어지지만 검은 화면보다 낫다.
-        # 경합이 심한 환경에서는 CONFIG.stream_during_gan=False 로 되돌린다.
-        # (진행률은 어느 쪽이든 DataChannel 로 계속 나간다)
-        if (not cfg.stream_during_gan and st.livebank is not None
-                and st.livebank.phase == "generate"):
-            return np.zeros_like(img)
+        # 수집 단계에서는 GPU 를 최소로 쓴다.
+        #
+        # 화면에 원본을 그대로 내보내므로 렌더용 분할이 필요 없다. GPU 를 쓰는
+        # 유일한 이유가 배경 플레이트 누적인데, 플레이트는 시간에 걸쳐 쌓는
+        # 것이라 매 프레임일 필요가 없다. 여기서 아낀 GPU 는 곧바로 이어질
+        # GAN 7칸에 쓰인다.
+        #
+        # 얼굴 각도는 위에서 이미 갱신됐고(CPU) 칸 포착도 끝났으므로, 각도
+        # 가이드와 수집은 이 분기와 무관하게 매 프레임 동작한다.
+        if (st.livebank is not None and st.livebank.phase == "collect"
+                and cfg.collect_seg_every > 1
+                and self._frame_idx % cfg.collect_seg_every != 0):
+            return img
 
         # 프레임 드롭. 버퍼는 지연을 줄이지 못한다 - 밀린 프레임을 계속
         # 처리하면 지연만 누적된다. 최신 프레임만 살리고 밀린 건 버린다.
@@ -724,6 +743,10 @@ class LiveBank:
         # generate: 모은 걸로 GAN 을 도는 중
         self.phase = "collect"
         self.frames = {}          # target -> 캡처된 원본 프레임
+        # target -> **실제로 측정된** yaw. 라벨(목표 각도)과 다를 수 있고,
+        # 런타임 칸 선택은 이 값을 써야 한다. 목표 각도를 적어 두면 허용오차
+        # 만큼 어긋난 채로 기록돼 엉뚱한 각도에서 그 칸이 선택된다.
+        self.measured = {}
         # 첫 칸(정면)의 눈 간격. 나머지 칸의 크기를 여기에 맞춰 정규화한다.
         # build_asset_from_result 가 채운다.
         self.ref_eye_len = None
@@ -792,7 +815,8 @@ async def run_bank_bucket(state: PeerState, lb: LiveBank, target: float, frame):
         app.metrics.gan_swaps_total += 1
         app.metrics.gan.observe(float(gan_ms))
         name = await build_asset_from_result(
-            state, result, lb.reference, yaw=float(target), bank=lb.name,
+            state, result, lb.reference,
+            yaw=float(lb.measured.get(target, target)), bank=lb.name,
             livebank=lb)
         if not name:
             lb.status[target] = "failed"
