@@ -1735,7 +1735,31 @@ async def offer(request):
             "max_sessions": cfg.max_sessions,
         }, status=503)
 
-    params = await request.json()
+    # 본문이 비었거나 sdp/type 이 없으면 **클라이언트 오류**다. 그냥 request.json()
+    # 을 부르면 JSONDecodeError 가 그대로 올라가 500 이 되는데, 그러면 받는 쪽은
+    # "서버가 answer 생성 중 터졌다" 로 읽는다. 실제로 그렇게 몇 시간을 잃었다.
+    #
+    # 실제 사례: 네이티브 앱이 RTCSessionDescription 객체를 그대로 실어 보냈다.
+    # sdp/type 이 프로토타입 게터라 브리지가 직렬화하면 빈 객체가 되고 본문이
+    # 비어서 도착한다. 브라우저는 JSON.stringify 가 toJSON() 을 타서 멀쩡했다.
+    raw = await request.text()
+    try:
+        params = json.loads(raw) if raw.strip() else None
+    except ValueError:
+        params = None
+    if not isinstance(params, dict) or not params.get("sdp") or not params.get("type"):
+        logger.warning("잘못된 /offer 본문 (%d바이트, UA=%s): %.200r",
+                       len(raw), request.headers.get("User-Agent", "?"), raw)
+        return web.json_response({
+            "error": "bad_offer",
+            "message": ("본문에 sdp 와 type 이 있어야 합니다. 받은 본문 %d바이트. "
+                        "RTCSessionDescription 을 그대로 보내면 sdp/type 이 "
+                        "프로토타입 게터라 직렬화에서 사라집니다 - "
+                        "{sdp, type} 평범한 객체로 만들어 보내세요."
+                        % len(raw)),
+            "received_bytes": len(raw),
+        }, status=400)
+
     offer_desc = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
