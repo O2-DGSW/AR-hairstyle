@@ -219,8 +219,39 @@ class GanWorker:
         return self._shape_predictor
 
     def _align(self, rgb: np.ndarray):
-        """RGB 배열 -> FFHQ 정렬된 (3,1024,1024) 텐서. 얼굴을 못 찾으면 예외."""
+        """RGB 배열 -> FFHQ 정렬된 (3,1024,1024) 텐서. 얼굴을 못 찾으면 예외.
+
+        기본은 MediaPipe + GPU 워프다(실측 2,083ms -> 5.6ms). dlib 경로는
+        얼굴을 못 찾을 때의 폴백으로 남는다. 자세한 근거는 ffhq_align.py 참고.
+        """
         import torchvision.transforms.functional as TF
+
+        if CONFIG.gan_fast_align:
+            try:
+                import ffhq_align
+                # self._poser(VIDEO 모드)를 재사용하면 안 된다. 여기 들어오는 건
+                # _prepare 로 잘린 **다른 이미지**라, 프레임 간 추적이 직전
+                # 기하를 끌고 와 기울고 어긋난 크롭이 나온다(실측 확인).
+                from face_pose import landmarks_image
+                pose = landmarks_image(rgb)
+                if pose is not None:
+                    import torch
+                    dev = "cuda" if torch.cuda.is_available() else "cpu"
+                    t = ffhq_align.align_face_landmarks(
+                        rgb, pose["eye_l"], pose["eye_r"],
+                        pose["mouth_l"], pose["mouth_r"], device=dev)
+                    # 예전 경로와 같은 모양/장치로 돌려준다(드롭인 대체).
+                    return t.detach().cpu()
+            except Exception:
+                # 정렬은 파이프라인의 입구다. 여기서 죽으면 촬영 자체가 안 되므로
+                # 조용히 예전 경로로 내려간다. 원인은 로그로 남긴다.
+                log_exc = getattr(self, "_align_warned", False)
+                if not log_exc:
+                    self._align_warned = True
+                    import traceback
+                    print("[gan] 빠른 정렬 실패 - dlib 경로로 폴백합니다\n"
+                          + traceback.format_exc(), flush=True)
+
         from utils.shape_predictor import align_face
         # align_face 는 리스트를 받아 리스트를 준다. 한 장만 넘긴다.
         return align_face([TF.to_tensor(rgb)], predictor=self._predictor())[0]

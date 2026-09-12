@@ -38,6 +38,53 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_landmarker.
 # MediaPipe face mesh 눈 코너 인덱스 (눈 중심 = 양 코너의 중점)
 EYE_L_OUT, EYE_L_IN = 33, 133
 EYE_R_IN, EYE_R_OUT = 362, 263
+# 입꼬리. FFHQ 정렬 사각형이 눈 2점 + 입꼬리 2점만으로 정해지므로
+# (shape_predictor.py 의 eye_to_eye / eye_to_mouth) 이 둘이 있어야
+# dlib 68점을 대체할 수 있다.
+MOUTH_L, MOUTH_R = 61, 291
+
+
+_IMAGE_LM = None
+
+
+def landmarks_image(frame_rgb: np.ndarray):
+    """정지 이미지 1장의 눈/입꼬리. -> dict 또는 None.
+
+    **FacePose 를 쓰면 안 되는 자리다.** 그건 VIDEO 모드라 프레임 간 추적을
+    하는데, 서로 무관한 정지 이미지를 넣으면 직전 이미지의 기하에 끌려간
+    랜드마크가 나온다. 실제로 FFHQ 정렬에 FacePose 를 재사용했더니 잘린
+    이미지에서 얼굴이 기울고 중심이 어긋난 크롭이 나왔다.
+
+    랜드마커는 한 번만 만들어 재사용한다(생성 비용이 크다). 프로세스당 하나이고
+    IMAGE 모드는 상태가 없어 호출 순서에 영향받지 않는다.
+    """
+    global _IMAGE_LM
+    if _IMAGE_LM is None:
+        _IMAGE_LM = vision.FaceLandmarker.create_from_options(
+            vision.FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=MODEL_PATH),
+                running_mode=vision.RunningMode.IMAGE,
+                num_faces=1,
+            ))
+    res = _IMAGE_LM.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
+                                    data=np.ascontiguousarray(frame_rgb)))
+    if not res.face_landmarks:
+        return None
+    h, w = frame_rgb.shape[:2]
+    pts = res.face_landmarks[0]
+
+    def px(i):
+        return np.array([pts[i].x * w, pts[i].y * h], dtype=np.float32)
+
+    e0 = (px(EYE_L_OUT) + px(EYE_L_IN)) / 2.0
+    e1 = (px(EYE_R_IN) + px(EYE_R_OUT)) / 2.0
+    m0, m1 = px(MOUTH_L), px(MOUTH_R)
+    return {
+        "eye_l": e0 if e0[0] <= e1[0] else e1,
+        "eye_r": e1 if e0[0] <= e1[0] else e0,
+        "mouth_l": m0 if m0[0] <= m1[0] else m1,
+        "mouth_r": m1 if m0[0] <= m1[0] else m0,
+    }
 
 
 class FacePose:
@@ -124,6 +171,9 @@ class FacePose:
         eye_l, eye_r = (e0, e1) if e0[0] <= e1[0] else (e1, e0)
         d_measured = float(np.linalg.norm(eye_r - eye_l))
 
+        m0, m1 = px(MOUTH_L), px(MOUTH_R)
+        mouth_l, mouth_r = (m0, m1) if m0[0] <= m1[0] else (m1, m0)
+
         yaw = pitch = roll = 0.0
         tz = None
         if res.facial_transformation_matrixes:
@@ -159,6 +209,7 @@ class FacePose:
 
         return {
             "eye_l": eye_l, "eye_r": eye_r,
+            "mouth_l": mouth_l, "mouth_r": mouth_r,
             "d_measured": d_measured,
             "d_corrected": d_corrected,
             "yaw": yaw, "pitch": pitch, "roll": roll,

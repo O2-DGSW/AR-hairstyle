@@ -158,6 +158,17 @@ class Config:
     gan_load_timeout_s: float = 420.0
     #: 합성 1회 대기 상한(초). 실측 ~9초.
     gan_call_timeout_s: float = 240.0
+    #: FFHQ 정렬을 MediaPipe + GPU 워프로 할지. 끄면 예전 dlib + PIL 경로.
+    #:
+    #: HairFastGAN 의 align_face 가 파이프라인 최대 병목이었다(실측 1,068ms -
+    #: GAN 네트워크보다 오래 걸린다). 68점 중 실제로 쓰는 건 눈 2점과 입꼬리
+    #: 2점뿐이고, 사각형이 닮음변환이라 PIL 체인 전체가 grid_sample 한 번으로
+    #: 대체된다. 실측: 2,083ms -> 5.6ms. 참고사진 2장 정렬이 6.10s -> 0.24s.
+    #:
+    #: GAN 최종 출력을 눈으로 비교해 얼굴/헤어가 동등함을 확인했다. 크롭이
+    #: 2.3% 정도 달라지는데(랜드마크 출처가 다르므로) 품질 차이는 아니다.
+    #: 문제가 생기면 0 으로 되돌린다 - dlib 경로가 그대로 남아 있다.
+    gan_fast_align: bool = True
     #: 파인튜닝한 Rotate 체크포인트 경로. 빈 문자열이면 HairFastGAN 기본값
     #: (pretrained_models/Rotate/rotate_best.pth)을 쓴다.
     #:
