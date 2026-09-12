@@ -695,6 +695,24 @@ async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
         logger.warning("GAN 결과에서 머리를 찾지 못했습니다 (%s px)", px)
         return None
 
+    # --- 얼굴 패치 ---
+    # 기존 머리를 지운 자리를 평균 살색 대신 이걸로 덮는다. GAN 결과에는 그
+    # 사람 피부톤/조명으로 그려진 이마와 눈썹이 들어 있는데 지금까지 머리만
+    # 오려내고 버렸다. 같은 눈 앵커를 쓰므로 머리와 같은 변환으로 정렬된다.
+    #
+    # 머리(13)/모자(14)/목/옷/배경을 뺀 얼굴 부위 전체(1~12)를 쓴다. 이마만
+    # 잘라내지 않는 이유는 앞머리가 어디까지 내려와 있었는지 미리 알 수 없기
+    # 때문이다 - 넉넉히 오려 두고 덮을 자리는 런타임이 정한다.
+    face_mask = ((cls >= 1) & (cls <= 12)).astype("uint8")
+    face_asset, _, fpx = hair_asset.build_from_photo(
+        result_bgr, face_mask, pose["eye_l"], pose["eye_r"], name + "#face",
+        ref_skin=ref_skin)
+    if face_asset is not None and fpx >= 500:
+        asset.face = face_asset
+    else:
+        logger.warning("GAN 결과에서 얼굴 패치를 못 만들었습니다 (%s px) - "
+                       "평균 살색으로 대체됩니다", fpx)
+
     asset.yaw = yaw
     asset.bank = bank
 

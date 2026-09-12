@@ -592,6 +592,7 @@ class GpuFaceParser:
         blended = False
         eyes = None
         new_rgb = new_a = None
+        face_rgb = face_a = None   # GAN 이 그려 준 이마/눈썹 패치
 
         if mode in ("remove", "tryon"):
             # 앵커는 랜드마크를 우선한다.
@@ -677,6 +678,16 @@ class GpuFaceParser:
                     new_rgb = (new_rgb * ratio.view(1, 1, 3)).clamp(0, 255)
                     harmonized = True
 
+                # 얼굴 패치. 기존 머리를 지운 자리를 평균 살색 대신 이걸로 덮는다.
+                # 머리와 **같은 변환**을 써야 눈/눈썹 위치가 어긋나지 않는다.
+                if getattr(asset, "face", None) is not None:
+                    face_rgb, face_a = self._warp_asset(
+                        asset.face, eye_l, eye_r,
+                        scale_mul * gain * asset.scale_adjust, offset_up, h, w)
+                    if face_rgb is not None and harmonized:
+                        # 같은 사진에서 나왔으니 헤어와 같은 조명 보정을 받는다.
+                        face_rgb = (face_rgb * ratio.view(1, 1, 3)).clamp(0, 255)
+
         # --- 눈/눈썹 보호 ---
         # 새 헤어 알파에서 이 영역을 깎아 둔다. 안 그러면 에셋에 앞머리가 있을 때
         # 눈까지 통째로 덮어서 마네킹처럼 보인다. 파싱이 실제로 '눈'으로 분류한
@@ -735,8 +746,19 @@ class GpuFaceParser:
                     below = torch.cummax(new_a.squeeze(-1), dim=0).values
                     zone = zone * below
                 tone = self._skin_tone(frame_f, cls).view(1, 1, 3)
-                fill = fill * (1.0 - zone).unsqueeze(-1) + tone * zone.unsqueeze(-1)
-                # 얼굴 영역은 플레이트 관측 여부와 무관하게 피부톤으로 채울 수 있다
+                # 얼굴 패치가 있으면 그걸 먼저 쓴다. 평균 살색은 패치가 없거나
+                # 패치가 안 닿는 자리에만 남는 폴백이다.
+                #
+                # 평균색이 나빴던 이유: 볼/턱/목이 섞여 이마 색과 안 맞고, 평평해서
+                # 음영이 없어 스티커처럼 보였다. 무엇보다 앞머리에 가려져 있던
+                # 눈썹 자리까지 살색이 됐다. 패치는 GAN 이 그 사람 피부톤과 조명으로
+                # 그린 이마라 셋 다 해결된다.
+                face_fill = tone
+                if face_rgb is not None:
+                    fa = face_a                                    # (h,w,1) 0~1
+                    face_fill = face_rgb * fa + tone * (1.0 - fa)
+                fill = fill * (1.0 - zone).unsqueeze(-1) + face_fill * zone.unsqueeze(-1)
+                # 얼굴 영역은 플레이트 관측 여부와 무관하게 채울 수 있다
                 src_ok = torch.clamp(src_ok + zone, 0.0, 1.0)
 
             a = (erase * src_ok).unsqueeze(-1)
