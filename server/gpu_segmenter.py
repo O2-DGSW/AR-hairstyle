@@ -125,6 +125,8 @@ class GpuFaceParser:
         self._alpha_cls[CLS_SKIN] = _ALPHA
 
         self._last_hair_px = 0
+        self._stat_cache = None    # (dark, sigma) 캐시. 몇 프레임에 한 번만 갱신.
+        self._stat_frame = -999
         self._last_coverage = None
         self._grid = None      # (ys, xs) 좌표 그리드 캐시 - 무게중심/워핑 공용
         # LRU. 512^2 RGBA float32 = 4MB/개이고 라이브 뱅크 한 번이 7개를 만든다.
@@ -324,11 +326,16 @@ class GpuFaceParser:
         t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
         a = t[:, 3:4] / 255.0
         pm = torch.cat([t[:, :3] * a, t[:, 3:4]], dim=1)
+        # 다운샘플은 avg_pool2d(2) = 정확한 2x 박스 평균이다. 이게 곧 올바른
+        # 2x 안티에일리어스라 interpolate(antialias) 와 품질이 같으면서 훨씬
+        # 싸다(실측: 에셋당 피라미드 빌드 12ms -> 2ms). 홀수 변은 마지막 행/열을
+        # 버리는데 밉맵이라 무해하다.
         levels = [pm]
         while (len(levels) < self._PYRAMID_LEVELS
                and min(levels[-1].shape[-2:]) >= 32):
-            levels.append(F.interpolate(levels[-1], scale_factor=0.5, mode="bilinear",
-                                        align_corners=False, antialias=True))
+            prev = levels[-1]
+            h2, w2 = (prev.shape[-2] // 2) * 2, (prev.shape[-1] // 2) * 2
+            levels.append(F.avg_pool2d(prev[..., :h2, :w2], 2))
 
         # 어두운 분위수. 불투명 픽셀만, CPU numpy 로 한 번.
         m = arr[..., 3] > 128
@@ -347,6 +354,19 @@ class GpuFaceParser:
     def _asset_tensor(self, asset):
         """호환용: 원본 해상도 프리멀티플라이드 텐서."""
         return self._asset_entry(asset)["levels"][0]
+
+    def warm_asset(self, asset) -> None:
+        """에셋(과 얼굴 패치)의 GPU 피라미드를 **미리** 만들어 캐시한다.
+
+        피라미드 빌드는 에셋당 수 ms 인데, 이걸 _warp_asset 이 처음 부를 때
+        (=고개를 돌려 그 각도 칸이 처음 화면에 뜰 때) 즉석으로 하면 그 프레임이
+        45~70ms 로 튄다(실측). 실시간 경로에서 스터터로 보인다. 뱅크는 GAN
+        생성(칸당 ~9초, 그동안 화면은 진행률로 덮임) 직후에 등록되므로, 거기서
+        미리 구워 두면 실제로 워핑할 때는 항상 warm 이다.
+        """
+        self._asset_entry(asset)
+        if getattr(asset, "face", None) is not None:
+            self._asset_entry(asset.face)
 
     # ---------- 에셋 GPU 캐시 ----------
     def evict_asset(self, name: str) -> bool:
@@ -825,7 +845,15 @@ class GpuFaceParser:
                 lift = None
                 dark_f = sigma_f = None
                 if new_rgb is not None and (CONFIG.black_match > 0 or CONFIG.grain_match > 0):
-                    dark_f, sigma_f = self._frame_stats(frame_f, cls, eyes)
+                    # 블랙레벨/노이즈 σ 는 조명·카메라 특성이라 프레임마다 거의
+                    # 안 변한다. 매 프레임 quantile+블러를 돌리면 비싸고(스파이크
+                    # 유발) 이득이 없어, 히스테리시스처럼 stats_every 프레임에 한
+                    # 번만 재고 캐시한다. 첫 프레임은 무조건 잰다.
+                    fidx = plate.frames if plate is not None else self._stat_frame + CONFIG.stats_every
+                    if self._stat_cache is None or fidx - self._stat_frame >= CONFIG.stats_every:
+                        self._stat_cache = self._frame_stats(frame_f, cls, eyes)
+                        self._stat_frame = fidx
+                    dark_f, sigma_f = self._stat_cache
                 if new_rgb is not None and harmonize and asset.ref_skin is not None:
                     cur = self._skin_tone(frame_f, cls)
                     ref = torch.as_tensor(asset.ref_skin, device=self.device,

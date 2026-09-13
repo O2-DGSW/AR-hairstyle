@@ -93,6 +93,9 @@ def main():
     banks = hair_asset.list_banks(assets)
     bank = banks[0] if banks else None
     print(f"에셋 {len(assets)}개, 뱅크 {banks}")
+    # 서버가 등록 직후 하는 것처럼 피라미드를 미리 굽는다(실시간 스파이크 방지).
+    for a in assets.values():
+        seg.warm_asset(a)
 
     yaw_ema = None
     cur = None

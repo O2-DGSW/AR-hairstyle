@@ -762,6 +762,15 @@ async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
     state.registry.add(asset)
     app.metrics.assets_generated_total += 1
 
+    # GPU 피라미드를 지금(GAN 생성 직후, 화면이 진행률로 덮여 있는 동안) 미리
+    # 굽는다. 이걸 안 하면 나중에 고개를 돌려 이 칸이 처음 화면에 뜰 때
+    # _warp_asset 이 즉석으로 만들어 그 프레임이 45~70ms 로 튄다(실측). 반드시
+    # gpu_executor(CUDA 단일 스레드)에서. 실패해도 렌더가 알아서 만드므로 무해.
+    try:
+        await loop.run_in_executor(app.gpu_executor, seg.warm_asset, asset)
+    except Exception:
+        logger.exception("에셋 피라미드 예열 실패 (렌더가 필요 시 만든다)")
+
     # 디스크에 남긴다. 목적은 **내구성과 수동 승격**이다: 마음에 든 결과를
     # 사람이 골라 server/assets/ 로 옮기면 그때부터 공유 정적 에셋이 된다.
     # 시작할 때 이 디렉터리를 공유 정적 목록으로 자동 로드하면 안 된다 -
