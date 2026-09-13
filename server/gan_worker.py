@@ -256,11 +256,53 @@ class GanWorker:
         # align_face 는 리스트를 받아 리스트를 준다. 한 장만 넘긴다.
         return align_face([TF.to_tensor(rgb)], predictor=self._predictor())[0]
 
+    def _align_direct(self, bgr: np.ndarray):
+        """원본 프레임에서 **한 번의 리샘플링**으로 FFHQ 1024 정렬. 실패하면 None.
+
+        예전 경로는 _prepare(크롭 + INTER_CUBIC 으로 눈 간격 130px 업스케일) 뒤에
+        다시 grid_sample 로 1024 를 만들었다. 두 번 보간하면 그만큼 흐려진다 -
+        웹캠 640x480 은 눈 간격 ~50px 라 어차피 4.4배를 늘려야 하는데 그걸
+        두 단계로 나눌 이유가 없다. _prepare 의 업스케일은 dlib 검출기를 위한
+        것이었고 MediaPipe 는 원본 크기에서 바로 잡는다. 사각형이 프레임 밖으로
+        나가는 부분은 align_to_quad 가 반사 패딩 + 블러로 덮는다(예전 경로의
+        BORDER_REPLICATE 와 같은 역할).
+        """
+        if not CONFIG.gan_fast_align:
+            return None
+        try:
+            import torch
+            import ffhq_align
+            from face_pose import landmarks_image
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            pose = landmarks_image(rgb)
+            if pose is None:
+                return None
+            d = float(np.linalg.norm(pose["eye_r"] - pose["eye_l"]))
+            if d < 8.0:
+                return None
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            t = ffhq_align.align_face_landmarks(
+                rgb, pose["eye_l"], pose["eye_r"], pose["mouth_l"], pose["mouth_r"],
+                device=dev)
+            return t.detach().cpu()
+        except Exception:
+            if not getattr(self, "_align_warned", False):
+                self._align_warned = True
+                import traceback
+                print("[gan] 직접 정렬 실패 - 예전 경로로 폴백합니다\n"
+                      + traceback.format_exc(), flush=True)
+            return None
+
     def _aligned_ref(self, path):
         """참고사진의 정렬 결과. 파일이 안 바뀌므로 프로세스 수명 내내 캐시한다."""
         cached = self._aligned_ref_cache.get(path)
         if cached is None:
-            cached = self._align(self._prepare_ref(path))
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError(f"참고사진을 읽을 수 없습니다: {path}")
+            cached = self._align_direct(img)
+            if cached is None:
+                cached = self._align(self._prepare_ref(path))
             self._aligned_ref_cache[path] = cached
         return cached
 
@@ -287,7 +329,10 @@ class GanWorker:
         shape_path = os.path.abspath(shape_path)
         color_path = os.path.abspath(color_path)
 
-        face_rgb = self._prepare(face_bgr)
+        # 원본에서 바로 정렬한다(리샘플링 1회). 안 되면 예전 경로(_prepare +
+        # _align, dlib 폴백 포함).
+        face_direct = self._align_direct(face_bgr)
+        face_rgb = None if face_direct is not None else self._prepare(face_bgr)
         # 참고사진도 **같은 기준으로** 정규화한다.
         # 얼굴 사진만 정규화하고 참고사진을 원본 그대로 넣으면 두 이미지의
         # 얼굴-프레임 비율이 크게 어긋나고, HairFastGAN 의 pose alignment 가
@@ -308,7 +353,7 @@ class GanWorker:
                 color_t = (shape_t if color_path == shape_path
                            else self._aligned_ref(color_path))
                 # 얼굴은 매번 달라지므로 이것만 정렬한다.
-                face_t = self._align(face_rgb)
+                face_t = face_direct if face_direct is not None else self._align(face_rgb)
                 # 이미 정렬했으므로 align=False. True 로 두면 안에서 3장을
                 # 다시 정렬해 2.7초가 그대로 붙는다.
                 out = hf.swap(face_t, shape_t, color_t, align=False)

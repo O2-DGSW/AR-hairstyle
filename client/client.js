@@ -388,6 +388,12 @@ function onCapture(d) {
   } else if (d.status === "done") {
     el("result-before").src = d.before + "?t=" + Date.now();
     el("result-after").src = d.url + "?t=" + Date.now();
+    // 합성 결과는 본인 얼굴 + GAN 헤어. 얼굴까지 재생성된 GAN 원본은 참고용.
+    const ganImg = el("result-gan");
+    if (ganImg) {
+      if (d.gan) { ganImg.src = d.gan + "?t=" + Date.now(); ganImg.style.display = "block"; }
+      else ganImg.style.display = "none";
+    }
     el("result-meta").textContent = `(GAN ${d.gan_seconds}초 / 전체 ${d.total_seconds}초)`;
     el("result-wrap").style.display = "block";
 

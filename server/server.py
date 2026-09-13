@@ -301,32 +301,36 @@ class SegmentedVideoTrack(VideoStreamTrack):
         self._yaw_ema = None       # yaw 흔들림이 각도 전환을 튀게 하므로 완만하게
         self._cur_asset = None     # 히스테리시스: 지금 쓰는 뱅크 칸
         self._last_out = None      # 드롭/에러 시 내보낼 직전 합성 결과
+        self._frame_size = None    # 수신 해상도 (h, w). 바뀌면 로그
 
     def _pose_rgb(self, img):
         """랜드마커 워커 스레드에서 실행. 색변환도 여기서 해야 메인 루프가 안 막힌다."""
         return self._state.pose.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
                                         int(time.monotonic() * 1000))
 
-    def _collect_for_bank(self, pose):
-        """라이브 뱅크가 켜져 있으면, 목표 각도에 들어온 순간의 원본을 잡아 큐에 넣는다.
+    @staticmethod
+    def _sharpness(img, pose):
+        """얼굴 주변 크롭의 라플라시안 분산. 같은 칸의 후보끼리만 비교한다."""
+        el, er = pose["eye_l"], pose["eye_r"]
+        d = max(20.0, float(np.hypot(er[0] - el[0], er[1] - el[1])))
+        cx, cy = (el[0] + er[0]) / 2.0, (el[1] + er[1]) / 2.0
+        h, w = img.shape[:2]
+        x0, x1 = int(max(0, cx - 1.5 * d)), int(min(w, cx + 1.5 * d))
+        y0, y1 = int(max(0, cy - 1.5 * d)), int(min(h, cy + 1.5 * d))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return 0.0
+        g = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(g, cv2.CV_32F).var())
 
-        움직이는 도중에 잡으면 모션 블러가 그대로 GAN 입력이 되어 결과가
-        뭉개진다. 측정값이 EMA 를 얼마나 앞질렀는지로 '지금 움직이는 중인가'
-        를 판정한다 - 정지해 있으면 둘이 붙고, 돌리는 중이면 벌어진다.
-        """
+    def _finalize_bucket(self, lb, target):
+        """후보 중 최선을 그 칸의 프레임으로 확정한다."""
         st = self._state
-        lb = st.livebank
-        if lb is None or lb.phase != "collect" or pose is None or self._yaw_ema is None:
-            return
-        if abs(float(pose["yaw"]) - self._yaw_ema) > st.cfg.live_steady:
-            return
-        target = lb.match(self._yaw_ema)
-        if target is None or st.last_raw is None:
-            return
-
+        best, frame, yaw, n = lb.cands.pop(target)
         lb.status[target] = "captured"
-        lb.frames[target] = st.last_raw.copy()
-        lb.measured[target] = float(self._yaw_ema)
+        lb.frames[target] = frame
+        lb.measured[target] = yaw
+        logger.info("라이브 뱅크 %s: yaw %+.0f 확정 (후보 %d장, 선명도 %.0f)",
+                    lb.name, target, n, best)
         notify_peer(st, {"type": "livebank", **lb.report(),
                          "status": "captured", "captured_yaw": target})
 
@@ -335,6 +339,42 @@ class SegmentedVideoTrack(VideoStreamTrack):
         if all(v == "captured" for v in lb.status.values()):
             lb.phase = "generate"
             asyncio.create_task(run_bank_generation(st, lb))
+
+    def _collect_for_bank(self, pose):
+        """라이브 뱅크가 켜져 있으면, 목표 각도에 들어온 프레임 중 가장 선명한
+        것을 잡아 큐에 넣는다.
+
+        움직이는 도중에 잡으면 모션 블러가 그대로 GAN 입력이 되어 결과가
+        뭉개진다. 측정값이 EMA 를 얼마나 앞질렀는지로 '지금 움직이는 중인가'
+        를 판정하고(정지해 있으면 둘이 붙고, 돌리는 중이면 벌어진다), 그
+        판정을 통과한 프레임 중에서도 후보 N 장의 선명도를 비교해 고른다
+        (CONFIG.live_pick_frames). yaw 만 보는 정지 판정은 상하 흔들림이나
+        초점 흔들림을 못 거르기 때문이다.
+        """
+        st = self._state
+        lb = st.livebank
+        if lb is None or lb.phase != "collect":
+            return
+        moving = (pose is None or self._yaw_ema is None
+                  or abs(float(pose["yaw"]) - self._yaw_ema) > st.cfg.live_steady)
+        target = None if moving or st.last_raw is None else lb.match(self._yaw_ema)
+
+        # 후보가 쌓여 있는데 그 칸을 벗어났으면(다른 칸이거나 범위 밖) 지금까지
+        # 의 최선으로 확정한다 - 사용자가 다시 돌아오길 기다리지 않는다.
+        for t in list(lb.cands):
+            if t != target and lb.status[t] == "pending":
+                self._finalize_bucket(lb, t)
+        if target is None:
+            return
+
+        score = self._sharpness(st.last_raw, pose)
+        c = lb.cands.get(target)
+        if c is None or score > c[0]:
+            c = [score, st.last_raw.copy(), float(self._yaw_ema), 0]
+        c[3] = (lb.cands[target][3] if target in lb.cands else 0) + 1
+        lb.cands[target] = c
+        if c[3] >= max(1, int(st.cfg.live_pick_frames)):
+            self._finalize_bucket(lb, target)
 
     def _record_frame(self, img):
         """학습 데이터 수집: 원본 프레임을 그대로 떨군다.
@@ -388,6 +428,12 @@ class SegmentedVideoTrack(VideoStreamTrack):
         self._last_recv_at = now
 
         img = frame.to_ndarray(format="bgr24")
+        # 수신 해상도. 클라이언트가 720p 를 요청해도 브라우저는 업링크 대역폭에
+        # 따라 조용히 낮춰 보낸다. 그러면 GAN 입력부터 흐려지는데 로그에
+        # 안 남으면 원인을 찾을 수 없다. 처음과 바뀔 때만 남긴다.
+        if img.shape[:2] != self._frame_size:
+            self._frame_size = img.shape[:2]
+            logger.info("수신 해상도 %dx%d (%s)", img.shape[1], img.shape[0], st.sid)
         # 촬영은 오버레이가 얹히기 전 원본을 써야 한다 (GAN 입력에 마젠타 색칠이
         # 들어가면 안 됨). 매 프레임 최신본만 보관.
         st.last_raw = img
@@ -613,6 +659,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
                     "d_corrected": round(pose["d_corrected"], 1) if pose else None,
                     "device": seg.device,
                     "cuda_graph": seg.graph is not None,
+                    "frame_size": [img.shape[1], img.shape[0]],
                     # --- 아래는 추가된 키다(기존 키는 하나도 안 바꿨다) ---
                     "dropped": st.dropped,
                     "errors": st.errors,
@@ -671,12 +718,6 @@ async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
     # 세그멘테이션은 CUDA 그래프 때문에 반드시 gpu_executor 스레드에서.
     cls = await loop.run_in_executor(app.gpu_executor, seg.class_map, result_bgr)
 
-    from gpu_segmenter import CLS_HAIR, CLS_SKIN
-    hair = (cls == CLS_HAIR).astype("uint8")
-    # 이 결과의 피부색을 함께 기록해두면, 나중에 조명이 달라져도 그 비율로
-    # 헤어 색을 보정할 수 있다.
-    ref_skin = hair_asset.skin_mean(result_bgr, (cls == CLS_SKIN))
-
     from face_pose import FacePose
     # with 문으로 닫는다. 예전 try/finally 와 같은 동작이지만 close() 를
     # 빠뜨릴 여지가 없다 - MediaPipe 는 네이티브 핸들이라 안 닫으면 프로세스가
@@ -689,29 +730,13 @@ async def build_asset_from_result(state: PeerState, result_bgr, reference: str,
 
     tag = "" if yaw is None else f"-yaw{int(round(yaw)):+03d}"
     name = f"gan-{reference}{tag}-{int(time.time() * 1000) % 1000000}"
-    asset, _, px = hair_asset.build_from_photo(
-        result_bgr, hair, pose["eye_l"], pose["eye_r"], name, ref_skin=ref_skin)
-    if asset is None or px < 500:
+    # 추출 규칙(머리 + 얼굴 패치)은 asset_extract 한 곳에 있다. 오프라인
+    # 뱅크 스크립트도 같은 함수를 쓰므로 두 경로가 어긋나지 않는다.
+    import asset_extract
+    asset, px = asset_extract.extract(result_bgr, cls, pose["eye_l"], pose["eye_r"], name)
+    if asset is None:
         logger.warning("GAN 결과에서 머리를 찾지 못했습니다 (%s px)", px)
         return None
-
-    # --- 얼굴 패치 ---
-    # 기존 머리를 지운 자리를 평균 살색 대신 이걸로 덮는다. GAN 결과에는 그
-    # 사람 피부톤/조명으로 그려진 이마와 눈썹이 들어 있는데 지금까지 머리만
-    # 오려내고 버렸다. 같은 눈 앵커를 쓰므로 머리와 같은 변환으로 정렬된다.
-    #
-    # 머리(13)/모자(14)/목/옷/배경을 뺀 얼굴 부위 전체(1~12)를 쓴다. 이마만
-    # 잘라내지 않는 이유는 앞머리가 어디까지 내려와 있었는지 미리 알 수 없기
-    # 때문이다 - 넉넉히 오려 두고 덮을 자리는 런타임이 정한다.
-    face_mask = ((cls >= 1) & (cls <= 12)).astype("uint8")
-    face_asset, _, fpx = hair_asset.build_from_photo(
-        result_bgr, face_mask, pose["eye_l"], pose["eye_r"], name + "#face",
-        ref_skin=ref_skin)
-    if face_asset is not None and fpx >= 500:
-        asset.face = face_asset
-    else:
-        logger.warning("GAN 결과에서 얼굴 패치를 못 만들었습니다 (%s px) - "
-                       "평균 살색으로 대체됩니다", fpx)
 
     asset.yaw = yaw
     asset.bank = bank
@@ -788,6 +813,8 @@ class LiveBank:
         # 런타임 칸 선택은 이 값을 써야 한다. 목표 각도를 적어 두면 허용오차
         # 만큼 어긋난 채로 기록돼 엉뚱한 각도에서 그 칸이 선택된다.
         self.measured = {}
+        # target -> [최고 선명도, 그 프레임, 그때 yaw, 본 후보 수]. 확정 전 후보.
+        self.cands = {}
         # 첫 칸(정면)의 눈 간격. 나머지 칸의 크기를 여기에 맞춰 정규화한다.
         # build_asset_from_result 가 채운다.
         self.ref_eye_len = None
@@ -829,6 +856,38 @@ def notify_peer(state, payload: dict):
             logger.exception("알림 전송 실패")
 
 
+async def prepare_gan_input(state: PeerState, frame):
+    """GAN 에 넣을 프레임 전처리. 지금은 앞머리 사전 제거(gan_input.py) 하나다.
+
+    파싱은 gpu_executor(CUDA 그래프 단일 스레드), 눈 위치는 MediaPipe IMAGE
+    모드. GAN 자식 프로세스에는 파서가 없으므로 여기(부모)서 끝내고 보낸다.
+    실패하면 원본을 그대로 쓴다 - 전처리는 개선이지 전제 조건이 아니다.
+    """
+    app = state.app
+    if not state.cfg.gan_prefill_forehead:
+        return frame
+    try:
+        seg = await app.get_segmenter()
+        loop = asyncio.get_event_loop()
+        from face_pose import landmarks_image
+        import gan_input
+        # 랜드마커(~10ms)와 채움(수십 ms)은 CPU 작업이라 루프 밖에서 돌린다.
+        # 촬영은 스트리밍 중에 오므로 루프를 막으면 모든 세션이 그만큼 멈춘다.
+        lm = await loop.run_in_executor(
+            None, landmarks_image, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if lm is None:
+            return frame
+        cls = await loop.run_in_executor(app.gpu_executor, seg.class_map, frame)
+        out, npx = await loop.run_in_executor(
+            None, gan_input.prefill_forehead, frame, cls, lm["eye_l"], lm["eye_r"])
+        if npx:
+            logger.info("GAN 입력: 앞머리 %d px 사전 제거", npx)
+        return out
+    except Exception:
+        logger.exception("GAN 입력 전처리 실패 - 원본 프레임 사용")
+        return frame
+
+
 async def run_bank_bucket(state: PeerState, lb: LiveBank, target: float, frame):
     """뱅크 한 칸을 GAN 으로 만들어 등록한다.
 
@@ -851,6 +910,7 @@ async def run_bank_bucket(state: PeerState, lb: LiveBank, target: float, frame):
     try:
         loop = asyncio.get_event_loop()
         t0 = time.perf_counter()
+        frame = await prepare_gan_input(state, frame)
         result, gan_ms = await loop.run_in_executor(
             app.gan_executor, app.gan.swap, frame, ref_path, ref_path, logger.info)
         app.metrics.gan_swaps_total += 1
@@ -919,6 +979,38 @@ async def run_bank_generation(state: PeerState, lb: LiveBank):
                         "banks": state.registry.banks()})
 
 
+async def compose_still(state: PeerState, frame, asset_name: str):
+    """프레임 한 장에 에셋을 실시간과 같은 경로로 합성한다. -> BGR 또는 None.
+
+    세션의 플레이트(기존 머리 지울 배경)와 세그멘터를 그대로 쓴다. 포즈는 이
+    프레임에서 새로 잰다 - 세션 포즈 추적기는 워커 스레드가 쓰고 있고, 어차피
+    한 장이라 거리 보정이 필요 없다.
+    """
+    app = state.app
+    seg = await app.get_segmenter()
+    asset = state.registry.get(asset_name)
+    if asset is None or state.plate is None:
+        return None
+    # 세션 추적기의 마지막 포즈를 쓴다. 거리 보정(d_corrected = K/tz)은 정면
+    # 프레임에서 캘리브레이션된 K 가 있어야 고개를 돌려도 크기가 유지되는데,
+    # 새 FacePose 로 한 장만 재면 K 가 없어 yaw 만큼 헤어가 작아진다
+    # (36° 면 ~19%). 촬영 프레임은 last_raw 라 추적기 포즈와 한 프레임 차이다.
+    pose = getattr(state.track, "_last_pose", None) if state.track is not None else None
+    if pose is None:
+        from face_pose import FacePose
+        with FacePose() as poser:
+            pose = poser.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 0)
+    if pose is None:
+        return None
+    loop = asyncio.get_event_loop()
+    # 평활화기는 넘기지 않는다(한 장). 블렌더도 끈다.
+    out, _ = await loop.run_in_executor(
+        app.gpu_executor, seg.process, frame, state.plate, "tryon",
+        asset, state.scale_mul, state.offset_up, pose, state.harmonize, state.shadow,
+        0.0, None, 0.0, None)
+    return out
+
+
 async def run_capture(state: PeerState, reference: str):
     """현재 프레임을 GAN으로 고화질 합성한다. 진행 상황은 DataChannel로 보고."""
     app = state.app
@@ -947,8 +1039,9 @@ async def run_capture(state: PeerState, reference: str):
 
         notify(status="running", message="합성 중...")
         t0 = time.perf_counter()
+        gan_in = await prepare_gan_input(state, frame)
         result, gan_ms = await loop.run_in_executor(
-            app.gan_executor, app.gan.swap, frame, ref_path, ref_path, logger.info)
+            app.gan_executor, app.gan.swap, gan_in, ref_path, ref_path, logger.info)
         total = time.perf_counter() - t0
         app.metrics.gan_swaps_total += 1
         app.metrics.gan.observe(float(gan_ms))
@@ -957,6 +1050,10 @@ async def run_capture(state: PeerState, reference: str):
         name = f"capture_{int(time.time() * 1000)}.png"
         out_path = os.path.join(gan_process.CAPTURE_DIR, name)
         before_name = name.replace("capture_", "before_")
+        gan_name = name.replace("capture_", "gan_")
+        # GAN 원본(1024, 얼굴 전체가 재생성된 것)은 gan_*.png 로 남긴다.
+        # capture_*.png 는 아래에서 **본인 얼굴 위에 합성한** 것으로 바뀐다.
+        cv2.imwrite(os.path.join(gan_process.CAPTURE_DIR, gan_name), result)
         cv2.imwrite(out_path, result)
         cv2.imwrite(os.path.join(gan_process.CAPTURE_DIR, before_name), frame)
 
@@ -989,7 +1086,22 @@ async def run_capture(state: PeerState, reference: str):
         except Exception:
             logger.exception("에셋 추출 실패 (촬영 결과는 정상)")
 
+        # --- 촬영 결과 = 본인 얼굴 + 합성 헤어 ---
+        # GAN 출력을 그대로 주면 얼굴까지 StyleGAN 이 다시 그린 "남의 얼굴"이
+        # 된다(입력이 웹캠이라 인버전이 정체성을 다 못 살린다). 실시간과 같은
+        # 합성 경로(기존 머리 제거 + GAN 헤어/이마 패치 + 조명/그레인 정합)를
+        # 원본 프레임에 한 번 돌려 그걸 촬영본으로 준다. 얼굴 픽셀은 100%
+        # 본인 것이고 헤어만 GAN 것이다. 실패하면 GAN 원본이 그대로 남는다.
+        if asset_name:
+            try:
+                composed = await compose_still(state, frame, asset_name)
+                if composed is not None:
+                    cv2.imwrite(out_path, composed)
+            except Exception:
+                logger.exception("촬영 합성 실패 - GAN 원본을 그대로 둡니다")
+
         notify(status="done", url=f"/captures/{name}", before=f"/captures/{before_name}",
+               gan=f"/captures/{gan_name}",
                gan_seconds=round(gan_ms, 1), total_seconds=round(total, 1),
                asset=asset_name, assets=state.registry.names())
     except Exception as e:

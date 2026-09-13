@@ -126,7 +126,13 @@ def align_to_quad(img, quad, out_size=1024, device=None):
     gy = (src[..., 1] * 2.0 + 1.0) / h - 1.0
     grid = torch.stack((gx, gy), dim=-1).unsqueeze(0).to(t.dtype)
 
-    out = F.grid_sample(t, grid, mode="bilinear", padding_mode="reflection",
+    # 업스케일이면 bicubic. 웹캠 프레임(눈 간격 ~50px)은 1024 정렬까지 4배
+    # 넘게 늘려야 하는데 bilinear 는 그 배율에서 눈에 띄게 뭉갠다. 실측(얼굴
+    # 중앙 512 영역 고주파 에너지): bilinear 0.71 / 예전 INTER_CUBIC 경로 0.82.
+    # 축소일 때는 위의 antialias 축소 + bilinear 가 맞다(bicubic 은 축소에서
+    # 에일리어싱을 못 막는다).
+    mode = "bicubic" if shrink < 1.0 else "bilinear"
+    out = F.grid_sample(t, grid, mode=mode, padding_mode="reflection",
                         align_corners=False)
 
     # 사각형이 원본 밖으로 나간 부분을 부드럽게 덮는다.
