@@ -129,7 +129,8 @@ class GpuFaceParser:
         self._grid = None      # (ys, xs) 좌표 그리드 캐시 - 무게중심/워핑 공용
         # LRU. 512^2 RGBA float32 = 4MB/개이고 라이브 뱅크 한 번이 7개를 만든다.
         # 상한 없이 두면 세션을 몇 번 돌리는 것만으로 VRAM 이 수백 MB 샌다.
-        self._asset_cache = OrderedDict()   # 에셋 이름 -> GPU 텐서
+        self._asset_cache = OrderedDict()   # 에셋 이름 -> {"levels", "dark"} (_asset_entry)
+        self._lum_w = torch.tensor([0.114, 0.587, 0.299], device=self.device)   # BGR 휘도
         self._blender = None    # 증류 블렌더 (load_blender 로 주입)
         self._cgrid = None      # 크롭 좌표 그리드 캐시
 
@@ -292,20 +293,60 @@ class GpuFaceParser:
             self._grid = (ys, xs)
         return self._grid
 
-    def _asset_tensor(self, asset):
-        """에셋 RGBA를 GPU에 올려 캐시. 매 프레임 업로드하면 그것만으로 수 ms 샌다."""
-        t = self._asset_cache.get(asset.name)
-        if t is not None:
-            self._asset_cache.move_to_end(asset.name)        # 최근 사용 표시
-            return t
+    #: 밉맵 단계 수 상한. 1024 스케일 에셋을 1/16 까지 (눈 간격 14px 상당).
+    _PYRAMID_LEVELS = 5
 
+    def _asset_entry(self, asset):
+        """에셋 RGBA -> GPU 캐시 항목 {"levels": [텐서...], "dark": float}.
+
+        levels[i] 는 원본을 1/2^i 로 **안티에일리어스** 축소한 프리멀티플라이드
+        BGRA 텐서(1,4,H,W). 두 가지 문제를 여기서 한 번에 잡는다:
+
+        1) 에일리어싱. 에셋은 1024 정렬 스케일(눈 간격 ~220px)인데 프레임은
+           50~100px 라 워핑이 3~5배 축소다. grid_sample bilinear 는 축소에
+           안티에일리어싱이 없어서 머리카락 고주파가 반짝이고 지글거린다.
+           목표 배율에 가장 가까운 레벨에서 샘플링하면 남는 축소가 2배 미만이라
+           bilinear 로 충분하다. 축소는 캐시 시점에 한 번만 한다.
+        2) 경계 프린지. build_from_photo 는 스트레이트 알파(RGB 가 마스크 밖에서
+           GAN 배경/피부색)를 만든다. 그대로 bilinear 하면 페더 경계에서 배경색이
+           머리에 섞여 밝은 테두리가 생긴다(실측: 헤어 외곽에 주황/흰 띠).
+           RGB 에 알파를 미리 곱해 두면 보간이 색을 끌어오지 않는다.
+
+        "dark" 는 알파가 있는 픽셀의 어두운 분위수 휘도. 장면 블랙레벨 정합에 쓴다.
+        """
+        e = self._asset_cache.get(asset.name)
+        if e is not None:
+            self._asset_cache.move_to_end(asset.name)        # 최근 사용 표시
+            return e
+
+        F = torch.nn.functional
         arr = asset.rgba.astype(np.float32)                  # (Ha, Wa, 4) BGRA
         t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        self._asset_cache[asset.name] = t
+        a = t[:, 3:4] / 255.0
+        pm = torch.cat([t[:, :3] * a, t[:, 3:4]], dim=1)
+        levels = [pm]
+        while (len(levels) < self._PYRAMID_LEVELS
+               and min(levels[-1].shape[-2:]) >= 32):
+            levels.append(F.interpolate(levels[-1], scale_factor=0.5, mode="bilinear",
+                                        align_corners=False, antialias=True))
+
+        # 어두운 분위수. 불투명 픽셀만, CPU numpy 로 한 번.
+        m = arr[..., 3] > 128
+        dark = 0.0
+        if m.sum() >= 100:
+            lum = arr[..., :3][m] @ np.array([0.114, 0.587, 0.299], np.float32)
+            dark = float(np.quantile(lum, CONFIG.black_pct))
+
+        e = {"levels": levels, "dark": dark}
+        self._asset_cache[asset.name] = e
         # 지금 워핑 중인 에셋이 축출되면 안 되므로 넣고 나서 자른다.
         while len(self._asset_cache) > CONFIG.asset_cache_max:
             self._asset_cache.popitem(last=False)
-        return t
+        return e
+
+    def _asset_tensor(self, asset):
+        """호환용: 원본 해상도 프리멀티플라이드 텐서."""
+        return self._asset_entry(asset)["levels"][0]
 
     # ---------- 에셋 GPU 캐시 ----------
     def evict_asset(self, name: str) -> bool:
@@ -315,15 +356,20 @@ class GpuFaceParser:
         레지스트리 쪽 축출 훅에서 이걸 불러야 VRAM 이 실제로 돌아온다
         (파이썬 쪽 참조가 남아 있으면 캐싱 얼로케이터가 반납하지 않는다).
         """
-        return self._asset_cache.pop(name, None) is not None
+        hit = self._asset_cache.pop(name, None) is not None
+        # 얼굴 패치는 <name>#face 키로 따로 캐시된다(asset_extract / _read_asset
+        # 규칙). 본체와 같이 지워야 VRAM 이 실제로 돌아온다.
+        self._asset_cache.pop(name + "#face", None)
+        return hit
 
     def evict_assets(self, names) -> int:
         return sum(1 for n in names if self.evict_asset(n))
 
     def cache_stats(self) -> dict:
         n = 0
-        for t in self._asset_cache.values():
-            n += t.numel() * t.element_size()
+        for e in self._asset_cache.values():
+            for t in e["levels"]:
+                n += t.numel() * t.element_size()
         return {"assets": len(self._asset_cache), "bytes": int(n)}
 
     def gpu_stats(self) -> dict:
@@ -360,22 +406,42 @@ class GpuFaceParser:
             return None, None
         Minv = hair_asset.invert_affine(M)
 
-        at = self._asset_tensor(asset)
+        # 에셋 px -> 프레임 px 배율. 이보다 크지 않은 밉맵 레벨을 고르면 남는
+        # 축소가 2배 미만이라 bilinear 로 에일리어싱이 안 생긴다.
+        scale = float(np.hypot(M[0, 0], M[1, 0]))
+        levels = self._asset_entry(asset)["levels"]
+        lvl = 0
+        while lvl + 1 < len(levels) and scale <= 0.5 ** (lvl + 1):
+            lvl += 1
+        at = levels[lvl]
+        f = 0.5 ** lvl
         ha, wa = at.shape[2], at.shape[3]
         ys, xs = self._ensure_grid(h, w)
 
-        # 출력 픽셀 좌표 -> 에셋 좌표 -> grid_sample 정규화 좌표([-1,1])
-        xa = Minv[0, 0] * xs + Minv[0, 1] * ys + Minv[0, 2]
-        ya = Minv[1, 0] * xs + Minv[1, 1] * ys + Minv[1, 2]
+        # 출력 픽셀 좌표 -> 에셋 좌표 -> 레벨 좌표 -> grid_sample 정규화 좌표([-1,1])
+        # 축소 레벨의 픽셀 중심은 (x + 0.5) * f - 0.5 에 놓인다(align_corners=False).
+        xa = (Minv[0, 0] * xs + Minv[0, 1] * ys + Minv[0, 2] + 0.5) * f - 0.5
+        ya = (Minv[1, 0] * xs + Minv[1, 1] * ys + Minv[1, 2] + 0.5) * f - 0.5
         gx = (2.0 * xa + 1.0) / wa - 1.0
         gy = (2.0 * ya + 1.0) / ha - 1.0
         grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
 
         warped = torch.nn.functional.grid_sample(
             at, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        a = warped[0, 3:4].permute(1, 2, 0) / 255.0     # (h, w, 1)
-        rgb = warped[0, :3].permute(1, 2, 0)            # (h, w, 3)
-        return rgb, a
+        if CONFIG.edge_feather > 0:
+            # 프레임 스케일 페더. 에셋의 3px 페더는 4배 축소되면 1px 미만이라
+            # 경계가 오려붙인 것처럼 딱딱해진다. 눈 간격에 비례한 폭으로 흐린다.
+            # **프리멀티플라이드 4채널을 함께** 흐려야 한다. 알파만 흐리면 알파가
+            # 새로 생긴 바깥 픽셀의 RGB 가 0(검정)이라 어두운 테두리가 생긴다.
+            d = float(np.hypot(eye_r[0] - eye_l[0], eye_r[1] - eye_l[1]))
+            k = int(round(d * CONFIG.edge_feather)) | 1
+            if k >= 3:
+                warped = torch.nn.functional.avg_pool2d(warped, k, stride=1, padding=k // 2)
+        a = warped[:, 3:4] / 255.0                          # (1,1,h,w)
+        # 프리멀티플라이드를 되돌린다. 알파 0 인 곳은 RGB 도 0 이고 합성에서
+        # 알파가 곱해져 사라지므로 나눗셈 하한만 두면 된다.
+        rgb = warped[:, :3] / a.clamp(min=1e-3)
+        return rgb[0].permute(1, 2, 0), a[0].permute(1, 2, 0)
 
     def _face_zone(self, eye_l, eye_r, h, w):
         """눈 2점 기준으로 '얼굴/이마' 영역의 부드러운 마스크 (h, w) 0~1.
@@ -393,6 +459,87 @@ class GpuFaceParser:
         ny = (ys - (c[1] - 0.75 * d)) / (1.60 * d)
         r = nx * nx + ny * ny
         return torch.clamp(1.6 - 1.6 * r, 0.0, 1.0)
+
+    def _eye_protect_geo(self, eye_l, eye_r, h, w):
+        """랜드마크 눈 2점 기준 보호 마스크 (h, w) 0~1. 눈마다 타원 하나.
+
+        파싱이 눈을 '머리'로 오분류하는 프레임(앞머리+안경+뿌연 조명)에서도
+        눈이 지워지지 않게 한다. 세부 근거는 CONFIG.protect_eye_rx 주석.
+        """
+        rx, ry = CONFIG.protect_eye_rx, CONFIG.protect_eye_ry
+        if rx <= 0 or ry <= 0:
+            return None
+        d = max(1.0, float(np.hypot(eye_r[0] - eye_l[0], eye_r[1] - eye_l[1])))
+        ys, xs = self._ensure_grid(h, w)
+        # 눈 축 방향/수직 방향으로 분해해 고개가 기울어도 타원이 따라간다.
+        ux, uy = (eye_r[0] - eye_l[0]) / d, (eye_r[1] - eye_l[1]) / d
+        out = torch.zeros_like(xs)
+        for ex, ey in (eye_l, eye_r):
+            dx, dy = xs - float(ex), ys - float(ey)
+            u = (dx * ux + dy * uy) / (rx * d)
+            v = (-dx * uy + dy * ux) / (ry * d)
+            r = u * u + v * v
+            # r<1 안쪽 1, 1~1.35 에서 부드럽게 0 으로 (반지름 기준 1.16배까지).
+            # 더 넓히면 눈썹 아래 앞머리 끝이 보호돼 지워지지 않고 남는다.
+            t = ((1.35 - r) / 0.35).clamp(0.0, 1.0)
+            out = torch.maximum(out, t * t * (3 - 2 * t))
+        return out
+
+    @staticmethod
+    def _box(x, k):
+        """(1,C,h,w) 분리형 박스 블러. 큰 커널도 O(k) 라 저주파 추출에 쓴다."""
+        F = torch.nn.functional
+        k = int(k) | 1
+        if k < 3:
+            return x
+        x = F.avg_pool2d(x, (k, 1), stride=1, padding=(k // 2, 0))
+        return F.avg_pool2d(x, (1, k), stride=1, padding=(0, k // 2))
+
+    def _frame_stats(self, frame_f, cls, eyes=None):
+        """(장면 블랙레벨 휘도, 피부 노이즈 σ) - 둘 다 GPU 스칼라 텐서.
+
+        블랙레벨: **머리 주변** 휘도의 어두운 분위수. 플레어/역광으로 뿌연
+        장면에서는 아무것도 진짜 검지 않아서 이 값이 40~80 까지 올라간다. GAN 이
+        그린 새까만 머리를 그대로 얹으면 그것만 튄다. 프레임 전체를 쓰지 않는
+        이유: 흰 벽/밝은 옷뿐인 또렷한 장면도 "검은 게 없다" 는 이유로 lift 가
+        걸린다. 머리 주변(본인 머리, 눈썹, 콧구멍)은 항상 어두운 게 있어서
+        플레어가 없으면 분위수가 낮게 나온다.
+        노이즈: 피부 픽셀의 (원본 - 3x3 평균) 표준편차. 피부는 평탄해서
+        고주파가 거의 전부 센서/압축 노이즈다.
+        .item() 없이 텐서로만 돌려준다.
+        """
+        F = torch.nn.functional
+        h, w = frame_f.shape[:2]
+        lum = (frame_f @ self._lum_w).unsqueeze(0).unsqueeze(0)          # (1,1,h,w)
+        d = 50.0
+        region = lum
+        if eyes is not None:
+            el, er = eyes
+            d = max(20.0, float(np.hypot(er[0] - el[0], er[1] - el[1])))
+            cx, cy = float((el[0] + er[0]) / 2), float((el[1] + er[1]) / 2)
+            x0, x1 = int(max(0, cx - 1.8 * d)), int(min(w, cx + 1.8 * d))
+            y0, y1 = int(max(0, cy - 2.2 * d)), int(min(h, cy + 1.5 * d))
+            if x1 - x0 >= 16 and y1 - y0 >= 16:
+                region = lum[:, :, y0:y1, x0:x1]
+        small = F.avg_pool2d(region, 4, stride=4)
+        dark = torch.quantile(small.reshape(-1), CONFIG.black_pct)
+
+        # 피부 마스크를 안쪽으로 깎는다. 경계(안경/눈/머리와 맞닿는 곳)와 피부
+        # 안의 에지(코 주름, 입꼬리)의 잔차는 노이즈가 아니라서 그대로 넣으면
+        # σ 가 1.5~2배 부푼다(실측: 침식 7px 1.5~1.7 vs 강건 추정 1.0). 침식
+        # 폭을 얼굴 크기에 비례(0.3D)시키고, 프레임 밖은 '피부 아님' 으로 패딩해
+        # 가장자리 픽셀이 침식을 피하지 못하게 한다. 잔차도 상한으로 자른다.
+        ke = max(7, int(round(0.3 * d))) | 1
+        skin = (cls == CLS_SKIN).float().unsqueeze(0).unsqueeze(0)
+        not_skin = F.pad(1.0 - skin, (ke // 2,) * 4, value=1.0)
+        skin = 1.0 - F.max_pool2d(not_skin, ke, stride=1)
+        hp = lum - F.avg_pool2d(lum, 3, stride=1, padding=1, count_include_pad=False)
+        n = skin.sum().clamp(min=1.0)
+        var = (torch.clamp(hp * hp, max=100.0) * skin).sum() / n
+        # 3x3 평균을 뺀 잔차의 분산은 원 노이즈 분산의 8/9 이다.
+        sigma = torch.sqrt(var * 9.0 / 8.0)
+        ok = (skin.sum() > 200).float()
+        return dark, sigma * ok
 
     @staticmethod
     def _skin_tone(frame_f, cls):
@@ -593,6 +740,7 @@ class GpuFaceParser:
         eyes = None
         new_rgb = new_a = None
         face_rgb = face_a = None   # GAN 이 그려 준 이마/눈썹 패치
+        sigma_f = None             # 프레임 노이즈 σ (그레인 정합용, tryon 에서만)
 
         if mode in ("remove", "tryon"):
             # 앵커는 랜드마크를 우선한다.
@@ -665,18 +813,32 @@ class GpuFaceParser:
                         new_rgb = (new_rgb * pa + rgb2 * pb) / tot.clamp(min=1e-4)
                         new_a = tot
 
+                # --- 조명 정합 ---
+                # (1) 곱셈 배율: 피부 평균색 비율. 화이트밸런스/노출 차이를 잡는다.
+                # (2) 블랙레벨 lift: 곱셈은 검은 것을 밝힐 수 없다. GAN 은 노출을
+                #     '정상'으로 되돌려 그리므로(실측: 플레어로 뿌연 프레임 ->
+                #     GAN 결과는 또렷한 어두운 머리) 뿌연 장면에 얹으면 머리만
+                #     새까맣게 튄다. 프레임의 어두운 분위수와 에셋 머리의 어두운
+                #     분위수 차이만큼 그림자를 들어올린다. out = x + lift*(1-x/255)
+                #     - 밝은 곳은 덜, 어두운 곳은 더 (플레어/안개 모델).
+                ratio = None
+                lift = None
+                dark_f = sigma_f = None
+                if new_rgb is not None and (CONFIG.black_match > 0 or CONFIG.grain_match > 0):
+                    dark_f, sigma_f = self._frame_stats(frame_f, cls, eyes)
                 if new_rgb is not None and harmonize and asset.ref_skin is not None:
-                    # 조명/화이트밸런스 정합.
-                    # 에셋은 만들어질 때의 조명에 고정돼 있는데 지금 프레임의 조명은
-                    # 다르다. 그 차이를 피부색 비율로 추정해 헤어에 그대로 곱한다.
-                    # (피부는 어느 장면에나 있고 조명을 그대로 받으므로 조도의
-                    #  대리 지표로 쓸 수 있다)
                     cur = self._skin_tone(frame_f, cls)
                     ref = torch.as_tensor(asset.ref_skin, device=self.device,
                                           dtype=torch.float32)
                     ratio = (cur / ref.clamp(min=1.0)).clamp(CONFIG.harmonize_min, CONFIG.harmonize_max)
                     new_rgb = (new_rgb * ratio.view(1, 1, 3)).clamp(0, 255)
                     harmonized = True
+                if new_rgb is not None and CONFIG.black_match > 0:
+                    dark_a = self._asset_entry(asset)["dark"]
+                    if ratio is not None:
+                        dark_a = dark_a * ratio.mean()
+                    lift = ((dark_f - dark_a) * CONFIG.black_match).clamp(0.0, CONFIG.black_lift_max)
+                    new_rgb = new_rgb + lift * (1.0 - new_rgb / 255.0)
 
                 # 얼굴 패치. 기존 머리를 지운 자리를 평균 살색 대신 이걸로 덮는다.
                 # 머리와 **같은 변환**을 써야 눈/눈썹 위치가 어긋나지 않는다.
@@ -684,9 +846,11 @@ class GpuFaceParser:
                     face_rgb, face_a = self._warp_asset(
                         asset.face, eye_l, eye_r,
                         scale_mul * gain * asset.scale_adjust, offset_up, h, w)
-                    if face_rgb is not None and harmonized:
+                    if face_rgb is not None and ratio is not None:
                         # 같은 사진에서 나왔으니 헤어와 같은 조명 보정을 받는다.
                         face_rgb = (face_rgb * ratio.view(1, 1, 3)).clamp(0, 255)
+                    if face_rgb is not None and lift is not None:
+                        face_rgb = face_rgb + lift * (1.0 - face_rgb / 255.0)
 
         # --- 눈/눈썹 보호 ---
         # 새 헤어 알파에서 이 영역을 깎아 둔다. 안 그러면 에셋에 앞머리가 있을 때
@@ -706,6 +870,12 @@ class GpuFaceParser:
             k = max(1, int(CONFIG.protect_blur_k) | 1)          # 홀수로
             p = F.avg_pool2d(p.unsqueeze(0).unsqueeze(0), k, stride=1,
                              padding=k // 2).squeeze(0).squeeze(0)
+            if eyes is not None and CONFIG.protect_eyes > 0:
+                # 파싱과 무관한 기하학적 눈 보호. 파서가 눈을 '머리'로 오분류하는
+                # 프레임에서 눈이 지워지고 GAN 얼굴로 대체되는 사고를 막는다.
+                geo = self._eye_protect_geo(eyes[0], eyes[1], h, w)
+                if geo is not None:
+                    p = torch.maximum(p, geo * float(CONFIG.protect_eyes))
             protect = p.clamp(0.0, 1.0)
             if new_a is not None:
                 new_a = new_a * (1.0 - protect).unsqueeze(-1)
@@ -745,6 +915,21 @@ class GpuFaceParser:
                     # 배경으로 채워진다. (.item() 없이 GPU 에서 끝난다)
                     below = torch.cummax(new_a.squeeze(-1), dim=0).values
                     zone = zone * below
+                # 얼굴 zone 안에서는 erase 를 단단하게 만든다. 원래 앞머리 경계
+                # 픽셀은 소프트 알파가 0.3~0.7 라 절반만 지워져서 이마에 어두운
+                # 테두리가 남았다(실측: 지운 이마가 얼룩덜룩). 이 구간을 0~1 로
+                # 다시 펴고 1px 팽창해 확실히 지운다. zone 밖(배경/옷 위)은
+                # 플레이트 관측이 필요한 곳이라 그대로 둔다.
+                lo, hi = CONFIG.erase_hard_lo, CONFIG.erase_hard_hi
+                if hi > lo:
+                    hard = ((hair_a - lo) / (hi - lo)).clamp(0.0, 1.0)
+                    hard = F.max_pool2d(hard.unsqueeze(0).unsqueeze(0), 3, stride=1,
+                                        padding=1).squeeze(0).squeeze(0)
+                    if new_a is not None:
+                        hard = hard * (1.0 - new_a.squeeze(-1))
+                    if protect is not None:
+                        hard = hard * (1.0 - protect)
+                    erase = erase * (1.0 - zone) + hard * zone
                 tone = self._skin_tone(frame_f, cls).view(1, 1, 3)
                 # 얼굴 패치가 있으면 그걸 먼저 쓴다. 평균 살색은 패치가 없거나
                 # 패치가 안 닿는 자리에만 남는 폴백이다.
@@ -756,7 +941,34 @@ class GpuFaceParser:
                 face_fill = tone
                 if face_rgb is not None:
                     fa = face_a                                    # (h,w,1) 0~1
+                    if CONFIG.face_lf_match > 0:
+                        # 패치의 저주파(색/큰 음영)를 **실제 피부**의 것으로 바꾼다.
+                        # GAN 이마는 색이 조금 다르고(뿌연 장면이면 더 어둡다)
+                        # 앞머리 자리에 얼룩이 남기도 하는데 둘 다 저주파다.
+                        # 눈썹/잔 음영 같은 세부는 패치 것을 남긴다.
+                        # 실제 피부 색 필드는 '지워지지 않는 피부' 픽셀만 넣은
+                        # 정규화 컨볼루션으로 이마까지 외삽한다.
+                        d = float(np.hypot(eyes[1][0] - eyes[0][0], eyes[1][1] - eyes[0][1]))
+                        k = int(round(d * CONFIG.face_lf_k)) | 1
+                        skin_m = (((cls == CLS_SKIN) | (cls == CLS_NOSE)).float()
+                                  * (1.0 - hair_a)).unsqueeze(0).unsqueeze(0)
+                        fr = frame_f.permute(2, 0, 1).unsqueeze(0)
+                        num = self._box(fr * skin_m, k)
+                        den = self._box(skin_m, k)
+                        skin_lf = num / den.clamp(min=1e-3)
+                        # 근거(창 안의 실제 피부 비율)가 적을수록 보정을 서서히
+                        # 줄인다. 하드 임계면 그 경계에서 수십 레벨이 한 픽셀에
+                        # 끊겨 이마에 가로 띠가 생긴다.
+                        have = ((den - 0.02) / 0.10).clamp(0.0, 1.0)
+                        pf = face_rgb.permute(2, 0, 1).unsqueeze(0)
+                        wa = face_a.permute(2, 0, 1).unsqueeze(0)
+                        face_lf = self._box(pf * wa, k) / self._box(wa, k).clamp(min=1e-3)
+                        corr = (skin_lf - face_lf) * have * CONFIG.face_lf_match
+                        face_rgb = (pf + corr).squeeze(0).permute(1, 2, 0).clamp(0, 255)
                     face_fill = face_rgb * fa + tone * (1.0 - fa)
+                if sigma_f is not None and CONFIG.grain_match > 0 and face_rgb is not None:
+                    face_fill = face_fill + torch.randn(h, w, 1, device=self.device) * (
+                        sigma_f * CONFIG.grain_match)
                 fill = fill * (1.0 - zone).unsqueeze(-1) + face_fill * zone.unsqueeze(-1)
                 # 얼굴 영역은 플레이트 관측 여부와 무관하게 채울 수 있다
                 src_ok = torch.clamp(src_ok + zone, 0.0, 1.0)
@@ -789,11 +1001,24 @@ class GpuFaceParser:
                 # 알파를 빼면 헤어 바깥에 딱 붙은 띠가 나오는데, 그 자리를 살짝
                 # 어둡게 해서 접지감을 만든다.
                 a2 = new_a.permute(2, 0, 1).unsqueeze(0)          # (1,1,h,w)
+                # 띠 폭은 얼굴 크기에 비례해야 한다. 픽셀 고정이면 720p 에서는
+                # 480p 의 절반 폭이 되어 그림자가 사라진다. shadow_k 는 눈 간격
+                # 50px 기준값이다.
                 sk = CONFIG.shadow_k
+                if eyes is not None:
+                    d = float(np.hypot(eyes[1][0] - eyes[0][0], eyes[1][1] - eyes[0][1]))
+                    sk = max(3, int(round(CONFIG.shadow_k * d / 50.0))) | 1
                 blurred = F.avg_pool2d(a2, sk, stride=1, padding=sk // 2)
                 band = (blurred - a2).clamp(min=0.0).squeeze(0).permute(1, 2, 0)
                 out = out * (1.0 - shadow * band)
 
+            if sigma_f is not None and CONFIG.grain_match > 0:
+                # 그레인 정합. 프레임의 센서/압축 노이즈 σ 를 피부에서 재서 같은
+                # 세기의 노이즈를 헤어에 얹는다. 합성물이 프레임보다 '깨끗' 하면
+                # 그 자체가 오려붙인 티다. 매 프레임 새 노이즈 - 실제 노이즈도
+                # 그렇다. 휘도 노이즈(3채널 동일)로 충분하다.
+                g = torch.randn(h, w, 1, device=self.device) * (sigma_f * CONFIG.grain_match)
+                new_rgb = new_rgb + g
             out = out * (1.0 - new_a) + new_rgb * new_a
 
             # 증류 블렌더: 워핑 합성본을 GAN 품질에 가깝게 정제한다.

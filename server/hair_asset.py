@@ -132,10 +132,13 @@ def build_procedural() -> HairAsset:
 
 def _read_asset(path):
     """<path>.png + 같은 이름의 .json -> HairAsset. 읽을 수 없으면 None."""
+    if _is_face_png(os.path.basename(path)):
+        return None                      # 얼굴 패치는 본체 에셋이 끌고 온다
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None or img.ndim != 3 or img.shape[2] != 4:
         return None
     meta_path = os.path.splitext(path)[0] + ".json"
+    face = None
     if os.path.isfile(meta_path):
         with open(meta_path, encoding="utf-8") as f:
             meta = json.load(f)
@@ -143,6 +146,15 @@ def _read_asset(path):
         ref_skin = meta.get("refSkin")
         yaw, bank = meta.get("yaw"), meta.get("bank")
         scale_adjust = float(meta.get("scaleAdjust", 1.0))
+        fm = meta.get("face")
+        if fm:
+            fimg = cv2.imread(os.path.join(os.path.dirname(path), fm["file"]),
+                              cv2.IMREAD_UNCHANGED)
+            if fimg is not None and fimg.ndim == 3 and fimg.shape[2] == 4:
+                # 이름은 생성 시점(asset_extract)과 같은 규칙 <name>#face 로.
+                # GPU 캐시 키가 이 이름이라 축출 훅이 둘을 같이 지울 수 있다.
+                face = HairAsset(os.path.splitext(os.path.basename(path))[0] + "#face",
+                                 fimg, fm["eyeL"], fm["eyeR"], ref_skin)
     else:
         # 앵커 정보가 없으면 이미지 비율로 추정 (사용자가 슬라이더로 보정)
         h, w = img.shape[:2]
@@ -151,7 +163,9 @@ def _read_asset(path):
         yaw = bank = None
         scale_adjust = 1.0
     name = os.path.splitext(os.path.basename(path))[0]
-    return HairAsset(name, img, eye_l, eye_r, ref_skin, yaw, bank, scale_adjust)
+    asset = HairAsset(name, img, eye_l, eye_r, ref_skin, yaw, bank, scale_adjust)
+    asset.face = face
+    return asset
 
 
 def load_assets() -> dict:
@@ -608,9 +622,30 @@ def save_asset(asset, directory) -> str:
         "bank": asset.bank,
         "scaleAdjust": float(asset.scale_adjust),
     }
+    # 얼굴 패치는 별도 PNG 로 옆에 둔다. 머리 PNG 에 채널을 더 붙이면 옛
+    # 로더가 깨지고, 파일명을 <name>.face.png 로 하면 load_asset_dir 의
+    # "*.png 전부" 스캔에 걸려 패치가 독립 에셋으로 등록되므로 로더에서
+    # 명시적으로 건너뛴다(_is_face_png).
+    face = getattr(asset, "face", None)
+    if face is not None and face.rgba is not None:
+        fpng = os.path.join(directory, name + FACE_SUFFIX)
+        if cv2.imwrite(fpng, face.rgba):
+            meta["face"] = {
+                "file": os.path.basename(fpng),
+                "eyeL": [float(face.eye_l[0]), float(face.eye_l[1])],
+                "eyeR": [float(face.eye_r[0]), float(face.eye_r[1])],
+            }
     with open(os.path.splitext(png)[0] + ".json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False)
     return png
+
+
+#: 얼굴 패치 PNG 의 접미사. <name>.face.png
+FACE_SUFFIX = ".face.png"
+
+
+def _is_face_png(fn: str) -> bool:
+    return fn.lower().endswith(FACE_SUFFIX)
 
 
 def load_asset_dir(directory) -> dict:
@@ -656,16 +691,19 @@ def prune_dir(directory, max_mb) -> int:
             except OSError:
                 continue
             total += st.st_size
-            if fn.lower().endswith(".png"):
-                meta = os.path.splitext(path)[0] + ".json"
-                entries.append((st.st_mtime, path, meta))
+            if fn.lower().endswith(".png") and not _is_face_png(fn):
+                # 얼굴 패치(<stem>.face.png)는 본체와 한 묶음이다. 따로 항목을
+                # 만들면 본체가 먼저 지워지고 패치가 고아로 남아 쿼터를 채운다
+                # (mtime 이 본체보다 늦어서 항상 뒤에 온다).
+                stem = os.path.splitext(path)[0]
+                entries.append((st.st_mtime, path, stem + ".json", stem + FACE_SUFFIX))
 
     entries.sort()
     removed = 0
-    for _mt, png, meta in entries:
+    for _mt, *paths in entries:
         if total <= limit:
             break
-        for path in (png, meta):
+        for path in paths:
             try:
                 total -= os.path.getsize(path)
                 os.remove(path)
