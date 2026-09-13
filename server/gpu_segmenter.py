@@ -572,6 +572,44 @@ class GpuFaceParser:
         ok = (n > 200).float()
         return tone * ok + frame_f.mean(dim=(0, 1)) * (1.0 - ok)
 
+    def _skin_plane(self, frame_f, cls, h, w):
+        """보이는 피부의 **휘도 평면** L(x,y)=a+b·x+c·y 를 피팅해 (h,w,3) 톤
+        필드로 돌려준다. 색도(chroma)는 평균 살색으로 고정하고 휘도 기울기만
+        살린다.
+
+        왜: 이마를 평균 살색 **한 색**으로 덮으면 스티커처럼 보인다. 실제 이마는
+        중앙이 밝고 관자놀이·헤어라인으로 어두워지는 그라디언트가 있는데 상수는
+        그걸 죽인다. 경계를 아무리 부드럽게 해도 안 없어지는 아티팩트다.
+
+        전부 reduction + 3x3 해라 .item() 없이 GPU 에서 끝난다(_skin_tone 의
+        무동기화 제약 유지). 기울기 (b,c) 는 사실상 조명 방향 단서라 나중에
+        헤어 셰이딩에 재활용할 수 있다.
+        """
+        m = (cls == CLS_SKIN).float()
+        n = m.sum()
+        mean_color = self._skin_tone(frame_f, cls)                  # (3,)
+        ys, xs = self._ensure_grid(h, w)
+        # 조건수를 위해 좌표를 [-1,1] 로 정규화한다(x² 이 수십만이면 행렬이 상함).
+        xn = (xs - w * 0.5) / (w * 0.5)
+        yn = (ys - h * 0.5) / (h * 0.5)
+        lum = frame_f @ self._lum_w                                 # (h,w)
+        Sx = (m * xn).sum(); Sy = (m * yn).sum()
+        Sxx = (m * xn * xn).sum(); Sxy = (m * xn * yn).sum(); Syy = (m * yn * yn).sum()
+        SL = (m * lum).sum(); SxL = (m * xn * lum).sum(); SyL = (m * yn * lum).sum()
+        A = torch.stack([torch.stack([n, Sx, Sy]),
+                         torch.stack([Sx, Sxx, Sxy]),
+                         torch.stack([Sy, Sxy, Syy])])
+        A = A + torch.eye(3, device=self.device) * 1e-3            # 정칙화
+        coef = torch.linalg.solve(A, torch.stack([SL, SxL, SyL]))  # [a,b,c]
+        Lfield = coef[0] + coef[1] * xn + coef[2] * yn             # (h,w)
+        meanL = SL / n.clamp(min=1.0)
+        # 이마는 피팅 영역(볼·코) 위쪽이라 외삽이다. 평면을 멀리 밀면 폭주하니
+        # 휘도 비율을 상한으로 자른다.
+        ratio = (Lfield / meanL.clamp(min=1.0)).clamp(0.65, 1.35)
+        ok = (n > 200).float()                                     # 피부 적으면 상수로
+        ratio = ratio * ok + (1.0 - ok)
+        return mean_color.view(1, 1, 3) * ratio.unsqueeze(-1)      # (h,w,3)
+
     def _centroids(self, cls, h, w):
         """눈/코/눈썹의 무게중심을 한 번의 전송으로 가져온다.
 
@@ -959,7 +997,10 @@ class GpuFaceParser:
                     if protect is not None:
                         hard = hard * (1.0 - protect)
                     erase = erase * (1.0 - zone) + hard * zone
-                tone = self._skin_tone(frame_f, cls).view(1, 1, 3)
+                # 상수 살색 대신 휘도 평면 필드(스티커 방지). 패치가 없거나
+                # 패치 알파가 낮은 자리의 폴백이 이걸로 그라디언트를 받는다.
+                tone = (self._skin_plane(frame_f, cls, h, w) if CONFIG.skin_plane
+                        else self._skin_tone(frame_f, cls).view(1, 1, 3))
                 # 얼굴 패치가 있으면 그걸 먼저 쓴다. 평균 살색은 패치가 없거나
                 # 패치가 안 닿는 자리에만 남는 폴백이다.
                 #
@@ -995,7 +1036,9 @@ class GpuFaceParser:
                         corr = (skin_lf - face_lf) * have * CONFIG.face_lf_match
                         face_rgb = (pf + corr).squeeze(0).permute(1, 2, 0).clamp(0, 255)
                     face_fill = face_rgb * fa + tone * (1.0 - fa)
-                if sigma_f is not None and CONFIG.grain_match > 0 and face_rgb is not None:
+                if sigma_f is not None and CONFIG.grain_match > 0:
+                    # 그레인은 패치 유무와 무관하게 얹는다. 채운 자리가 노이즈 0
+                    # 이면 실제 카메라 노이즈와 대비돼 튀는 건 평균색 폴백도 같다.
                     face_fill = face_fill + torch.randn(h, w, 1, device=self.device) * (
                         sigma_f * CONFIG.grain_match)
                 fill = fill * (1.0 - zone).unsqueeze(-1) + face_fill * zone.unsqueeze(-1)
