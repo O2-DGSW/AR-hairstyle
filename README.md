@@ -87,3 +87,14 @@ HEDDY_MAX_SESSIONS=3 HEDDY_VIDEO_MAX_BITRATE=4000000 python server.py
 ```bash
 cd server && python -m unittest discover -s tests
 ```
+
+## 합성 품질 검증 (서버 없이)
+
+```bash
+cd server
+python train/make_asset_bank.py train/frames/<세션> --reference korean-layered --out /tmp/bank
+python train/render_offline.py train/frames/<세션> --bank /tmp/bank --out /tmp/render --render 40,80,120
+```
+
+녹화된 원본 프레임과 구운 뱅크로 실시간 합성 경로를 결정적으로 재현한다.
+무엇을 왜 고쳤는지는 `docs/quality-pipeline.md`.
