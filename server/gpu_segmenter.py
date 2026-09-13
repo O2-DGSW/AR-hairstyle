@@ -326,16 +326,17 @@ class GpuFaceParser:
         t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
         a = t[:, 3:4] / 255.0
         pm = torch.cat([t[:, :3] * a, t[:, 3:4]], dim=1)
-        # 다운샘플은 avg_pool2d(2) = 정확한 2x 박스 평균이다. 이게 곧 올바른
-        # 2x 안티에일리어스라 interpolate(antialias) 와 품질이 같으면서 훨씬
-        # 싸다(실측: 에셋당 피라미드 빌드 12ms -> 2ms). 홀수 변은 마지막 행/열을
-        # 버리는데 밉맵이라 무해하다.
+        # 다운샘플은 bicubic + antialias. box 평균(avg_pool)보다 통과대역이
+        # 살아 있어 머리카락이 덜 뭉갠다(실측 헤어 HF box 1.29 vs bicubic 1.31,
+        # 예전 에일리어스 1.41). 피라미드는 등록 시점(warm_asset)에 미리 구우므로
+        # 실시간 경로 밖이라 이 비용(에셋당 ~12ms)은 체감되지 않는다. bicubic 은
+        # 오버슈트로 음수가 나올 수 있어 클램프한다(프리멀티라 음수는 무의미).
         levels = [pm]
         while (len(levels) < self._PYRAMID_LEVELS
                and min(levels[-1].shape[-2:]) >= 32):
-            prev = levels[-1]
-            h2, w2 = (prev.shape[-2] // 2) * 2, (prev.shape[-1] // 2) * 2
-            levels.append(F.avg_pool2d(prev[..., :h2, :w2], 2))
+            nxt = F.interpolate(levels[-1], scale_factor=0.5, mode="bicubic",
+                                align_corners=False, antialias=True)
+            levels.append(nxt.clamp(min=0.0))
 
         # 어두운 분위수. 불투명 픽셀만, CPU numpy 로 한 번.
         m = arr[..., 3] > 128
@@ -1040,11 +1041,26 @@ class GpuFaceParser:
                 band = (blurred - a2).clamp(min=0.0).squeeze(0).permute(1, 2, 0)
                 out = out * (1.0 - shadow * band)
 
+            if CONFIG.hair_sharpen > 0:
+                # 언샤프 마스크. 두 곳에서 디테일이 깎인다: (1) 웹캠 입력이 눈
+                # 간격 ~50px 라 GAN 입력이 4배 업스케일된다 (2) 에셋을 프레임에
+                # 얹을 때 안티에일리어스 축소가 통과대역을 조금 누른다. 잃은
+                # 고주파를 되살린다. 헤어 rgb 에만(얼굴은 실제 픽셀이라 불필요),
+                # 축소 배율에 맞춘 커널로. 과하면 예의 'AI 텍스처'가 도로 생기니
+                # 기본은 온건하게 두고 HEDDY_HAIR_SHARPEN 으로 조절한다.
+                hr = new_rgb.permute(2, 0, 1).unsqueeze(0)
+                ksz = 3 if eyes is None else max(3, int(round(
+                    0.06 * float(np.hypot(eyes[1][0] - eyes[0][0],
+                                          eyes[1][1] - eyes[0][1]))))) | 1
+                lo = F.avg_pool2d(hr, ksz, stride=1, padding=ksz // 2)
+                hr = (hr + CONFIG.hair_sharpen * (hr - lo)).clamp(0, 255)
+                new_rgb = hr.squeeze(0).permute(1, 2, 0)
             if sigma_f is not None and CONFIG.grain_match > 0:
                 # 그레인 정합. 프레임의 센서/압축 노이즈 σ 를 피부에서 재서 같은
                 # 세기의 노이즈를 헤어에 얹는다. 합성물이 프레임보다 '깨끗' 하면
                 # 그 자체가 오려붙인 티다. 매 프레임 새 노이즈 - 실제 노이즈도
-                # 그렇다. 휘도 노이즈(3채널 동일)로 충분하다.
+                # 그렇다. 휘도 노이즈(3채널 동일)로 충분하다. 샤픈 뒤에 얹어야
+                # 노이즈까지 증폭되지 않는다.
                 g = torch.randn(h, w, 1, device=self.device) * (sigma_f * CONFIG.grain_match)
                 new_rgb = new_rgb + g
             out = out * (1.0 - new_a) + new_rgb * new_a
