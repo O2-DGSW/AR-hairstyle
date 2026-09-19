@@ -52,6 +52,17 @@ av==12.3.0
 mediapipe==0.10.14
 opencv-python==4.10.0.84
 
+# ---------- 3D 헤어 그룸 렌더 (groom_renderer.py) ----------
+# moderngl 은 창 없는 standalone GL 컨텍스트로 GPU 래스터라이즈 (nvdiffrast 불필요).
+# 프리빌트 휠은 py3.12 까지 - python 3.14 에서는 소스 빌드(MSVC)로 떨어진다.
+# trimesh 는 GLB(헤어카드 + head_occluder) 로딩 전용.
+moderngl==5.12.0
+trimesh==4.5.3
+# 맨이마 인페인팅 (forehead.py). LaMa TorchScript 래퍼 - 순수 파이썬, torch 는 위의 것을 쓴다.
+# 설치는 --no-deps 로 (안 그러면 torch 를 다른 버전으로 갈아끼운다). 가중치 big-lama.pt(196MB)는
+# 첫 사용 때 ~/.cache/torch/hub/checkpoints 로 자동 다운로드.
+simple-lama-inpainting==0.1.2
+
 # numpy 는 2.x 로 올리지 못한다.
 #   mediapipe 0.10.14 의 확장 모듈(_framework_bindings.pyd)이 numpy 1.x ABI 로
 #   빌드돼 있어서, 2.x 를 깔면 import 시점에

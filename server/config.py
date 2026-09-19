@@ -39,6 +39,13 @@ class Config:
     # ---------- 전송 / 세션 ----------
     host: str = "0.0.0.0"
     port: int = 8080
+    #: HTTPS. 브라우저는 localhost 가 아닌 평문 HTTP 에서 getUserMedia(웹캠) 를 아예
+    #: 안 준다 - 공인 IP 로 접속하면 [시작]이 "getUserMedia undefined" 로 죽는다.
+    #: 인증서/키 파일이 둘 다 있으면 HTTP(port) 옆에 HTTPS(tls_port) 도 같이 연다.
+    #: 자체서명이면 브라우저 경고를 한 번 넘기면 된다. 만들기: server/tls/make_cert.sh
+    tls_cert: str = os.path.join(ROOT, "tls", "server.crt")
+    tls_key: str = os.path.join(ROOT, "tls", "server.key")
+    tls_port: int = 8443
     #: 동시에 받을 수 있는 피어 수. GPU 워커가 1개라 초과분은 거절하는 편이
     #: 전부 같이 느려지는 것보다 낫다.
     max_sessions: int = 2
@@ -187,6 +194,26 @@ class Config:
     #: fit {asset:...} 도 자연히 안 먹는다.
     #: 진단용으로 되살리려면 HEDDY_SERVE_STATIC_ASSETS=1.
     serve_static_assets: bool = False
+
+    # ---------- 3D 그룸 (groom_renderer.py) ----------
+    #: 그룸 색 맞춤 - 사용자 머리 평균색 EMA 계수(stats_every 프레임마다 한 번).
+    groom_color_alpha: float = 0.2
+    #: 이보다 머리 픽셀이 적으면(모자/삭발) 색을 맞추지 않고 GLB 색을 쓴다.
+    groom_color_min_px: int = 400
+    #: 리본 가장자리 페더 폭 (눈 간격 배수). 0 이면 MSAA 만.
+    groom_feather: float = 0.04
+    #: 휘도 대비(표준편차) 맞춤 세기. 0=평균색만, 1=완전 일치.
+    groom_contrast_match: float = 0.8
+    #: 맨이마 패치(forehead.py) 주기 갱신 간격(초). 0 이면 선택/수동 때만. 조명·표정 변화를 따라간다.
+    #: 인페인트(LaMa ~45ms)는 별도 스레드/스트림이지만 GPU 경합+GIL 로 그 순간 프레임 하나가
+    #: 40~50ms 로 튄다(실측). 2초에 한 프레임이면 체감이 안 되는 수준. 더 줄이려면 별도 프로세스.
+    forehead_refresh_s: float = 2.0
+    #: 이 각도(|yaw|, 도) 안일 때만 갱신 - 돌린 얼굴은 인페인트 문맥이 나쁘다.
+    forehead_refresh_yaw: float = 15.0
+    #: 새 패치로 바꿀 때 이전 패치와 섞는 시간(초). 툭 바뀌면 이마가 깜빡인다.
+    forehead_fade_s: float = 0.4
+    #: 사용자 머리가 안 보일 때(모자/삭발) 쓰는 기본 머리색 (BGR).
+    groom_default_bgr: tuple[float, ...] = (28.0, 32.0, 40.0)
     #: GPU 에 올려둘 에셋 텐서 상한(개). 512^2 RGBA float32 = 약 4MB/개.
     asset_cache_max: int = 48
     #: 세션 하나가 만들 수 있는 에셋 상한. 라이브 뱅크 1회가 7칸이다.
@@ -202,6 +229,10 @@ class Config:
     cal_alpha: float = 0.08
 
     # ---------- GAN (HairFastGAN) ----------
+    #: 2026-09-19 부터 헤어는 3D 그룸(groom_renderer.py) 이 기본이고 GAN 2D 경로는 쓰지 않는다.
+    #: False 면 GAN 워커를 띄우지 않고(VRAM 5.5GB 절약) 촬영/라이브 뱅크 명령은 거절한다.
+    #: 코드는 남겨 둔다 - HEDDY_GAN_ENABLED=1 로 되살릴 수 있다.
+    gan_enabled: bool = False
     #: "process" = 별도 프로세스에서 실행(권장). 실시간 경로가 GAN 로딩/추론에
     #: 절대 막히지 않고, GAN 이 죽어도 서버가 안 죽는다.
     #: "thread"  = 기존처럼 같은 프로세스의 전용 스레드.

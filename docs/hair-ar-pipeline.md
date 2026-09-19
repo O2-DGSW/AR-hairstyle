@@ -290,7 +290,47 @@ python make_asset.py photo.jpg --name bob  # 에셋 추출
 
 ---
 
-## 7. 미착수 / 다음
+## 7. 3D 그룸 경로 (2026-09-19 부터 기본)
+
+헤어는 더 이상 2D 워핑/GAN 이 아니라 **3D 헤어카드(GLB)를 얼굴 포즈로 렌더**해 얹는다.
+2D 닮음변환은 평면 밖 회전을 못 만들어 고개를 돌리면 헤어가 정면인 채 남았고, 각도별
+GAN 뱅크는 칸 전환이 끊겼다. 3D 메시는 그 프레임의 포즈 행렬로 그대로 돌아간다.
+HairFastGAN 경로는 코드만 남기고 껐다(`gan_enabled=False`, UI 는 `?debug=1`).
+
+```
+[오프라인 - 스타일당 1회, WSL2]
+ 사진 1장 → Im2Haircut (3DGS 재구성, 4070 에서 ~25분/장)
+   → 스트랜드 PLY (13k 가닥 × 200점, FLAME 프레임)
+   → _hair3d_work/strands_to_cards.py → GLB (알파 리본 헤어카드 + head_occluder) + json(user_fit)
+   → server/grooms/<이름>.glb|json   (파일명 = 스타일 이름, /grooms 가 목록)
+
+[실시간 - 프레임마다]
+ SegFormer (기존) → MediaPipe 4x4 (face_pose.py "matrix")
+   → groom_renderer.py: moderngl 로 GLB 렌더 (MediaPipe 가 PnP 에 가정한 수직 화각 63° 가상카메라,
+     두상 오클루더 깊이 전용, 2패스 알파 + MSAA) → (rgb, alpha) GPU 텐서 = _warp_asset 과 같은 계약
+   → 색: 사용자 머리 마스크의 평균색 + 휘도 표준편차에 맞춤 (흰 베이스 렌더 × 채널 배율)
+   → 이마: forehead.py — 앞머리 자리를 LaMa 로 인페인팅한 맨이마 패치(1회 + 2초 주기 갱신, 크로스페이드)
+     를 기존 얼굴 패치 경로(눈 앵커 닮음변환, face_lf_match, 그레인)로 얹음
+   → 이후 지우기/플레이트/그림자/샤픈/그레인 합성은 2D 때와 한 줄도 안 바뀜
+```
+
+비용 (640x480, 4070 SUPER): 프레임 15.7 → 19.4ms (+3.7ms). 그룸 렌더 자체는 1.5ms 지만
+GL 읽기가 앞서 큐잉된 CUDA 추론을 기다리므로 `groom_ms` 는 ~12ms 로 보인다(실제 추가는 위 값).
+LaMa 는 512 크롭 41ms/VRAM 0.6GB(별도 스레드·스트림, 갱신 순간 프레임 하나가 40~50ms).
+
+좌표계 함정 (실측으로 잡은 것):
+- MediaPipe 행렬은 이미 three.js/GL 규약(y 위, 카메라가 -z, 얼굴 z≈-50). 예전 hair3d.js 의
+  y/z 반전(FLIP)이 얼굴을 카메라 뒤로 보내 아무것도 안 보였다.
+- 파이썬 API 의 행렬은 row-major(평행이동이 m[3],m[7],m[11]); JS 는 column-major.
+- 브라우저 웹캠은 HTTPS 또는 localhost 에서만 - 공인 IP 접속은 8443(자체서명, `server/tls/make_cert.sh`).
+
+검증: `server/train/render_groom_offline.py <frames> --groom <이름> --forehead 0 --render 0,60,110`
+(서버 없이 실제 프레임으로 전/후 저장). 이마 인페인터 비교는 `train/try_forehead_inpaint.py`.
+
+남은 것: **우리 사진으로 새 스타일 만들기**(Im2Haircut 전처리가 HairStep torch1.9/cu111 에 묶여
+Ada 에서 안 돎 - 우회 필요), 리본 폭 방향(카메라 기준으로) 아티팩트, 이마 인페인트를 별도 프로세스로.
+
+## 7-구. (구) GAN 경로 메모 — 더 이상 기본이 아님
 
 ### GAN을 붙일 자리
 

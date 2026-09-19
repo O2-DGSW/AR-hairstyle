@@ -176,6 +176,7 @@ class FacePose:
 
         yaw = pitch = roll = 0.0
         tz = None
+        matrix = None
         if res.facial_transformation_matrixes:
             m = np.asarray(res.facial_transformation_matrixes[0].data,
                            dtype=np.float32).reshape(-1)
@@ -196,6 +197,9 @@ class FacePose:
             # 44.8%) 되돌릴 방법이 없으니 헤어가 그대로 반토막 났다.
             # m[11] 로 고치면 전 구간 92.8~100.4% 로 유지된다.
             tz = abs(float(m[11]))
+            # 3D 그룸 렌더용 원본 4x4 (row-major, 정규 얼굴 cm -> 카메라 공간; 카메라는 -z 를
+            # 보고 y 위, 얼굴은 z<0). groom_renderer.py 가 이걸 모델 행렬로 그대로 쓴다.
+            matrix = m.reshape(4, 4).copy()
 
         # --- 거리 기반 스케일 정규화 ---
         d_corrected = d_measured
@@ -214,6 +218,7 @@ class FacePose:
             "d_corrected": d_corrected,
             "yaw": yaw, "pitch": pitch, "roll": roll,
             "tz": tz,
+            "matrix": matrix,
             "calibrated": self._k is not None,
         }
 

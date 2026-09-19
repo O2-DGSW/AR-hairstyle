@@ -565,6 +565,14 @@ class AssetRegistry:
             name, _ = self._session.popitem(last=False)
             self._evict(name)
 
+    def remove(self, name: str) -> bool:
+        """세션 에셋 하나를 지운다(GPU 캐시 축출 포함). 없으면 False."""
+        if name not in self._session:
+            return False
+        del self._session[name]
+        self._evict(name)
+        return True
+
     def close(self) -> None:
         if self._closed:
             return

@@ -51,13 +51,20 @@
 <h1>3D 헤어 — GLB + 오클루더 + 스프링본 + 라이팅 매칭</h1>
 <div class="sub">
   머리 3D 포즈로 메시를 직접 렌더합니다. 평면 밖 회전이 원리적으로 해결되므로
-  각도별 에셋 뱅크가 필요 없습니다. 2D 워핑 비교군: <a href="/warp.html" style="color:#ff2fc8">/warp.html</a>
+  각도별 에셋 뱅크가 필요 없습니다. 2D 워핑 비교군: <a href="/warp.html" style="color:#ff2fc8">/warp.html</a><br>
+  <b style="color:#f5a">이 페이지는 브라우저 단독 정합 미리보기입니다</b> — 기존 머리 지우기·맨이마 생성·색 맞춤은
+  서버 합성 경로라 <a href="/" style="color:#ff2fc8">메인 페이지</a>에서 "3D 스타일"을 고르세요.
 </div>
 
 <div class="row">
   <button id="start">시작</button>
   <button id="stop" disabled>정지</button>
-  <label style="font-size:12.5px;color:#bbb">GLB 헤어:
+  <label style="font-size:12.5px;color:#bbb">스타일:
+    <select id="groom" style="font-size:12.5px;padding:4px 6px;background:#222;color:#eee;border:1px solid #444;border-radius:4px">
+      <option value="">(절차적 헤어)</option>
+    </select>
+  </label>
+  <label style="font-size:12.5px;color:#bbb">GLB 파일:
     <input type="file" id="glb" accept=".glb,.gltf" style="font-size:11px;color:#888">
   </label>
 </div>
@@ -86,6 +93,7 @@
         <dt>랜드마크</dt><dd id="s-detect">-</dd>
         <dt>yaw / pitch / roll</dt><dd id="s-ypr">-</dd>
         <dt>거리 (tz)</dt><dd id="s-tz">-</dd>
+        <dt>원시 위치 x,y,z</dt><dd id="s-raw">-</dd>
         <dt>자동 스케일</dt><dd id="s-scale">-</dd>
       </dl>
     </div>
@@ -100,6 +108,7 @@
         <label>앞뒤기울기 <input type="range" id="c-pitch" min="-90" max="90" value="0"><span class="val" id="v-c-pitch">0</span></label>
         <label><input type="checkbox" id="c-occ" checked> 오클루더 (머리 뒤 가리기)</label>
         <label><input type="checkbox" id="c-occ-show"> 오클루더 보이기 (디버그)</label>
+        <label><input type="checkbox" id="c-fixed"> 포즈 고정 — 웹캠/추적 없이 정면 45cm 에 렌더 (디버그)</label>
       </div>
     </div>
 

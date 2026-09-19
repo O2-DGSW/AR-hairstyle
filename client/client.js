@@ -37,6 +37,9 @@ modeSel.addEventListener("change", () => send({ type: "mode", mode: modeSel.valu
  * 진단용 뷰는 감춘다. 서버에는 그대로 남아 있으므로 ?debug=1 로 되살린다. */
 if (!new URLSearchParams(location.search).has("debug")) {
   modeSel.querySelectorAll("option[data-debug]").forEach((o) => o.remove());
+  // GAN 2D 경로(촬영/라이브 뱅크/뱅크·에셋/증류 블렌더)는 2026-09 부터 안 쓴다. 서버도 기본
+  // 비활성(gan_enabled=False). 코드는 남아 있으니 ?debug=1 이면 보인다.
+  document.querySelectorAll("[data-gan]").forEach((e) => { e.style.display = "none"; });
 }
 
 function sendFit() {
@@ -65,6 +68,32 @@ assetSel.addEventListener("change", () => {
   sendFit();
 });
 bankSel.addEventListener("change", () => send({ type: "fit", bank: bankSel.value }));
+
+/* ---------- 3D 그룸 (server/grooms/*.glb) ---------- */
+const groomSel = el("groom"), groomColor = el("groom-color"), groomAuto = el("groom-color-auto");
+fetch("/grooms").then((r) => r.json()).then((j) => {
+  for (const g of j.grooms || []) {
+    const o = document.createElement("option");
+    o.value = g.name;
+    o.textContent = g.n_strands ? `${g.name} (${g.n_strands} 가닥)` : g.name;
+    groomSel.appendChild(o);
+  }
+}).catch((e) => console.warn("/grooms 실패", e));
+function sendGroomColor() {
+  send({ type: "fit", groom_color: groomAuto.checked ? "" : groomColor.value });
+}
+groomSel.addEventListener("change", () => {
+  // 그룸을 고르면 서버가 GLB 를 올린 뒤 tryon 으로 바꾼다(raw 였을 때). 해제하면 뱅크/에셋으로 복귀.
+  send({ type: "fit", groom: groomSel.value });
+  sendGroomColor();
+});
+groomColor.addEventListener("input", () => { groomAuto.checked = false; sendGroomColor(); });
+groomAuto.addEventListener("change", sendGroomColor);
+// 맨이마 패치(앞머리 인페인팅)는 스타일 선택 때 현재 프레임으로 1회 만든다. 정면을 보고 다시 만들 수 있다.
+el("forehead-refresh").addEventListener("click", () => {
+  el("s-forehead").textContent = "맨이마 패치: 생성 중…";
+  send({ type: "fit", forehead: "refresh" });
+});
 
 /* ---------- 사진 찍기 (GAN) ---------- */
 const shootBtn = el("shoot"), refSel = el("reference");
@@ -544,6 +573,18 @@ function onMessage(event) {
 
   if (d.type === "capture") { onCapture(d); return; }
   if (d.type === "livebank") { onLiveBank(d); return; }
+  if (d.type === "forehead") {
+    const t = el("s-forehead");
+    if (d.status === "ok") t.textContent = `맨이마 패치: 완료 (앞머리 ${d.bangs_px}px, ${d.inpaint_ms}ms)`;
+    else if (d.status === "loading") t.textContent = "맨이마 패치: " + d.message;
+    else t.textContent = "맨이마 패치 실패: " + d.message;
+    return;
+  }
+  if (d.type === "groom") {
+    if (d.status === "ok") el("s-used").textContent = "3D " + d.groom;
+    else { console.warn("groom:", d.message); el("s-used").textContent = "그룸 실패: " + d.message; }
+    return;
+  }
   if (d.type === "record") {
     recInfo.textContent = d.on ? `수집 중... ${d.count}장` : (d.count ? `${d.count}장 저장됨` : "");
     return;
@@ -598,7 +639,7 @@ function onMessage(event) {
   if (d.rec_count !== null && d.rec_count !== undefined) {
     recInfo.textContent = `수집 중... ${d.rec_count}장`;
   }
-  if (d.asset_used) el("s-used").textContent = d.asset_used;
+  if (d.asset_used) el("s-used").textContent = d.asset_used + (d.groom_ms ? ` (렌더 ${d.groom_ms}ms)` : "");
   el("s-blend").textContent = d.blended ? "적용됨"
     : (!d.blender_ready ? "모델 없음" : (fBlend.checked ? "대기(새 헤어 씌우기 모드)" : "꺼짐"));
   el("s-harm").textContent = d.harmonized ? "적용됨" : (fHarmonize.checked ? "기준색 없음" : "꺼짐");

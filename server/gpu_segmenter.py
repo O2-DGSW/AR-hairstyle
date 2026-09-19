@@ -15,6 +15,7 @@ CUDA 그래프로 실행 계획을 통째로 캡처하면 9ms대로 떨어진다
 주의: CUDA 그래프는 캡처한 스트림에 묶이므로 반드시 단일 스레드에서만
 호출해야 한다. server.py가 전용 단일 워커 executor로 호출한다.
 """
+import logging
 import os
 import time
 from collections import OrderedDict
@@ -25,6 +26,8 @@ import torch
 from transformers import SegformerForSemanticSegmentation
 
 from config import CONFIG
+
+logger = logging.getLogger("segmenter")
 
 # 아래 CLS_* 는 튜닝 값이 아니라 CelebAMask-HQ 19클래스의 **모델 규격**이다.
 # 체크포인트가 바뀌지 않는 한 바뀔 수 없으므로 설정으로 뺄 이유가 없다.
@@ -135,6 +138,9 @@ class GpuFaceParser:
         self._lum_w = torch.tensor([0.114, 0.587, 0.299], device=self.device)   # BGR 휘도
         self._blender = None    # 증류 블렌더 (load_blender 로 주입)
         self._cgrid = None      # 크롭 좌표 그리드 캐시
+        self._groom = None      # GroomRenderer (3D 헤어카드). 처음 쓸 때 gpu_executor 스레드에서 생성.
+        self._hair_color = None # 사용자 머리 평균색 (BGR 텐서, EMA). 그룸 색 맞춤용.
+        self._hair_std = None   # 사용자 머리 휘도 표준편차 (EMA). 대비 맞춤용.
 
         # 추론 시간 측정용 CUDA 이벤트. 쌍을 두 조 두고 번갈아 쓴다 - 자세한
         # 이유는 _begin_infer() 주석 참고.
@@ -701,8 +707,13 @@ class GpuFaceParser:
                 asset=None, scale_mul: float = 1.0, offset_up: float = 0.0, pose=None,
                 harmonize: bool = True, shadow: float = 0.35,
                 blend: float = 1.0, asset2=None, mix: float = 0.0,
-                smoother=None):
+                smoother=None, groom=None, groom_fit=None, groom_color=None):
         """BGR 프레임 -> (합성된 BGR 프레임, 타이밍/상태 dict).
+
+        groom: {"name","path","meta"} 3D 헤어카드 GLB. 주어지면 tryon 에서 2D 에셋
+               워핑 대신 포즈 행렬로 렌더한다(_render_groom). 뒤 합성은 동일.
+        groom_fit: (scale_mul, up_cm, fwd_cm) 세션 보정. json 의 user_fit 위에 곱/더한다.
+        groom_color: (b,g,r) 0~255 또는 None. None 이면 사용자 머리색에 맞춘다.
 
         mode:
           raw    - 원본 그대로 (기본). 플레이트는 계속 쌓는다.
@@ -850,7 +861,54 @@ class GpuFaceParser:
             # 보정할 근거 자체가 없으므로 그대로 1.0 이다.
             gain = 1.0
 
-            if mode == "tryon" and asset is not None and eyes is not None:
+            groom_ms = 0.0
+            if mode == "tryon" and groom is not None and pose is not None                     and pose.get("matrix") is not None:
+                # 3D 그룸: 그 프레임의 포즈 행렬로 직접 래스터라이즈. 평면 밖 회전이
+                # 그대로 나오므로 각도 뱅크(asset2/mix)가 필요 없다. 조명 정합(ratio/lift)
+                # 대신 아래 색 맞춤이 사용자 머리색(=그 조명 아래의 색)에 맞춘다.
+                new_rgb, new_a = self._render_groom(groom, pose["matrix"], groom_fit, h, w)
+                groom_ms = self._groom.last_ms if self._groom is not None else 0.0
+                # 이마 패치: 앞머리 있는 사람이 앞머리 없는 스타일을 입으면 지운 자리가
+                # 살색 평면으로 남아 이질적이다. 촬영(GAN, 입력에서 앞머리를 미리 걷어냄)이
+                # 재구성한 맨이마(asset.face)를 2D 경로와 똑같이 눈 앵커로 워핑해 쓴다.
+                # 헤어는 3D 지만 이마는 거의 평면이라 닮음변환으로 충분하다.
+                if asset is not None and getattr(asset, "face", None) is not None and eyes is not None:
+                    def _face_patch(a_):
+                        r_, al_ = self._warp_asset(a_.face, eye_l, eye_r,
+                                                   scale_mul * a_.scale_adjust, offset_up, h, w)
+                        if r_ is not None and harmonize and a_.ref_skin is not None:
+                            cur = self._skin_tone(frame_f, cls)
+                            ref = torch.as_tensor(a_.ref_skin, device=self.device, dtype=torch.float32)
+                            fr = (cur / ref.clamp(min=1.0)).clamp(CONFIG.harmonize_min, CONFIG.harmonize_max)
+                            r_ = (r_ * fr.view(1, 1, 3)).clamp(0, 255)
+                        return r_, al_
+                    face_rgb, face_a = _face_patch(asset)
+                    harmonized = face_rgb is not None and harmonize and asset.ref_skin is not None
+                    # 주기 갱신 직후: 이전 패치(asset2)와 크로스페이드. 같은 앵커로 워핑되므로
+                    # 겹침 없이 섞인다. 프리멀티플라이드로 섞어야 경계가 어두워지지 않는다.
+                    if (face_rgb is not None and asset2 is not None and mix > 0.001
+                            and getattr(asset2, "face", None) is not None):
+                        rgb2, a2 = _face_patch(asset2)
+                        if rgb2 is not None:
+                            pa = face_a * (1.0 - mix)
+                            pb = a2 * mix
+                            tot = pa + pb
+                            face_rgb = (face_rgb * pa + rgb2 * pb) / tot.clamp(min=1e-4)
+                            face_a = tot
+                if new_rgb is not None:
+                    new_rgb = self._match_hair_color(new_rgb, new_a, frame_f, hair_a,
+                                                     want_stats, groom_color)
+                    if CONFIG.groom_feather > 0 and eyes is not None:
+                        # 리본 가장자리 페더. MSAA 만으로는 원래 머리 경계(소프트 알파)보다
+                        # 딱딱해 오려붙인 티가 난다. 눈 간격 비례 폭으로 프리멀티플라이드 블러.
+                        d = float(np.hypot(eye_r[0] - eye_l[0], eye_r[1] - eye_l[1]))
+                        k = int(round(d * CONFIG.groom_feather)) | 1
+                        if k >= 3:
+                            pm = torch.cat([new_rgb * new_a, new_a], -1).permute(2, 0, 1).unsqueeze(0)
+                            pm = F.avg_pool2d(pm, k, stride=1, padding=k // 2)[0].permute(1, 2, 0)
+                            new_a = pm[:, :, 3:4]
+                            new_rgb = pm[:, :, :3] / new_a.clamp(min=1e-3)
+            elif mode == "tryon" and asset is not None and eyes is not None:
                 # 에셋에 구워진 크기 보정까지 함께 적용한다.
                 new_rgb, new_a = self._warp_asset(
                     asset, eye_l, eye_r,
@@ -1127,7 +1185,100 @@ class GpuFaceParser:
             "anchor": anchor_src,
             "harmonized": harmonized,
             "blended": blended,
+            "groom_ms": groom_ms if mode in ("remove", "tryon") else 0.0,
         }
+
+    # ---- 3D 그룸 ----
+    def warm_groom(self, groom: dict) -> bool:
+        """GLB 를 GPU 에 올려 둔다(트라이메시 파싱 + VBO, ~1초). 실시간 경로 밖에서 부를 것 -
+        _render_groom 이 처음 부를 때 즉석에서 하면 그 프레임이 1초 멈춘다."""
+        try:
+            self._groom_renderer().load(groom["name"], groom["path"], groom.get("meta"))
+            return True
+        except Exception:
+            logger.exception("그룸 로드 실패: %s", groom.get("path"))
+            return False
+
+    def evict_groom(self, name: str) -> None:
+        if self._groom is not None:
+            self._groom.evict(name)
+
+    def _groom_renderer(self):
+        if self._groom is None:
+            from groom_renderer import GroomRenderer
+            self._groom = GroomRenderer(self.device)
+        return self._groom
+
+    def _render_groom(self, groom: dict, matrix, fit, h: int, w: int):
+        r = self._groom_renderer()
+        g = r.load(groom["name"], groom["path"], groom.get("meta"))
+        sm, up, fwd = fit if fit is not None else (1.0, 0.0, 0.0)
+        try:
+            # 흰 베이스: 색은 _match_hair_color 가 입힌다 (GLB 의 갈색은 무시)
+            return r.render(g, matrix, w, h, g.scale_mul * float(sm),
+                            g.offset_up_cm + float(up), g.offset_fwd_cm + float(fwd),
+                            base_rgb=(1.0, 1.0, 1.0))
+        except Exception:
+            logger.exception("그룸 렌더 실패")
+            return None, None
+
+    def _match_hair_color(self, new_rgb, new_a, frame_f, hair_a, refresh: bool, color=None):
+        """렌더된 헤어(흰 베이스: 음영·텍스처만)에 색을 입힌다 - 알파가중 평균이 목표색이 되도록.
+
+        목표색은 사용자 머리(파싱 마스크)의 평균색. **그 조명 아래에서 관측된** 색이라
+        색상뿐 아니라 노출/화이트밸런스/플레어(뿌연 프레임이면 밝은 회색)까지 한 번에
+        들어 있다. 2D 경로의 피부 비율(harmonize)과 블랙레벨 lift 가 하던 일을 이 배율
+        하나가 대신한다. 텍스처의 명암 대비는 배율이라 그대로 남는다.
+
+        렌더가 흰 베이스여야 하는 이유: 진한 갈색 베이스에 배율을 곱하면 목표가 밝은
+        회색일 때 4배 넘게 필요하고, 클램프에 걸리면 갈색 색상이 남아 **주황**이 된다
+        (실측). 흰 베이스면 채널별 배율 = 목표/휘도 라 색상이 정확히 목표를 따른다.
+        color 가 주어지면(염색 미리보기) 사용자 색 대신 그 색.
+        """
+        if color is not None:
+            target = torch.as_tensor(color, device=self.device, dtype=torch.float32)
+        else:
+            def measure():
+                # (평균 BGR, 휘도 표준편차) - 마스크 안 픽셀
+                m = (hair_a > 0.5).float().unsqueeze(-1)
+                cnt = m.sum().clamp(min=1.0)
+                mean = (frame_f * m).sum((0, 1)) / cnt
+                lum = (frame_f * self._lum_w).sum(-1, keepdim=True)
+                lmean = (lum * m).sum() / cnt
+                std = (((lum - lmean) ** 2 * m).sum() / cnt).sqrt()
+                return mean, std
+
+            if self._hair_color is None:
+                # 첫 프레임: 통계 주기를 기다리면 그동안 흰 머리가 나간다. 한 번만 동기화해서 잰다.
+                if int((hair_a > 0.5).sum().item()) > CONFIG.groom_color_min_px:
+                    self._hair_color, self._hair_std = measure()
+            elif refresh and self._last_hair_px > CONFIG.groom_color_min_px:
+                # 이후는 want_stats 프레임(이미 동기화됨)에만 EMA 갱신. .item() 없음.
+                mean, std = measure()
+                a = CONFIG.groom_color_alpha
+                self._hair_color = self._hair_color * (1.0 - a) + mean * a
+                self._hair_std = self._hair_std * (1.0 - a) + std * a
+            if self._hair_color is None:
+                # 사용자 머리가 안 보인다(모자/삭발): 기본 색
+                target = torch.as_tensor(CONFIG.groom_default_bgr, device=self.device,
+                                         dtype=torch.float32)
+            else:
+                target = self._hair_color
+        # 1) 평균색 맞춤 (채널별 배율)
+        asum = new_a.sum().clamp(min=1.0)
+        rmean = (new_rgb * new_a).sum((0, 1)) / asum
+        gain = (target / rmean.clamp(min=1.0)).clamp(0.02, 8.0)
+        out = new_rgb * gain.view(1, 1, 3)
+        # 2) 휘도 대비 맞춤. 실제 머리는 어두운 뿌리 + 밝은 윤기라 표준편차가 렌더(텍스처
+        #    0.55~1.0 배 음영)보다 크다. 평균은 그대로 두고 편차만 배율로 늘리거나 줄인다.
+        if color is None and self._hair_color is not None and CONFIG.groom_contrast_match > 0:
+            lum = (out * self._lum_w).sum(-1, keepdim=True)
+            lmean = (lum * new_a).sum() / asum
+            rstd = (((lum - lmean) ** 2 * new_a).sum() / asum).sqrt()
+            k = (self._hair_std / rstd.clamp(min=1.0)).clamp(0.5, 3.0)
+            k = 1.0 + (k - 1.0) * CONFIG.groom_contrast_match
+            out = target.view(1, 1, 3) + (out - target.view(1, 1, 3)) * k
+        return out.clamp(0.0, 255.0)
 
     def close(self):
         self.graph = None
@@ -1136,6 +1287,9 @@ class GpuFaceParser:
         # 캐싱 얼로케이터는 파이썬 참조가 살아 있는 블록을 반납하지 못한다.
         self._asset_cache.clear()
         self._blender = None
+        if self._groom is not None:
+            self._groom.close()
+            self._groom = None
         self._ev_pairs = None
         self._ev_prev = None
         if torch.cuda.is_available():

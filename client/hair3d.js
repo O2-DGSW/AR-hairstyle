@@ -36,7 +36,7 @@ const startBtn = el("start"), stopBtn = el("stop"), statusEl = el("status");
 const ui = {
   size: el("c-size"), fwd: el("c-fwd"), up: el("c-up"),
   yaw: el("c-yaw"), pitch: el("c-pitch"),
-  occ: el("c-occ"), occShow: el("c-occ-show"),
+  occ: el("c-occ"), occShow: el("c-occ-show"), fixed: el("c-fixed"),
   spring: el("c-spring"), stiff: el("c-stiff"), damp: el("c-damp"), grav: el("c-grav"),
   light: el("c-light"), lint: el("c-lint"),
 };
@@ -140,50 +140,128 @@ hairPivot.add(hairObj);
 
 /* ---------------- GLB 로딩 ---------------- */
 const loader = new GLTFLoader();
-el("glb").addEventListener("change", (e) => {
-  const f = e.target.files && e.target.files[0];
-  if (!f) return;
-  const url = URL.createObjectURL(f);
-  loader.load(url, (gltf) => {
-    hairPivot.remove(hairObj);
 
+function setFit(fit) {
+  // 그룸 json 의 user_fit -> 슬라이더. 없으면 기본값으로 되돌린다(이전 스타일 보정이 남지 않게).
+  const f = fit || {};
+  ui.size.value = Math.round((f.scale_mul ?? 1) * 100);
+  ui.up.value = Math.round((f.offset_up_cm ?? 0) * 10);
+  ui.fwd.value = Math.round((f.offset_fwd_cm ?? 0) * 10);
+  ui.yaw.value = 0; ui.pitch.value = 0;
+  ["size", "up", "fwd", "yaw", "pitch"].forEach((k) => ui[k].dispatchEvent(new Event("input")));
+}
+
+let groomOccluder = null;   // GLB 안의 head_occluder 메시 (없으면 내장 타원체 사용)
+
+function useHair(obj) {
+  hairPivot.remove(hairObj);
+  hairObj = obj;
+  hairPivot.add(hairObj);
+  if (!obj.getObjectByName || !obj.getObjectByName("head_occluder")) groomOccluder = null;
+}
+
+/** url 의 GLB 를 헤어로 교체. label 은 상태 표시용, fit 은 그룸 json 의 user_fit.
+ *  onDone 은 성공/실패 뒤 한 번 호출(로컬 파일의 blob URL 해제용). */
+function loadGroom(url, label, fit, onDone) {
+  setStatus(`${label} 불러오는 중…`);
+  loader.load(url, (gltf) => {
     // 아바타 통짜 GLB(Ready Player Me 등)는 바운딩박스가 몸 전체라, 그대로 쓰면
     // 어깨 폭이 19cm 로 정규화되어 헤어가 얼굴에 파묻힌다. 이름에 hair 가 들어간
     // 노드가 있으면 그것만 떼어 쓴다. (스킨드 메시면 본 계층에서 분리되므로
     // 바인드 포즈로 고정된다 — 정적 헤어라 문제 없다)
+    // 우리 그룸 GLB 는 heddy_hair + head_occluder 두 노드가 같은 프레임에 있으므로 통째로 쓴다.
+    let occ = null;
+    gltf.scene.traverse((o) => { if (!occ && o.isMesh && o.name === "head_occluder") occ = o; });
     let picked = null;
-    gltf.scene.traverse((o) => {
-      if (!picked && o !== gltf.scene && /hair|헤어|髪/i.test(o.name)) picked = o;
-    });
-    if (picked) picked.removeFromParent();
-    hairObj = picked || gltf.scene;
+    if (!occ) {
+      gltf.scene.traverse((o) => {
+        if (!picked && o !== gltf.scene && /hair|헤어|髪/i.test(o.name)) picked = o;
+      });
+      if (picked) picked.removeFromParent();
+    }
+    const obj = picked || gltf.scene;
+    if (occ) {
+      // FLAME 두상을 깊이 전용 오클루더로: 헤어 뿌리가 이 표면 위에 정확히 놓여 있어
+      // 내장 타원체처럼 정수리를 삼키지 않는다. 내장 타원체는 이 그룸 동안 끈다.
+      occ.material = occluderMat;
+      occ.renderOrder = -1;
+      occ.userData.isGroomOccluder = true;
+    }
+    groomOccluder = occ;
 
     // 에셋 크기가 제각각이므로 두상 기준으로 정규화한다.
     // (에셋마다 단위가 미터/센티미터/임의로 달라서 이 단계가 없으면 안 보이거나
     //  화면을 뒤덮는다)
-    const box = new THREE.Box3().setFromObject(hairObj);
-    const size = new THREE.Vector3(); box.getSize(size);
-    const center = new THREE.Vector3(); box.getCenter(center);
-    const target = 19.0;                     // 정규 얼굴 모델 기준 머리 폭(cm 근사)
-    const k = target / Math.max(size.x, 1e-6);
-    hairObj.scale.setScalar(k);
-    hairObj.position.sub(center.multiplyScalar(k));
-    hairObj.position.y += 1.5;
+    // 단, 우리 변환기(strands_to_cards.py)가 만든 GLB 는 이미 MediaPipe 정규 프레임
+    // (cm, 두상 중심 원점) 이라 바운딩박스 정규화가 오히려 망친다 — 그대로 쓴다.
+    const ud = gltf.scene.userData || {};
+    const canonical = !!(ud.heddy_canonical || (ud.extras && ud.extras.heddy_canonical));
+    let k = 1;
+    if (!canonical) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3(); box.getSize(size);
+      const center = new THREE.Vector3(); box.getCenter(center);
+      const target = 19.0;                     // 정규 얼굴 모델 기준 머리 폭(cm 근사)
+      k = target / Math.max(size.x, 1e-6);
+      obj.scale.setScalar(k);
+      obj.position.sub(center.multiplyScalar(k));
+      obj.position.y += 1.5;
+    }
 
     // 본이 있으면 스프링본 대상으로 잡는다
     const bones = [];
-    hairObj.traverse((o) => { if (o.isBone) bones.push(o); });
-    hairObj.userData.bones = bones;
+    obj.traverse((o) => { if (o.isBone) bones.push(o); });
+    obj.userData.bones = bones;
 
-    hairPivot.add(hairObj);
-    setStatus(`GLB 로드됨: ${f.name} — 노드 "${hairObj.name || "(루트 전체)"}", ` +
-              `본 ${bones.length}개, 자동 스케일 ×${k.toFixed(3)}. ` +
+    useHair(obj);
+    setFit(fit);
+    setStatus(`${label} 로드됨 — 노드 "${obj.name || "(루트 전체)"}", 본 ${bones.length}개, ` +
+              (canonical ? "정규 프레임(자동 스케일 없음). " : `자동 스케일 ×${k.toFixed(3)}. `) +
               `방향이 틀어졌으면 [좌우돌림]/[앞뒤기울기] 로 맞추세요.`);
-    URL.revokeObjectURL(url);
+    if (onDone) onDone();
   }, undefined, (err) => {
-    setStatus("GLB 로드 실패: " + err.message);
-    URL.revokeObjectURL(url);
+    setStatus(`${label} 로드 실패: ` + err.message);
+    if (onDone) onDone();
   });
+}
+
+// 로컬 파일
+el("glb").addEventListener("change", (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  el("groom").value = "";
+  const url = URL.createObjectURL(f);
+  loadGroom(url, f.name, null, () => URL.revokeObjectURL(url));
+});
+
+// 서버 그룸 드롭다운 (server/grooms/*.glb — /grooms 가 목록을 준다)
+const groomSel = el("groom");
+let groomIndex = {};
+const groomsReady = fetch("/grooms").then((r) => r.json()).then((j) => {
+  for (const g of j.grooms || []) {
+    groomIndex[g.name] = g;
+    const o = document.createElement("option");
+    o.value = g.name;
+    o.textContent = g.n_strands ? `${g.name} (${g.n_strands} 가닥)` : g.name;
+    groomSel.appendChild(o);
+  }
+}).catch((e) => console.warn("[3d] /grooms 실패", e));
+function selectGroom(name) {
+  el("glb").value = "";
+  if (!name) { useHair(buildProceduralHair()); setFit(null); setStatus("절차적 헤어로 전환"); return; }
+  const g = groomIndex[name];
+  if (!g) { setStatus(`스타일 없음: ${name}`); return; }
+  loadGroom(g.url, name, g.user_fit);
+}
+groomSel.addEventListener("change", () => selectGroom(groomSel.value));
+
+// 딥링크: ?groom=<이름>&autostart=1  (헤드리스 재현/공유용)
+const qs = new URLSearchParams(location.search);
+groomsReady.then(() => {
+  const want = qs.get("groom");
+  if (want) { groomSel.value = want; selectGroom(want); }
+  if (qs.get("fixed") === "1") ui.fixed.checked = true;
+  if (qs.get("autostart") === "1") start();
 });
 
 /* ---------------- 스프링본 ----------------
@@ -276,18 +354,24 @@ function matchLighting() {
 
 /* ---------------- 메인 루프 ---------------- */
 const fpsBuf = [];
-let lastT = 0, lastVideoTime = -1;
+let lastT = 0, lastVideoTime = -1, lastDetectTs = -1;
 const mpMatrix = new THREE.Matrix4();
 
-// MediaPipe 는 y 아래쪽/z 앞쪽 규약이 three.js 와 달라 축을 뒤집어 맞춘다.
-const FLIP = new THREE.Matrix4().makeScale(1, -1, -1);
+// MediaPipe(tasks-vision 0.10.14) 의 facialTransformationMatrix 는 이미 three.js 와 같은
+// 규약이다: x 오른쪽, y 위, 카메라가 -z 를 보고 얼굴은 z≈-50 에 온다(실측 (4.8, -3.8, -49.4),
+// 정면 회전 = 단위행렬). 예전에 y/z 를 뒤집던 FLIP 은 얼굴을 카메라 **뒤**(z=+50)로 보내고
+// 거꾸로 세워서 아무것도 안 보이게 했다. 그래서 항등행렬로 둔다 — 규약이 다른 버전을 만나면
+// 여기만 바꾸면 된다.
+const FLIP = new THREE.Matrix4();
 
 function loop(now) {
   if (!running) return;
   rafId = requestAnimationFrame(loop);
-  if (video.readyState < 2) return;
-
-  if (video.currentTime === lastVideoTime) return;   // 같은 프레임 재처리 방지
+  const fixed = ui.fixed.checked;
+  if (!fixed) {
+    if (video.readyState < 2) return;
+    if (video.currentTime === lastVideoTime) return;   // 같은 프레임 재처리 방지
+  }
   const dt = Math.min(0.05, lastT ? (now - lastT) / 1000 : 0.016);
   if (lastT) {
     fpsBuf.push(now - lastT);
@@ -298,14 +382,24 @@ function loop(now) {
   lastT = now;
   lastVideoTime = video.currentTime;
 
-  const t0 = performance.now();
-  const res = landmarker.detectForVideo(video, now);
-  el("s-detect").textContent = (performance.now() - t0).toFixed(1) + " ms";
-
-  const mats = res.facialTransformationMatrixes;
+  let mats = null;
+  if (fixed) {
+    // 추적 없이 정면 45cm (MediaPipe 와 같은 규약: 회전 없음, z=-45)
+    mats = [{ data: new THREE.Matrix4().makeTranslation(0, 0, -45).toArray() }];
+    el("s-detect").textContent = "고정";
+  } else if (landmarker) {
+    const t0 = performance.now();
+    const ts = Math.max(Math.floor(now), lastDetectTs + 1);   // 단조증가 보장
+    lastDetectTs = ts;
+    const res = landmarker.detectForVideo(video, ts);
+    el("s-detect").textContent = (performance.now() - t0).toFixed(1) + " ms";
+    mats = res.facialTransformationMatrixes;
+  }
   if (mats && mats.length) {
     // column-major 16개 -> three.js Matrix4
     mpMatrix.fromArray(mats[0].data);
+    const raw = mpMatrix.elements;
+    el("s-raw").textContent = `${raw[12].toFixed(1)}, ${raw[13].toFixed(1)}, ${raw[14].toFixed(1)}`;
     mpMatrix.premultiply(FLIP);
     headRoot.matrix.copy(mpMatrix);
     headRoot.matrixWorldNeedsUpdate = true;
@@ -333,10 +427,17 @@ function loop(now) {
     el("s-ypr").textContent = "-";
   }
 
-  occluder.visible = ui.occ.checked || ui.occShow.checked;
-  occluder.material = ui.occShow.checked ? occluderDebugMat : occluderMat;
+  if (groomOccluder) {
+    occluder.visible = false;
+    groomOccluder.visible = ui.occ.checked || ui.occShow.checked;
+    groomOccluder.material = ui.occShow.checked ? occluderDebugMat : occluderMat;
+  } else {
+    occluder.visible = ui.occ.checked || ui.occShow.checked;
+    occluder.material = ui.occShow.checked ? occluderDebugMat : occluderMat;
+  }
 
-  matchLighting();
+  if (fixed) { ambient.color.setRGB(1, 1, 1); key.color.setRGB(1, 1, 1); ambient.intensity = 0.75; key.intensity = 1.1; }
+  else matchLighting();
   stepSprings(dt);
   renderer.render(scene, camera);
 }
@@ -344,6 +445,13 @@ function loop(now) {
 /* ---------------- 시작/정지 ---------------- */
 async function start() {
   startBtn.disabled = true;
+  if (ui.fixed.checked) {
+    // 디버그: 웹캠/MediaPipe 없이 렌더 루프만
+    running = true; stopBtn.disabled = false;
+    setStatus("포즈 고정 모드 — 정면 45cm 에 헤어만 렌더 (웹캠 없음)");
+    rafId = requestAnimationFrame(loop);
+    return;
+  }
   try {
     setStatus("MediaPipe 로딩 중...");
     const vision = await FilesetResolver.forVisionTasks(CDN + "/wasm");
@@ -375,7 +483,9 @@ async function start() {
     running = true;
     stopBtn.disabled = false;
     setStatus("동작 중 — 고개를 돌려보세요. 3D 포즈로 렌더하므로 각도 뱅크 없이 따라 돌아야 합니다.");
-    loop(performance.now());
+    // 첫 호출도 rAF 로: performance.now() 를 직접 넘기면 다음 rAF 타임스탬프가 그보다 작을 수
+    // 있고, MediaPipe VIDEO 모드는 타임스탬프가 줄면 그래프가 영구히 죽는다.
+    rafId = requestAnimationFrame(loop);
   } catch (err) {
     setStatus("시작 실패: " + err.message);
     startBtn.disabled = false;
@@ -388,7 +498,7 @@ function stop() {
   if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
   video.srcObject = null;
   renderer.clear();
-  fpsBuf.length = 0; lastT = 0; lastVideoTime = -1; hasPrevHead = false;
+  fpsBuf.length = 0; lastT = 0; lastVideoTime = -1; lastDetectTs = -1; hasPrevHead = false;
   startBtn.disabled = false; stopBtn.disabled = true;
   setStatus("정지됨");
 }

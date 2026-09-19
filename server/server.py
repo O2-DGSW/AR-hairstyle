@@ -90,10 +90,14 @@ class AppState:
         self.relay = MediaRelay()
 
         self.gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+        # 맨이마 인페인팅(LaMa, ~45ms) 전용. gpu_executor 에서 돌리면 그 시간만큼 영상 경로가
+        # 멈춘다(주기 갱신이면 매초 한 번 끊김). 별도 스레드 + 별도 CUDA 스트림으로 겹친다.
+        self.forehead_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forehead")
         self.gan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gan")
         self.pose_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pose")
 
         self.segmenter = None          # 첫 연결 때 지연 초기화 (모델 로딩이 몇 초)
+        self.forehead = None           # forehead.ForeheadInpainter (LaMa). 3D 그룸 첫 선택 때 적재.
         self.seg_error = None          # 적재 실패 사유. /readyz 가 이걸 돌려준다.
         self._seg_lock = asyncio.Lock()
 
@@ -175,6 +179,7 @@ class AppState:
         if self.segmenter is not None:
             self.segmenter.close()
         self.gpu_executor.shutdown(wait=False)
+        self.forehead_executor.shutdown(wait=False)
         self.gan_executor.shutdown(wait=False)
         self.pose_executor.shutdown(wait=False)
 
@@ -209,6 +214,17 @@ class PeerState:
         # 실제 영상에서 체감 이득이 없다고 확인됨. 비교용으로만 남긴다.
         self.blend = 0.0
         self.smooth = 1.0         # 앵커 평활화 세기 (0=끔)
+        # 3D 그룸(헤어카드 GLB). 설정되면 tryon 이 2D 에셋/뱅크 대신 이걸 포즈로 렌더한다.
+        # groom_obj 는 {"name","path","meta"} - warm 이 끝난 뒤에만 채워진다(첫 프레임 멈춤 방지).
+        self.groom = None
+        self.groom_obj = None
+        self.groom_fwd_cm = 0.0   # 앞뒤 (cm). 상하는 offset_up(px) 을 cm 로 환산해 같이 쓴다.
+        self.groom_color = None   # (b,g,r) 염색 미리보기. None 이면 사용자 머리색에 맞춤.
+        self.forehead_name = None # 인페인팅으로 만든 맨이마 패치(세션 레지스트리 이름). 그룸 tryon 이 이마에 씀.
+        self.forehead_building = False
+        self.forehead_built_at = 0.0   # 주기 갱신 기준 시각 (monotonic)
+        self.forehead_prev = None      # 교체 직후 크로스페이드용 이전 패치 이름
+        self.forehead_fade_at = 0.0
         self.livebank = None      # LiveBank: 세션 중 GAN 으로 각도별 헤어를 생성
         self.recording = False    # 학습 데이터용 원본 프레임 수집
         self.rec_dir = None
@@ -608,10 +624,35 @@ class SegmentedVideoTrack(VideoStreamTrack):
         st.inflight += 1
         app.gpu_inflight += 1
         try:
+            # 그룸은 상하 슬라이더(px)를 cm 로 환산해 쓴다: 눈 간격 ~50px ≈ 6.3cm 이므로 10px ≈ 1.2cm.
+            groom_fit = (st.scale_mul, st.offset_up * 0.12, st.groom_fwd_cm)
+            if st.groom_obj is not None:
+                # 그룸 경로에서 asset 은 이마 패치(.face) 로만 쓰인다 - 2D 헤어/뱅크는 무시.
+                asset = st.registry.get(st.forehead_name) if st.forehead_name else None
+                asset2, mix = None, 0.0
+                now_m = time.monotonic()
+                # 방금 갱신됐으면 이전 패치와 크로스페이드 (둘 다 같은 앵커로 워핑되므로 겹침 없음)
+                if st.forehead_prev is not None:
+                    f = (now_m - st.forehead_fade_at) / max(cfg.forehead_fade_s, 1e-3)
+                    prev = st.registry.get(st.forehead_prev)
+                    if f < 1.0 and prev is not None:
+                        asset2, mix = prev, 1.0 - f
+                    else:
+                        st.registry.remove(st.forehead_prev)
+                        st.forehead_prev = None
+                # 주기 갱신: 정면이고 안정적일 때만, 마지막 생성 후 refresh_s 지났으면 백그라운드로.
+                if (cfg.forehead_refresh_s > 0 and st.forehead_name is not None
+                        and not st.forehead_building and pose is not None
+                        and abs(float(pose["yaw"])) < cfg.forehead_refresh_yaw
+                        and self._yaw_ema is not None
+                        and abs(float(pose["yaw"]) - self._yaw_ema) < 5.0
+                        and now_m - st.forehead_built_at > cfg.forehead_refresh_s):
+                    asyncio.ensure_future(build_forehead(st, quiet=True))
             processed, timings = await loop.run_in_executor(
                 app.gpu_executor, seg.process, img, st.plate, st.mode,
                 asset, st.scale_mul, st.offset_up, pose, st.harmonize, st.shadow,
-                st.blend, asset2, mix, st.smoother)
+                st.blend, asset2, mix, st.smoother,
+                st.groom_obj, groom_fit, st.groom_color)
         finally:
             st.inflight -= 1
             app.gpu_inflight -= 1
@@ -649,7 +690,9 @@ class SegmentedVideoTrack(VideoStreamTrack):
                     "assets": st.registry.names(),
                     "banks": st.registry.banks(),
                     "bank": st.bank,
-                    "asset_used": _asset_label(asset, asset2, mix),
+                    "asset_used": ("3D " + st.groom) if st.groom_obj else _asset_label(asset, asset2, mix),
+                    "groom": st.groom,
+                    "groom_ms": round(timings.get("groom_ms", 0.0), 2),
                     "yaw_ema": round(self._yaw_ema, 1) if self._yaw_ema is not None else None,
                     "references": list(app.references.keys()),
                     "gan_loaded": app.gan.loaded if app.gan else False,
@@ -1566,6 +1609,162 @@ async def captures_file(request):
     return web.FileResponse(path)
 
 
+#: 3D 헤어 그룸(헤어카드 GLB + 정합 메타 json). Im2Haircut 스트랜드를
+#: _hair3d_work/strands_to_cards.py 로 변환한 결과를 여기 둔다. 파일명이 곧 스타일 이름.
+GROOM_DIR = os.path.join(ROOT, "grooms")
+
+
+def list_grooms():
+    """{name: meta}. meta 는 옆의 .json (없으면 {}). 정렬은 이름순."""
+    out = {}
+    if not os.path.isdir(GROOM_DIR):
+        return out
+    for fn in sorted(os.listdir(GROOM_DIR)):
+        if not fn.endswith(".glb"):
+            continue
+        name = fn[:-4]
+        meta = {}
+        jp = os.path.join(GROOM_DIR, name + ".json")
+        if os.path.isfile(jp):
+            try:
+                with open(jp, encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (OSError, ValueError) as e:
+                logger.warning("그룸 메타 읽기 실패 %s: %s", jp, e)
+        out[name] = meta
+    return out
+
+
+async def grooms_list(request):
+    """hair3d.html 드롭다운용. 클라이언트에 필요한 것만 추린다(source_ply 같은 로컬 경로는 뺌)."""
+    items = []
+    for name, meta in list_grooms().items():
+        items.append({
+            "name": name,
+            "url": f"/grooms/{name}.glb",
+            "n_strands": meta.get("n_strands"),
+            "user_fit": meta.get("user_fit", {}),
+        })
+    return web.json_response({"grooms": items})
+
+
+def _parse_bgr(v):
+    """'#rrggbb' -> (b,g,r) 0~255. 빈 값/이상한 값은 None(=사용자 머리색 맞춤)."""
+    if not v or not isinstance(v, str):
+        return None
+    h = v.lstrip("#")
+    if len(h) != 6:
+        return None
+    try:
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+    return (float(b), float(g), float(r))
+
+
+async def _set_groom(state: "SessionState", name):
+    """세션 그룸 교체. GLB 적재(~1초)는 gpu_executor 에서 미리 하고, 끝난 뒤에 세션에 건다 -
+    실시간 경로에서 처음 렌더할 때 적재하면 그 프레임이 1초 멈춘다."""
+    app = state.app
+    if not name:
+        state.groom = state.groom_obj = None
+        if state.mode == "tryon" and state.asset_name is None and not state.bank:
+            state.mode = "raw"
+        return
+    grooms = list_grooms()
+    if name not in grooms:
+        notify_peer(state, {"type": "groom", "status": "error",
+                            "message": f"그룸을 찾을 수 없습니다: {name}"})
+        return
+    obj = {"name": name, "path": os.path.join(GROOM_DIR, name + ".glb"), "meta": grooms[name]}
+    seg = await app.get_segmenter()
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(app.gpu_executor, seg.warm_groom, obj)
+    if not ok:
+        notify_peer(state, {"type": "groom", "status": "error", "message": f"GLB 로드 실패: {name}"})
+        return
+    state.groom = name
+    state.groom_obj = obj
+    state.bank = None
+    if state.mode == "raw":
+        state.mode = "tryon"
+    logger.info("그룸 -> %s (%s)", name, state.sid)
+    notify_peer(state, {"type": "groom", "status": "ok", "groom": name})
+    # 맨이마 패치가 아직 없으면 지금 프레임으로 만든다 (LaMa 인페인팅, ~50ms + 첫 적재 수 초).
+    if state.forehead_name is None:
+        asyncio.ensure_future(build_forehead(state))
+
+
+async def build_forehead(state: "SessionState", force: bool = False, quiet: bool = False):
+    """현재 프레임에서 앞머리를 인페인팅으로 걷어낸 얼굴 패치를 만들어 세션에 등록한다.
+
+    GAN 촬영을 쓰지 않는 이유는 forehead.py 머리 주석 참고. 파싱은 gpu_executor(CUDA 그래프
+    스레드), 인페인트는 forehead_executor(별도 스트림), 눈 위치는 MediaPipe IMAGE 모드.
+
+    quiet: 주기 갱신. 성공 알림을 보내지 않고 이전 패치와 크로스페이드로 바꿔 끼운다 -
+    매초 새 인페인트로 툭 바뀌면 이마가 깜빡인다.
+    """
+    app = state.app
+    if state.forehead_building or state.last_raw is None:
+        return
+    state.forehead_building = True
+    try:
+        frame = state.last_raw.copy()
+        seg = await app.get_segmenter()
+        loop = asyncio.get_event_loop()
+        cls = await loop.run_in_executor(app.gpu_executor, seg.class_map, frame)
+        from face_pose import landmarks_image
+        lm = await loop.run_in_executor(app.pose_executor, landmarks_image,
+                                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if lm is None:
+            notify_peer(state, {"type": "forehead", "status": "error", "message": "얼굴을 찾지 못했습니다"})
+            return
+        import forehead
+        if app.forehead is None:
+            app.forehead = forehead.ForeheadInpainter(seg.device)
+            notify_peer(state, {"type": "forehead", "status": "loading", "message": "이마 인페인터 적재 중 (최초 1회)"})
+        name = f"forehead-{int(time.time() * 1000) % 1000000}"
+        asset, bangs_px, ms = await loop.run_in_executor(
+            app.forehead_executor, forehead.build_forehead_asset,
+            app.forehead, frame, cls, lm["eye_l"], lm["eye_r"], name)
+        if asset is None:
+            if not quiet:
+                notify_peer(state, {"type": "forehead", "status": "error", "message": "얼굴 패치를 만들지 못했습니다"})
+            return
+        # 이전 패치는 바로 지우지 않는다 - 프레임 루프가 fade 동안 둘을 섞는다. 그 전 것만 정리.
+        stale, state.forehead_prev = state.forehead_prev, state.forehead_name
+        state.registry.add(asset)
+        await loop.run_in_executor(app.gpu_executor, seg.warm_asset, asset)
+        state.forehead_name = name
+        state.forehead_built_at = time.monotonic()
+        state.forehead_fade_at = state.forehead_built_at
+        if stale:
+            state.registry.remove(stale)
+        if quiet:
+            logger.debug("맨이마 패치 갱신 %s: 앞머리 %dpx, %.0fms", name, bangs_px, ms)
+        else:
+            logger.info("맨이마 패치 %s: 앞머리 %dpx, 인페인트 %.0fms (%s)", name, bangs_px, ms, state.sid)
+            notify_peer(state, {"type": "forehead", "status": "ok", "name": name,
+                                "bangs_px": bangs_px, "inpaint_ms": round(ms)})
+    except Exception as e:
+        logger.exception("맨이마 패치 생성 실패")
+        if not quiet:
+            notify_peer(state, {"type": "forehead", "status": "error", "message": str(e)})
+        state.forehead_built_at = time.monotonic()      # 실패 직후 매 프레임 재시도하지 않게
+    finally:
+        state.forehead_building = False
+
+
+async def groom_file(request):
+    name = request.match_info["name"]
+    if "/" in name or "\\" in name or ".." in name or not name.endswith(".glb"):
+        raise web.HTTPNotFound()
+    path = os.path.join(GROOM_DIR, name)
+    if not os.path.isfile(path):
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Content-Type": "model/gltf-binary"})
+
+
 # 개발 중에는 브라우저 캐시가 계속 발목을 잡는다. 코드를 고쳐도 예전 client.js가
 # 캐시에서 나오면 "왜 안 바뀌지"로 시간을 버린다. 클라이언트 파일은 캐시 금지.
 _NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
@@ -1940,6 +2139,11 @@ async def offer(request):
                 if m in ("raw", "seg", "remove", "plate", "tryon"):
                     state.mode = m
                     logger.info("mode -> %s", m)
+            elif data.get("type") in ("livebank", "capture") and app.gan is None:
+                notify_peer(state, {"type": data["type"], "status": "error",
+                                    "message": "GAN 경로는 꺼져 있습니다 (3D 스타일을 쓰세요. HEDDY_GAN_ENABLED=1 로 복구)"})
+                if data.get("type") == "capture":
+                    state.capturing = False
             elif data.get("type") == "livebank":
                 if data.get("on"):
                     ref = data.get("reference") or (app.references and
@@ -1978,6 +2182,14 @@ async def offer(request):
                     run_capture(state, data.get("reference") or
                                 (next(iter(app.references)) if app.references else "")))
             elif data.get("type") == "fit":
+                if "groom" in data:
+                    asyncio.ensure_future(_set_groom(state, data["groom"] or None))
+                if data.get("forehead") == "refresh":
+                    asyncio.ensure_future(build_forehead(state, force=True))
+                if "groom_fwd" in data:
+                    state.groom_fwd_cm = max(-15.0, min(15.0, float(data["groom_fwd"])))
+                if "groom_color" in data:
+                    state.groom_color = _parse_bgr(data["groom_color"])
                 if "asset" in data and data["asset"] in state.registry:
                     state.asset_name = data["asset"]
                     state.bank = None          # 개별 에셋을 고르면 뱅크는 해제
@@ -2131,15 +2343,18 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
         # 부르면 서버를 두 번 띄웠을 때 자식도 둘이 되어 VRAM 이 2배가 된다.
         # log=logger.info 는 자식 stdout/stderr 중계에 쓰이며, 부모의 데몬
         # 스레드에서 호출되므로 스레드 안전한 콜러블이어야 한다.
-        state.gan = gan_process.GanClient(cfg=cfg, log=logger.info)
-        try:
-            state.gan.start()          # 논블로킹(실측 0.008s). 모델은 첫 swap 때.
-        except Exception:
-            logger.exception("GAN 워커 기동 실패 (첫 촬영 때 다시 시도한다)")
+        if cfg.gan_enabled:
+            state.gan = gan_process.GanClient(cfg=cfg, log=logger.info)
+            try:
+                state.gan.start()          # 논블로킹(실측 0.008s). 모델은 첫 swap 때.
+            except Exception:
+                logger.exception("GAN 워커 기동 실패 (첫 촬영 때 다시 시도한다)")
+        else:
+            logger.info("GAN 경로 비활성 (gan_enabled=False) - 3D 그룸만 사용")
 
         if preload:
             await state.get_segmenter()
-        if preload_gan:
+        if preload_gan and state.gan is not None:
             await _warm_gan(state)
 
         state.reaper = asyncio.create_task(_reaper(state))
@@ -2174,6 +2389,8 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
     app.router.add_get("/readyz", readyz)
     app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/captures/{name}", captures_file)
+    app.router.add_get("/grooms", grooms_list)
+    app.router.add_get("/grooms/{name}", groom_file)
     # 반드시 마지막 (catch-all). 위에 있으면 /healthz 같은 새 라우트를 전부
     # 삼켜서 404 가 된다.
     app.router.add_get("/{name}", client_file)
@@ -2222,8 +2439,33 @@ def main():
     args = parser.parse_args()
 
     app = create_app(CONFIG, preload=args.preload, preload_gan=args.preload_gan)
-    logger.info("starting on http://%s:%s", args.host, args.port)
-    web.run_app(app, host=args.host, port=args.port)
+
+    # 인증서가 있으면 HTTPS 도 같이 연다 (run_app 은 사이트 하나만 열어서 직접 구성).
+    ssl_ctx = None
+    if os.path.isfile(CONFIG.tls_cert) and os.path.isfile(CONFIG.tls_key):
+        import ssl
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain(CONFIG.tls_cert, CONFIG.tls_key)
+        logger.info("starting on http://%s:%s + https://%s:%s", args.host, args.port, args.host, CONFIG.tls_port)
+    else:
+        logger.info("starting on http://%s:%s (TLS 없음: %s 없음)", args.host, args.port, CONFIG.tls_cert)
+
+    async def _serve():
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, args.host, args.port).start()
+        if ssl_ctx is not None:
+            await web.TCPSite(runner, args.host, CONFIG.tls_port, ssl_context=ssl_ctx).start()
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            await runner.cleanup()
+
+    try:
+        asyncio.run(_serve())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
