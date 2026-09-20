@@ -202,6 +202,9 @@ class Config:
     groom_color_min_px: int = 400
     #: 리본 가장자리 페더 폭 (눈 간격 배수). 0 이면 MSAA 만.
     groom_feather: float = 0.04
+    #: 머리색 샘플링을 허용하는 포즈 범위(도). 벗어나면 이전 값 유지(파서가 피부를 머리로 찍는다).
+    groom_color_max_yaw: float = 25.0
+    groom_color_max_pitch: float = 20.0
     #: 휘도 대비(표준편차) 맞춤 세기. 0=평균색만, 1=완전 일치.
     groom_contrast_match: float = 0.8
     #: 맨이마 패치(forehead.py) 주기 갱신 간격(초). 0 이면 선택/수동 때만. 조명·표정 변화를 따라간다.
@@ -212,6 +215,17 @@ class Config:
     forehead_refresh_yaw: float = 15.0
     #: 새 패치로 바꿀 때 이전 패치와 섞는 시간(초). 툭 바뀌면 이마가 깜빡인다.
     forehead_fade_s: float = 0.4
+    # 2차 운동 (hair_dynamics.py). 강체 헤어는 가발처럼 보인다.
+    #: 스프링 상수(1/s²). 클수록 빨리 따라온다. 140 이면 0.2초 회전에 14° 뒤처졌다 0.6초에 정착.
+    groom_dyn_stiffness: float = 140.0
+    #: 감쇠비. 1 미만이면 한 번 넘쳤다 돌아온다(자연스러움), 1 이면 넘침 없이 정착.
+    groom_dyn_damping: float = 0.55
+    #: 중력: 고개를 기울였을 때 끝이 수직으로 처지는 비율 (0=두상 그대로, 1=완전 수직).
+    groom_dyn_gravity: float = 0.5
+    #: 이동 지연 상한(cm). 두상에서 너무 떨어지면 잘린 것처럼 보인다.
+    groom_dyn_max_shift_cm: float = 2.5
+    #: 정지해 있을 때의 미세 흔들림 진폭(cm, 끝 기준). 0 이면 완전 정지.
+    groom_dyn_idle_cm: float = 0.12
     #: 사용자 머리가 안 보일 때(모자/삭발) 쓰는 기본 머리색 (BGR).
     groom_default_bgr: tuple[float, ...] = (28.0, 32.0, 40.0)
     #: GPU 에 올려둘 에셋 텐서 상한(개). 512^2 RGBA float32 = 약 4MB/개.

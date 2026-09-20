@@ -88,6 +88,11 @@ groomSel.addEventListener("change", () => {
   sendGroomColor();
 });
 groomColor.addEventListener("input", () => { groomAuto.checked = false; sendGroomColor(); });
+// 2차 운동 세기 (0=강체). 관성/중력 스프링은 서버(hair_dynamics.py)가 굴린다.
+el("f-dyn").addEventListener("input", () => {
+  el("v-f-dyn").textContent = el("f-dyn").value;
+  send({ type: "fit", dyn: Number(el("f-dyn").value) / 100 });
+});
 groomAuto.addEventListener("change", sendGroomColor);
 // 맨이마 패치(앞머리 인페인팅)는 스타일 선택 때 현재 프레임으로 1회 만든다. 정면을 보고 다시 만들 수 있다.
 el("forehead-refresh").addEventListener("click", () => {

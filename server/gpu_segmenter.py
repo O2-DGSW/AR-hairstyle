@@ -707,13 +707,14 @@ class GpuFaceParser:
                 asset=None, scale_mul: float = 1.0, offset_up: float = 0.0, pose=None,
                 harmonize: bool = True, shadow: float = 0.35,
                 blend: float = 1.0, asset2=None, mix: float = 0.0,
-                smoother=None, groom=None, groom_fit=None, groom_color=None):
+                smoother=None, groom=None, groom_fit=None, groom_color=None, groom_dyn=None):
         """BGR 프레임 -> (합성된 BGR 프레임, 타이밍/상태 dict).
 
         groom: {"name","path","meta"} 3D 헤어카드 GLB. 주어지면 tryon 에서 2D 에셋
                워핑 대신 포즈 행렬로 렌더한다(_render_groom). 뒤 합성은 동일.
         groom_fit: (scale_mul, up_cm, fwd_cm) 세션 보정. json 의 user_fit 위에 곱/더한다.
         groom_color: (b,g,r) 0~255 또는 None. None 이면 사용자 머리색에 맞춘다.
+        groom_dyn: hair_dynamics.HairDynamics.step() 결과(2차 운동 유니폼). None 이면 강체.
 
         mode:
           raw    - 원본 그대로 (기본). 플레이트는 계속 쌓는다.
@@ -866,7 +867,7 @@ class GpuFaceParser:
                 # 3D 그룸: 그 프레임의 포즈 행렬로 직접 래스터라이즈. 평면 밖 회전이
                 # 그대로 나오므로 각도 뱅크(asset2/mix)가 필요 없다. 조명 정합(ratio/lift)
                 # 대신 아래 색 맞춤이 사용자 머리색(=그 조명 아래의 색)에 맞춘다.
-                new_rgb, new_a = self._render_groom(groom, pose["matrix"], groom_fit, h, w)
+                new_rgb, new_a = self._render_groom(groom, pose["matrix"], groom_fit, h, w, groom_dyn)
                 groom_ms = self._groom.last_ms if self._groom is not None else 0.0
                 # 이마 패치: 앞머리 있는 사람이 앞머리 없는 스타일을 입으면 지운 자리가
                 # 살색 평면으로 남아 이질적이다. 촬영(GAN, 입력에서 앞머리를 미리 걷어냄)이
@@ -897,7 +898,7 @@ class GpuFaceParser:
                             face_a = tot
                 if new_rgb is not None:
                     new_rgb = self._match_hair_color(new_rgb, new_a, frame_f, hair_a,
-                                                     want_stats, groom_color)
+                                                     want_stats, groom_color, pose=pose, eyes=eyes)
                     if CONFIG.groom_feather > 0 and eyes is not None:
                         # 리본 가장자리 페더. MSAA 만으로는 원래 머리 경계(소프트 알파)보다
                         # 딱딱해 오려붙인 티가 난다. 눈 간격 비례 폭으로 프리멀티플라이드 블러.
@@ -1209,7 +1210,7 @@ class GpuFaceParser:
             self._groom = GroomRenderer(self.device)
         return self._groom
 
-    def _render_groom(self, groom: dict, matrix, fit, h: int, w: int):
+    def _render_groom(self, groom: dict, matrix, fit, h: int, w: int, dyn=None):
         r = self._groom_renderer()
         g = r.load(groom["name"], groom["path"], groom.get("meta"))
         sm, up, fwd = fit if fit is not None else (1.0, 0.0, 0.0)
@@ -1217,12 +1218,13 @@ class GpuFaceParser:
             # 흰 베이스: 색은 _match_hair_color 가 입힌다 (GLB 의 갈색은 무시)
             return r.render(g, matrix, w, h, g.scale_mul * float(sm),
                             g.offset_up_cm + float(up), g.offset_fwd_cm + float(fwd),
-                            base_rgb=(1.0, 1.0, 1.0))
+                            base_rgb=(1.0, 1.0, 1.0), dyn=dyn)
         except Exception:
             logger.exception("그룸 렌더 실패")
             return None, None
 
-    def _match_hair_color(self, new_rgb, new_a, frame_f, hair_a, refresh: bool, color=None):
+    def _match_hair_color(self, new_rgb, new_a, frame_f, hair_a, refresh: bool, color=None,
+                          pose=None, eyes=None):
         """렌더된 헤어(흰 베이스: 음영·텍스처만)에 색을 입힌다 - 알파가중 평균이 목표색이 되도록.
 
         목표색은 사용자 머리(파싱 마스크)의 평균색. **그 조명 아래에서 관측된** 색이라
@@ -1238,9 +1240,22 @@ class GpuFaceParser:
         if color is not None:
             target = torch.as_tensor(color, device=self.device, dtype=torch.float32)
         else:
+            # 샘플이 오염되는 두 경우를 막는다: (1) 고개를 크게 젖히거나 돌리면 파서가 피부를
+            # '머리'로 찍어 평균이 살색으로 밀린다(실측: 분홍 헤어) (2) 긴 머리가 얼굴 옆으로
+            # 내려온 자리는 그림자/피부가 섞인다. 정면·안정 포즈에서 눈 위쪽 픽셀만 잰다.
+            steady = pose is None or (abs(float(pose.get("yaw", 0.0))) < CONFIG.groom_color_max_yaw
+                                      and abs(float(pose.get("pitch", 0.0))) < CONFIG.groom_color_max_pitch)
+            above = None
+            if eyes is not None:
+                ey = float(min(eyes[0][1], eyes[1][1]))
+                above = (torch.arange(hair_a.shape[0], device=self.device, dtype=torch.float32)
+                         < ey).unsqueeze(-1).unsqueeze(-1)          # (h,1,1) 눈 위쪽 행만
+
             def measure():
-                # (평균 BGR, 휘도 표준편차) - 마스크 안 픽셀
+                # (평균 BGR, 휘도 표준편차) - 마스크 안(눈 위쪽) 픽셀
                 m = (hair_a > 0.5).float().unsqueeze(-1)
+                if above is not None:
+                    m = m * above
                 cnt = m.sum().clamp(min=1.0)
                 mean = (frame_f * m).sum((0, 1)) / cnt
                 lum = (frame_f * self._lum_w).sum(-1, keepdim=True)
@@ -1250,9 +1265,9 @@ class GpuFaceParser:
 
             if self._hair_color is None:
                 # 첫 프레임: 통계 주기를 기다리면 그동안 흰 머리가 나간다. 한 번만 동기화해서 잰다.
-                if int((hair_a > 0.5).sum().item()) > CONFIG.groom_color_min_px:
+                if steady and int((hair_a > 0.5).sum().item()) > CONFIG.groom_color_min_px:
                     self._hair_color, self._hair_std = measure()
-            elif refresh and self._last_hair_px > CONFIG.groom_color_min_px:
+            elif refresh and steady and self._last_hair_px > CONFIG.groom_color_min_px:
                 # 이후는 want_stats 프레임(이미 동기화됨)에만 EMA 갱신. .item() 없음.
                 mean, std = measure()
                 a = CONFIG.groom_color_alpha

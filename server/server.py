@@ -220,6 +220,14 @@ class PeerState:
         self.groom_obj = None
         self.groom_fwd_cm = 0.0   # 앞뒤 (cm). 상하는 offset_up(px) 을 cm 로 환산해 같이 쓴다.
         self.groom_color = None   # (b,g,r) 염색 미리보기. None 이면 사용자 머리색에 맞춤.
+        # 2차 운동 상태(세션별 스프링). dyn_amount 는 UI 슬라이더(0=강체, 1=기본, 1.5=과장).
+        import hair_dynamics
+        self.hair_dyn = hair_dynamics.HairDynamics(
+            stiffness=self.cfg.groom_dyn_stiffness, damping_ratio=self.cfg.groom_dyn_damping,
+            gravity=self.cfg.groom_dyn_gravity, max_shift_cm=self.cfg.groom_dyn_max_shift_cm,
+            idle_cm=self.cfg.groom_dyn_idle_cm)
+        self.dyn_amount = 1.0
+        self.dyn_last_t = None
         self.forehead_name = None # 인페인팅으로 만든 맨이마 패치(세션 레지스트리 이름). 그룸 tryon 이 이마에 씀.
         self.forehead_building = False
         self.forehead_built_at = 0.0   # 주기 갱신 기준 시각 (monotonic)
@@ -626,11 +634,19 @@ class SegmentedVideoTrack(VideoStreamTrack):
         try:
             # 그룸은 상하 슬라이더(px)를 cm 로 환산해 쓴다: 눈 간격 ~50px ≈ 6.3cm 이므로 10px ≈ 1.2cm.
             groom_fit = (st.scale_mul, st.offset_up * 0.12, st.groom_fwd_cm)
+            groom_dyn = None
             if st.groom_obj is not None:
                 # 그룸 경로에서 asset 은 이마 패치(.face) 로만 쓰인다 - 2D 헤어/뱅크는 무시.
                 asset = st.registry.get(st.forehead_name) if st.forehead_name else None
                 asset2, mix = None, 0.0
                 now_m = time.monotonic()
+                # 2차 운동: 이 프레임의 포즈로 스프링을 한 스텝 굴린다 (실제 경과 시간 사용).
+                if pose is not None and pose.get("matrix") is not None and st.dyn_amount > 0:
+                    dt = 1 / 30 if st.dyn_last_t is None else now_m - st.dyn_last_t
+                    groom_dyn = st.hair_dyn.step(pose["matrix"], dt)
+                    groom_dyn["tip"] = st.dyn_amount
+                    groom_dyn["idle"] = groom_dyn["idle"] * st.dyn_amount
+                st.dyn_last_t = now_m
                 # 방금 갱신됐으면 이전 패치와 크로스페이드 (둘 다 같은 앵커로 워핑되므로 겹침 없음)
                 if st.forehead_prev is not None:
                     f = (now_m - st.forehead_fade_at) / max(cfg.forehead_fade_s, 1e-3)
@@ -652,7 +668,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
                 app.gpu_executor, seg.process, img, st.plate, st.mode,
                 asset, st.scale_mul, st.offset_up, pose, st.harmonize, st.shadow,
                 st.blend, asset2, mix, st.smoother,
-                st.groom_obj, groom_fit, st.groom_color)
+                st.groom_obj, groom_fit, st.groom_color, groom_dyn)
         finally:
             st.inflight -= 1
             app.gpu_inflight -= 1
@@ -2186,6 +2202,8 @@ async def offer(request):
                     asyncio.ensure_future(_set_groom(state, data["groom"] or None))
                 if data.get("forehead") == "refresh":
                     asyncio.ensure_future(build_forehead(state, force=True))
+                if "dyn" in data:
+                    state.dyn_amount = max(0.0, min(2.0, float(data["dyn"])))
                 if "groom_fwd" in data:
                     state.groom_fwd_cm = max(-15.0, min(15.0, float(data["groom_fwd"])))
                 if "groom_color" in data:

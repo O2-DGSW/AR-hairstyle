@@ -49,10 +49,29 @@ _VS = """
 #version 330
 uniform mat4 u_mvp;
 uniform mat3 u_nrm;
-in vec3 in_pos; in vec2 in_uv; in vec3 in_nrm;
+// 2차 운동 (hair_dynamics.py): 뿌리 기준 상대좌표를 [현재 -> 지연 자세] 로 끝쪽만 섞는다
+uniform mat3 u_lag;         // 두상 공간 회전 (현재 -> 지연)
+uniform vec3 u_shift;       // 두상 공간 이동 지연 (cm)
+uniform float u_tip;        // 끝 가중치 배율 (0 이면 강체)
+uniform float u_idle;       // 미세 흔들림 진폭 (cm)
+uniform float u_time;
+in vec3 in_pos; in vec2 in_uv; in vec3 in_nrm; in vec3 in_root;
 out vec2 v_uv; out vec3 v_nrm;
 void main() {
-    gl_Position = u_mvp * vec4(in_pos, 1.0);
+    float s = in_uv.y;                      // 0 = 뿌리, 1 = 끝 (strands_to_cards 의 v 를 로더가 뒤집음)
+    vec3 rel = in_pos - in_root;
+    float w = clamp(u_tip * s * s, 0.0, 1.0);
+    vec3 rel2 = u_lag * rel + u_shift * s;
+    vec3 d = mix(rel, rel2, w);
+    // 살아 있는 느낌: 뿌리 위치로 위상을 흩뜨린 느린 흔들림 (끝일수록 크게)
+    float ph = dot(in_root, vec3(12.9898, 78.233, 37.719));
+    d += vec3(sin(u_time * 1.7 + ph), 0.0, cos(u_time * 1.3 + ph * 0.7)) * (u_idle * s * s);
+    // 가닥 길이 보존 (섞으면 짧아진다)
+    float L = length(rel);
+    float Ld = length(d);
+    if (L > 1e-4 && Ld > 1e-4) d *= L / Ld;
+    vec3 pos = in_root + d;
+    gl_Position = u_mvp * vec4(pos, 1.0);
     v_uv = in_uv;
     v_nrm = normalize(u_nrm * in_nrm);
 }
@@ -178,9 +197,17 @@ class GroomRenderer:
                 uv = np.zeros((len(v), 2), np.float32)
             uv = np.asarray(uv, np.float32).copy()
             uv[:, 1] = 1.0 - uv[:, 1]           # glTF 는 v 가 위->아래, GL 텍스처는 아래->위
-            vbo = ctx.buffer(np.hstack([v, uv, n]).astype(np.float32).tobytes())
+            # 뿌리 위치(2차 운동의 회전 중심). strands_to_cards 는 정점을 [strand][pt][좌/우] 순으로
+            # 쓰므로 pts_per_strand 로 되감을 수 있다. 맞지 않으면(다른 GLB) 자기 자신 = 강체.
+            root = v.copy()
+            P = int((meta or {}).get("pts_per_strand", 0))
+            if gname != "head_occluder" and P > 0 and len(v) % (P * 2) == 0:
+                strands = v.reshape(-1, P, 2, 3)
+                r0 = strands[:, 0, :, :].mean(axis=1)                       # (N,3) 뿌리(좌우 평균)
+                root = np.repeat(r0, P * 2, axis=0).astype(np.float32)
+            vbo = ctx.buffer(np.hstack([v, uv, n, root]).astype(np.float32).tobytes())
             ibo = ctx.buffer(faces.tobytes())
-            vao = ctx.vertex_array(self._prog, [(vbo, "3f 2f 3f", "in_pos", "in_uv", "in_nrm")], ibo)
+            vao = ctx.vertex_array(self._prog, [(vbo, "3f 2f 3f 3f", "in_pos", "in_uv", "in_nrm", "in_root")], ibo)
             if gname == "head_occluder":
                 g.occ_vao = vao
                 continue
@@ -216,7 +243,7 @@ class GroomRenderer:
     # ---- 렌더 ----
     def render(self, groom: Groom, matrix: np.ndarray, w: int, h: int,
                scale_mul: float = 1.0, offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0,
-               base_rgb=None):
+               base_rgb=None, dyn: dict | None = None):
         """-> (rgb (h,w,3) BGR float 0~255, a (h,w,1) float 0~1) GPU 텐서, 또는 (None, None).
 
         matrix: MediaPipe 4x4 row-major (정규 얼굴 -> 카메라 공간, cm).
@@ -236,6 +263,7 @@ class GroomRenderer:
         fit[1, 3] = float(offset_up_cm)
         fit[2, 3] = float(offset_fwd_cm)
         model = M @ fit
+        # 셰이더의 상대좌표 변형은 정규 공간(fit 적용 전)에서 일어나므로 u_shift 는 스케일과 무관
         proj = _perspective(MP_VERTICAL_FOV_DEG, w / float(h), 1.0, 1000.0)
         # 이미지 좌표는 y 가 아래로 자란다. 투영의 y 를 뒤집어 프레임버퍼 0행이 이미지 0행이 되게 한다.
         proj[1] *= -1.0
@@ -250,6 +278,19 @@ class GroomRenderer:
         prog["u_mvp"].write(np.ascontiguousarray(mvp.T).tobytes())   # column-major
         prog["u_nrm"].write(np.ascontiguousarray(nrm.T.astype(np.float32)).tobytes())
         prog["u_light"].value = (0.3, 0.8, 1.0)
+        # 2차 운동 (hair_dynamics.HairDynamics.step 의 결과). 없으면 강체.
+        if dyn is not None:
+            prog["u_lag"].write(np.ascontiguousarray(np.asarray(dyn["lag"], np.float32).T).tobytes())
+            prog["u_shift"].value = tuple(float(x) for x in dyn["shift"])
+            prog["u_tip"].value = float(dyn["tip"])
+            prog["u_idle"].value = float(dyn["idle"])
+            prog["u_time"].value = float(dyn["time"])
+        else:
+            prog["u_lag"].write(np.eye(3, dtype=np.float32).tobytes())
+            prog["u_shift"].value = (0.0, 0.0, 0.0)
+            prog["u_tip"].value = 0.0
+            prog["u_idle"].value = 0.0
+            prog["u_time"].value = 0.0
         base = groom.base if base_rgb is None else tuple(float(c) for c in base_rgb)
         prog["u_base"].value = base
         prog["u_tex"].value = 0

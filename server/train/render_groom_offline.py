@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--color", default="", help="#rrggbb (비우면 내 머리색)")
     ap.add_argument("--forehead", type=int, default=-1,
                     help="이 프레임으로 맨이마 패치(LaMa)를 만들어 이마에 쓴다. -1 이면 살색 평면")
+    ap.add_argument("--dyn", type=float, default=0.0,
+                    help="2차 운동 세기(1=기본). 프레임 순서대로 30fps 로 스프링을 굴린다")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -66,17 +68,28 @@ def main():
         cv2.imwrite(os.path.join(a.out, "forehead_bald.png"), fh_asset.bald_bgr)
         print(f"forehead: 앞머리 {bangs_px}px, 인페인트 {ms:.0f}ms")
 
+    from hair_dynamics import HairDynamics
+    hd = HairDynamics()
+
     def run(idx, mode):
         img = cv2.imread(os.path.join(a.frames, files[idx]))
         pose = poser.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), idx * 33)
+        dyn = None
+        if a.dyn > 0 and pose is not None and pose.get("matrix") is not None:
+            dyn = hd.step(pose["matrix"], 1 / 30)
+            dyn["tip"] = a.dyn
         out, t = seg.process(img, plate, mode, fh_asset, 1.0, 0.0, pose, True, 0.35, 0.0,
-                             None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color)
+                             None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color, dyn)
         return img, out, t, pose
 
     for i in range(min(a.warm, len(files))):
         run(i, "raw")
     ts = []
-    for idx in [int(x) for x in a.render.split(",")]:
+    want = [int(x) for x in a.render.split(",")]
+    # 2차 운동은 연속성이 필요하다: 첫 렌더 프레임까지 그 앞 프레임들을 raw 로 순서대로 굴린다
+    for i in range(a.warm, want[0]):
+        run(i, "raw")     # 랜드마커(VIDEO 모드) 추적 연속성도 필요하다
+    for idx in want:
         img, out, t, pose = run(idx, "tryon")
         ts.append(t)
         side = np.hstack([img, out])
