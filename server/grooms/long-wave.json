@@ -1,6 +1,7 @@
 {
   "source_ply": "C:\\Users\\rr444\\Documents\\projects\\_hair3d_work\\out\\adrianne_final.ply",
   "frame": "mediapipe_cm_headcenter",
+  "version": 1,
   "flame_head_center_m": [
     -0.003049349193708911,
     1.7244086233326685,
@@ -8,9 +9,10 @@
   ],
   "flame_head_width_m": 0.21541064,
   "scale_m_to_cm": 88.20362819589599,
-  "n_strands": 4338,
-  "pts_per_strand": 40,
-  "card_width_cm": 0.7,
+  "n_strands": 13014,
+  "pts_per_strand": 24,
+  "card_width_cm": 0.3,
+  "billboard": true,
   "user_fit": {
     "scale_mul": 1.12,
     "offset_up_cm": -2.5,

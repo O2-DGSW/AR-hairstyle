@@ -46,8 +46,9 @@ logger = logging.getLogger("groom")
 MP_VERTICAL_FOV_DEG = 63.0
 
 _VS = """
-#version 330
-uniform mat4 u_mvp;
+#version 400
+uniform mat4 u_proj;        // 카메라 공간 -> 클립
+uniform mat4 u_model;       // 두상(정규, cm) -> 카메라 공간
 uniform mat3 u_nrm;
 // 2차 운동 (hair_dynamics.py): 뿌리 기준 상대좌표를 [현재 -> 지연 자세] 로 끝쪽만 섞는다
 uniform mat3 u_lag;         // 두상 공간 회전 (현재 -> 지연)
@@ -55,50 +56,97 @@ uniform vec3 u_shift;       // 두상 공간 이동 지연 (cm)
 uniform float u_tip;        // 끝 가중치 배율 (0 이면 강체)
 uniform float u_idle;       // 미세 흔들림 진폭 (cm)
 uniform float u_time;
+uniform int u_billboard;    // 1: _center/_tangent/_side/_halfw 로 카메라를 향하는 리본을 만든다 (v1 GLB)
+uniform float u_scale;      // 두상 스케일(폭에 곱함)
 in vec3 in_pos; in vec2 in_uv; in vec3 in_nrm; in vec3 in_root;
-out vec2 v_uv; out vec3 v_nrm;
+in vec3 in_center; in vec3 in_tangent; in float in_side; in float in_rand; in float in_halfw;
+out vec2 v_uv; out vec3 v_nrm; out vec3 v_tan; out vec3 v_pos; flat out float v_rand;
 void main() {
     float s = in_uv.y;                      // 0 = 뿌리, 1 = 끝 (strands_to_cards 의 v 를 로더가 뒤집음)
-    vec3 rel = in_pos - in_root;
+    vec3 base = (u_billboard == 1) ? in_center : in_pos;
+    vec3 rel = base - in_root;
     float w = clamp(u_tip * s * s, 0.0, 1.0);
     vec3 rel2 = u_lag * rel + u_shift * s;
     vec3 d = mix(rel, rel2, w);
-    // 살아 있는 느낌: 뿌리 위치로 위상을 흩뜨린 느린 흔들림 (끝일수록 크게)
     float ph = dot(in_root, vec3(12.9898, 78.233, 37.719));
     d += vec3(sin(u_time * 1.7 + ph), 0.0, cos(u_time * 1.3 + ph * 0.7)) * (u_idle * s * s);
-    // 가닥 길이 보존 (섞으면 짧아진다)
     float L = length(rel);
     float Ld = length(d);
     if (L > 1e-4 && Ld > 1e-4) d *= L / Ld;
-    vec3 pos = in_root + d;
-    gl_Position = u_mvp * vec4(pos, 1.0);
+    vec3 p = in_root + d;                   // 두상 공간
+    vec4 pc = u_model * vec4(p, 1.0);       // 카메라 공간
+    vec3 tc = normalize(mat3(u_model) * ((u_billboard == 1) ? in_tangent : in_nrm));
+    if (u_billboard == 1) {
+        // 리본 폭 방향 = 접선 x 시선. 매 프레임 카메라를 향하므로 꼬임/계단이 없고 폭이 일정하다.
+        vec3 view = normalize(-pc.xyz);
+        vec3 side = cross(tc, view);
+        float sl = length(side);
+        side = (sl > 1e-4) ? side / sl : vec3(1.0, 0.0, 0.0);
+        pc.xyz += side * (in_side * in_halfw * u_scale);
+    }
+    gl_Position = u_proj * pc;
     v_uv = in_uv;
     v_nrm = normalize(u_nrm * in_nrm);
+    v_tan = tc;
+    v_pos = pc.xyz;
+    v_rand = in_rand;
 }
 """
 
 _FS = """
-#version 330
+#version 400
 uniform sampler2D u_tex;
 uniform vec3 u_base;        // 베이스 색 (0~1, RGB)
-uniform int u_pass;         // 0: 불투명 컷아웃(a>=0.5), 1: 반투명 가장자리(a<0.5), 2: 깊이만
+uniform int u_pass;         // 0: 컷아웃(a>=0.5), 1: 반투명 가장자리(a<0.5), 2: 깊이만, 3: 알파-투-커버리지 단일 패스
 uniform vec3 u_light;       // 카메라 공간 광원 방향
-in vec2 v_uv; in vec3 v_nrm;
+uniform int u_billboard;
+uniform int u_samples;      // MSAA 샘플 수 (패스 3)
+in vec2 v_uv; in vec3 v_nrm; in vec3 v_tan; in vec3 v_pos; flat in float v_rand;
 out vec4 f_color;
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 void main() {
+    // gl_SampleMask 를 한 곳에서라도 쓰면 안 쓴 경로에선 값이 미정의다(GLSL 규칙) -> 항상 전부 덮음으로 시작
+    gl_SampleMask[0] = 0xFFFFFFFF;
     if (u_pass == 2) { f_color = vec4(0.0); return; }
     vec4 t = texture(u_tex, v_uv);
     float a = t.a;
     if (u_pass == 0 && a < 0.5) discard;
     if (u_pass == 1 && a >= 0.5) discard;
-    // 양면 조명. 리본은 두께가 없어 뒷면도 그대로 보인다.
-    float nl = abs(dot(v_nrm, normalize(u_light)));
-    float shade = 0.55 + 0.45 * nl;
+    if (u_pass == 3) {
+        // 확률적 투명도: 알파 비율만큼의 샘플을 덮되, 어느 샘플부터 덮을지를 가닥+픽셀 해시로 돌린다.
+        // 하드웨어 알파-투-커버리지는 알파값마다 고정 패턴이라 겹치는 가닥이 같은 샘플만 덮어
+        // 밀도가 누적되지 않았다(실측: 알파 합이 1/7). 마스크를 돌리면 겹칠수록 덮인다 = 블렌딩과 같아진다.
+        if (a < 0.02) discard;
+        float n = float(u_samples);
+        float jitter = hash12(gl_FragCoord.xy + v_rand * 97.0);
+        int k = int(clamp(floor(a * n + jitter), 0.0, n));   // 디더로 소수 알파도 평균적으로 맞춘다
+        if (k <= 0) discard;
+        int off = int(hash12(gl_FragCoord.yx * 1.7 + v_rand * 31.0) * n);
+        int mask = 0;
+        for (int i = 0; i < k; i++) mask |= 1 << ((off + i) % u_samples);
+        gl_SampleMask[0] = mask;
+    }
+    vec3 Ld = normalize(u_light);
+    float shade;
+    if (u_billboard == 1) {
+        // Kajiya-Kay: 머리카락은 접선 방향으로 늘어진 원기둥. 확산은 sin(T,L), 반사는 결을 따라 흐른다.
+        vec3 V = normalize(-v_pos);
+        vec3 H = normalize(Ld + V);
+        float tl = dot(v_tan, Ld);
+        float diff = sqrt(max(0.0, 1.0 - tl * tl));
+        float th = dot(v_tan, H);
+        float spec = pow(sqrt(max(0.0, 1.0 - th * th)), 48.0);
+        shade = 0.45 + 0.55 * diff + 0.35 * spec;
+        shade *= 0.82 + 0.36 * v_rand;      // 가닥별 밝기 변주 (뭉침 방지)
+    } else {
+        float nl = abs(dot(v_nrm, Ld));
+        shade = 0.55 + 0.45 * nl;
+    }
     vec3 c = u_base * t.rgb * shade;
     // 패스 0 은 컷아웃이라 완전 불투명으로 쓴다(블렌드 없음). 패스 1 은 SRC_ALPHA 블렌드가
-    // 프리멀티플라이드로 누적하므로 스트레이트 색을 낸다. 어느 쪽이든 최종 색/알파 관계는
-    // 프리멀티플라이드라 렌더 뒤 알파로 나누면 된다.
-    f_color = (u_pass == 0) ? vec4(c, 1.0) : vec4(c, a);
+    // 프리멀티플라이드로 누적하므로 스트레이트 색을 낸다. 패스 3(A2C)은 커버리지가 알파를 나른다.
+    // 패스 3 은 샘플 마스크가 알파를 나르므로 알파 1 로 쓴다(리졸브 = 커버리지).
+    f_color = (u_pass == 0 || u_pass == 3) ? vec4(c, 1.0) : vec4(c, a);
 }
 """
 
@@ -130,6 +178,7 @@ class Groom:
         self.tex = None
         self.base = (0.23, 0.14, 0.09)
         self.n_tris = 0
+        self.billboard = False   # v1 GLB (_center/_tangent/_side/_halfw 속성) 이면 True
 
 
 class GroomRenderer:
@@ -141,6 +190,7 @@ class GroomRenderer:
         self._fbo_ms = None      # (w,h) 별 MSAA 프레임버퍼
         self._fbo = None         # 리졸브 대상
         self._fbo_size = None
+        self._samples = 8
         self._grooms: dict[str, Groom] = {}
         self.last_ms = 0.0
 
@@ -152,7 +202,7 @@ class GroomRenderer:
             return
         import moderngl
         t0 = time.perf_counter()
-        self._ctx = moderngl.create_standalone_context()
+        self._ctx = moderngl.create_standalone_context(require=400)   # gl_SampleMask
         self._thread = threading.get_ident()
         self._prog = self._ctx.program(vertex_shader=_VS, fragment_shader=_FS)
         logger.info("moderngl 컨텍스트: %s (%.0fms)", self._ctx.info.get("GL_RENDERER"),
@@ -165,9 +215,12 @@ class GroomRenderer:
         for f in (self._fbo_ms, self._fbo):
             if f is not None:
                 f.release()
+        # 8x: 알파-투-커버리지가 알파를 8단계로 디더링한다 (4x 면 4단계라 결이 거칠다)
+        ns = min(8, ctx.max_samples)
+        self._samples = ns
         self._fbo_ms = ctx.framebuffer(
-            color_attachments=[ctx.renderbuffer((w, h), components=4, samples=4)],
-            depth_attachment=ctx.depth_renderbuffer((w, h), samples=4))
+            color_attachments=[ctx.renderbuffer((w, h), components=4, samples=ns)],
+            depth_attachment=ctx.depth_renderbuffer((w, h), samples=ns))
         self._fbo = ctx.framebuffer(color_attachments=[ctx.texture((w, h), components=4)])
         self._fbo_size = (w, h)
 
@@ -205,9 +258,27 @@ class GroomRenderer:
                 strands = v.reshape(-1, P, 2, 3)
                 r0 = strands[:, 0, :, :].mean(axis=1)                       # (N,3) 뿌리(좌우 평균)
                 root = np.repeat(r0, P * 2, axis=0).astype(np.float32)
-            vbo = ctx.buffer(np.hstack([v, uv, n, root]).astype(np.float32).tobytes())
+            va = getattr(geom, "vertex_attributes", {}) or {}
+            has_bb = all(k in va for k in ("_center", "_tangent", "_side", "_halfw")) and gname != "head_occluder"
+            if has_bb:
+                center = trimesh.transform_points(np.asarray(va["_center"], np.float32), T).astype(np.float32)
+                tangent = (np.asarray(va["_tangent"], np.float32) @ T[:3, :3].T).astype(np.float32)
+                side = np.asarray(va["_side"], np.float32).reshape(-1, 1)
+                halfw = np.asarray(va["_halfw"], np.float32).reshape(-1, 1)
+                rand = np.asarray(va.get("_rand", np.zeros(len(v))), np.float32).reshape(-1, 1)
+                if P > 0 and len(v) % (P * 2) == 0:
+                    # 뿌리는 중심선 기준으로 (구운 POSITION 은 폭 오프셋이 들어 있다)
+                    r0 = center.reshape(-1, P, 2, 3)[:, 0, :, :].mean(axis=1)
+                    root = np.repeat(r0, P * 2, axis=0).astype(np.float32)
+                g.billboard = True
+            else:
+                center = v; tangent = n
+                side = np.zeros((len(v), 1), np.float32); halfw = side; rand = side
+            vbo = ctx.buffer(np.hstack([v, uv, n, root, center, tangent, side, rand, halfw]).astype(np.float32).tobytes())
             ibo = ctx.buffer(faces.tobytes())
-            vao = ctx.vertex_array(self._prog, [(vbo, "3f 2f 3f 3f", "in_pos", "in_uv", "in_nrm", "in_root")], ibo)
+            vao = ctx.vertex_array(self._prog, [(vbo, "3f 2f 3f 3f 3f 3f 1f 1f 1f",
+                                                 "in_pos", "in_uv", "in_nrm", "in_root",
+                                                 "in_center", "in_tangent", "in_side", "in_rand", "in_halfw")], ibo)
             if gname == "head_occluder":
                 g.occ_vao = vao
                 continue
@@ -275,8 +346,11 @@ class GroomRenderer:
         except np.linalg.LinAlgError:
             pass
 
-        prog["u_mvp"].write(np.ascontiguousarray(mvp.T).tobytes())   # column-major
+        prog["u_proj"].write(np.ascontiguousarray(proj.T).tobytes())     # column-major
+        prog["u_model"].write(np.ascontiguousarray(model.T).tobytes())
         prog["u_nrm"].write(np.ascontiguousarray(nrm.T.astype(np.float32)).tobytes())
+        prog["u_billboard"].value = 1 if groom.billboard else 0
+        prog["u_scale"].value = float(scale_mul)
         prog["u_light"].value = (0.3, 0.8, 1.0)
         # 2차 운동 (hair_dynamics.HairDynamics.step 의 결과). 없으면 강체.
         if dyn is not None:
@@ -310,26 +384,36 @@ class GroomRenderer:
             prog["u_pass"].value = 2
             groom.occ_vao.render()
             fbo.color_mask = (True, True, True, True)
-        # 1) 불투명 컷아웃
-        ctx.disable(moderngl.BLEND)
-        ctx.depth_mask = True
-        prog["u_pass"].value = 0
-        groom.hair_vao.render()
-        # 2) 반투명 가장자리 (깊이 읽기만). 색은 프리멀티플라이드로 누적, 알파는 커버리지.
-        ctx.enable(moderngl.BLEND)
-        ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA,
-                          moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-        ctx.depth_mask = False
-        prog["u_pass"].value = 1
-        groom.hair_vao.render()
-        ctx.depth_mask = True
-        ctx.disable(moderngl.BLEND)
+        if groom.billboard:
+            # v1: 알파-투-커버리지 단일 패스. 알파가 MSAA 샘플 커버리지로 바뀌어 깊이 쓰기와
+            # 함께 순서 무관하게 반투명 가닥이 겹친다(정렬 불필요, 2패스 불필요). 리졸브 결과는
+            # 색이 커버리지로 프리멀티플라이드된 것 -> 아래에서 알파로 나눈다.
+            ctx.disable(moderngl.BLEND)
+            ctx.depth_mask = True
+            prog["u_pass"].value = 3
+            prog["u_samples"].value = int(self._samples)
+            groom.hair_vao.render()
+        else:
+            # v0: 1) 불투명 컷아웃
+            ctx.disable(moderngl.BLEND)
+            ctx.depth_mask = True
+            prog["u_pass"].value = 0
+            groom.hair_vao.render()
+            # 2) 반투명 가장자리 (깊이 읽기만). 색은 프리멀티플라이드로 누적, 알파는 커버리지.
+            ctx.enable(moderngl.BLEND)
+            ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA,
+                              moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+            ctx.depth_mask = False
+            prog["u_pass"].value = 1
+            groom.hair_vao.render()
+            ctx.depth_mask = True
+            ctx.disable(moderngl.BLEND)
 
         ctx.copy_framebuffer(self._fbo, fbo)                  # MSAA 리졸브
         raw = self._fbo.read(components=4, dtype="f1")         # RGBA8, 0행 = 이미지 0행 (투영 y 반전)
         t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(h, w, 4).to(
             self.device, non_blocking=True).float()
-        # 컷아웃은 알파 1, 가장자리는 SRC_ALPHA 로 프리멀티플라이드 누적 -> 알파로 나눠 되돌린다
+        # 컷아웃/A2C 는 커버리지, 가장자리는 SRC_ALPHA 누적 -> 어느 쪽이든 프리멀티플라이드라 알파로 나눈다
         a = t[:, :, 3:4] / 255.0
         rgb = t[:, :, :3] / a.clamp(min=1e-3)
         rgb = rgb[:, :, [2, 1, 0]].clamp(0.0, 255.0)          # 합성 코드는 BGR

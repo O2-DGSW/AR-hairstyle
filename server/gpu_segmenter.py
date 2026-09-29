@@ -138,6 +138,8 @@ class GpuFaceParser:
         self._lum_w = torch.tensor([0.114, 0.587, 0.299], device=self.device)   # BGR 휘도
         self._blender = None    # 증류 블렌더 (load_blender 로 주입)
         self._cgrid = None      # 크롭 좌표 그리드 캐시
+        self.last_cls = None    # 마지막 프레임의 클래스맵 (GPU uint8) - 이마 갱신이 재사용
+        self.last_cls_frame = None
         self._groom = None      # GroomRenderer (3D 헤어카드). 처음 쓸 때 gpu_executor 스레드에서 생성.
         self._hair_color = None # 사용자 머리 평균색 (BGR 텐서, EMA). 그룸 색 맞춤용.
         self._hair_std = None   # 사용자 머리 휘도 표준편차 (EMA). 대비 맞춤용.
@@ -707,7 +709,8 @@ class GpuFaceParser:
                 asset=None, scale_mul: float = 1.0, offset_up: float = 0.0, pose=None,
                 harmonize: bool = True, shadow: float = 0.35,
                 blend: float = 1.0, asset2=None, mix: float = 0.0,
-                smoother=None, groom=None, groom_fit=None, groom_color=None, groom_dyn=None):
+                smoother=None, groom=None, groom_fit=None, groom_color=None, groom_dyn=None,
+                pose_future=None, dyn=None):
         """BGR 프레임 -> (합성된 BGR 프레임, 타이밍/상태 dict).
 
         groom: {"name","path","meta"} 3D 헤어카드 GLB. 주어지면 tryon 에서 2D 에셋
@@ -715,6 +718,11 @@ class GpuFaceParser:
         groom_fit: (scale_mul, up_cm, fwd_cm) 세션 보정. json 의 user_fit 위에 곱/더한다.
         groom_color: (b,g,r) 0~255 또는 None. None 이면 사용자 머리색에 맞춘다.
         groom_dyn: hair_dynamics.HairDynamics.step() 결과(2차 운동 유니폼). None 이면 강체.
+        pose_future: **이 프레임**의 랜드마커 concurrent.futures.Future. 주어지면 앵커가 필요한
+               시점(추론이 GPU 에서 도는 동안)에 짧게 기다려 그 결과를 pose 대신 쓴다.
+               제때 안 끝나면 넘어온 pose(직전 프레임)로 간다. 이걸 안 하면 헤어가 항상
+               한 프레임(33ms) 전 위치에 그려져 빠르게 움직일 때 뒤따라온다.
+        dyn: (hair_dynamics, amount) - pose_future 를 쓸 때 스프링도 여기서 그 포즈로 굴린다.
 
         mode:
           raw    - 원본 그대로 (기본). 플레이트는 계속 쌓는다.
@@ -776,6 +784,10 @@ class GpuFaceParser:
 
         frame_f = frame_t.float()
         hair = hair_a > 0.5
+        # 이마 갱신(build_forehead)이 파싱을 다시 돌리지 않도록 이 프레임의 클래스맵을 남긴다
+        # (GPU uint8, 0.05ms). 프레임과 짝을 맞추기 위해 원본도 같이 참조만 둔다.
+        self.last_cls = cls.to(torch.uint8)
+        self.last_cls_frame = frame_bgr
 
         if plate is not None:
             # 플레이트에는 **배경만** 기록한다.
@@ -805,6 +817,24 @@ class GpuFaceParser:
         # 눈 앵커. remove/tryon 둘 다 필요하다 - tryon 은 헤어 정합에, remove 는
         # 얼굴 영역을 알아야 거기에 플레이트를 안 쓸 수 있기 때문.
         # (파서는 세션 공용 싱글턴이므로 인스턴스에 담지 않고 지역 변수로 다룬다)
+        # 이 프레임의 포즈. 위의 전처리/추론 런치(비동기) 동안 랜드마커가 다른 스레드에서
+        # 돌았으므로 여기서 기다리는 시간은 대부분 GPU 추론과 겹친다(실측 포즈 7.9ms, 추론 6ms).
+        pose_ms = 0.0
+        if pose_future is not None and mode in ("remove", "tryon"):
+            t_p = time.perf_counter()
+            try:
+                fresh = pose_future.result(timeout=CONFIG.pose_wait_s)
+                if fresh is not None:
+                    pose = fresh
+            except Exception:
+                pass                                   # 타임아웃/실패: 직전 포즈로
+            pose_ms = (time.perf_counter() - t_p) * 1000
+            if dyn is not None and pose is not None and pose.get("matrix") is not None:
+                hd, amount, dt = dyn
+                if amount > 0:
+                    groom_dyn = hd.step(pose["matrix"], dt)
+                    groom_dyn["tip"] = amount
+                    groom_dyn["idle"] = groom_dyn["idle"] * amount
         anchor_src = None
         harmonized = False
         blended = False
@@ -885,6 +915,13 @@ class GpuFaceParser:
                         return r_, al_
                     face_rgb, face_a = _face_patch(asset)
                     harmonized = face_rgb is not None and harmonize and asset.ref_skin is not None
+                    # 닮음변환 패치는 큰 yaw 에서 어긋난다(얼굴은 평면이 아니다). 25°→50° 로 서서히 빼면
+                    # 그 자리는 플레이트/피부 평면이 잇는다 - 옆모습에선 이마가 거의 안 보여 티가 안 난다.
+                    if face_a is not None and pose is not None:
+                        yf = 1.0 - min(1.0, max(0.0, (abs(float(pose.get("yaw", 0.0))) - CONFIG.face_patch_yaw_lo)
+                                                  / max(1e-3, CONFIG.face_patch_yaw_hi - CONFIG.face_patch_yaw_lo)))
+                        if yf < 1.0:
+                            face_a = face_a * yf
                     # 주기 갱신 직후: 이전 패치(asset2)와 크로스페이드. 같은 앵커로 워핑되므로
                     # 겹침 없이 섞인다. 프리멀티플라이드로 섞어야 경계가 어두워지지 않는다.
                     if (face_rgb is not None and asset2 is not None and mix > 0.001
@@ -1187,6 +1224,8 @@ class GpuFaceParser:
             "harmonized": harmonized,
             "blended": blended,
             "groom_ms": groom_ms if mode in ("remove", "tryon") else 0.0,
+            "pose_ms": pose_ms,
+            "pose": pose,
         }
 
     # ---- 3D 그룸 ----
@@ -1290,9 +1329,14 @@ class GpuFaceParser:
             lum = (out * self._lum_w).sum(-1, keepdim=True)
             lmean = (lum * new_a).sum() / asum
             rstd = (((lum - lmean) ** 2 * new_a).sum() / asum).sqrt()
-            k = (self._hair_std / rstd.clamp(min=1.0)).clamp(0.5, 3.0)
+            # 배율 상한을 낮게 둔다. 3.0 까지 허용했더니 목표가 밝은 회색(뿌연 조명)일 때 어두운 결이
+            # 0 아래로 눌려 가닥 뭉치가 새까맣게 나왔다(실측). v1 그룸은 가닥별 변주로 대비가 이미 있다.
+            k = (self._hair_std / rstd.clamp(min=1.0)).clamp(CONFIG.groom_contrast_min, CONFIG.groom_contrast_max)
             k = 1.0 + (k - 1.0) * CONFIG.groom_contrast_match
-            out = target.view(1, 1, 3) + (out - target.view(1, 1, 3)) * k
+            # 곱셈(로그) 영역에서 늘린다: target·(x/target)^k. 선형(target + (x-target)·k)은 목표가
+            # 밝을 때 어두운 결이 음수 -> 0 으로 눌려 가닥 뭉치가 새까맣게 됐다(실측).
+            tv = target.view(1, 1, 3).clamp(min=1.0)
+            out = tv * torch.pow((out / tv).clamp(min=1e-3), k)
         return out.clamp(0.0, 255.0)
 
     def close(self):

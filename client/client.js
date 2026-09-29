@@ -757,12 +757,11 @@ async function start() {
   setStatus("웹캠 요청 중...");
 
   try {
-    const [capW, capH] = (el("capres").value || "1280x720").split("x").map(Number);
+    const [capW, capH] = (el("capres").value || "640x480").split("x").map(Number);
     localStream = await navigator.mediaDevices.getUserMedia({
-      // GAN 입력 화질은 여기서 결정된다. 640x480 이면 얼굴 크롭이 ~312px 인데
-      // HairFastGAN 은 1024px 로 정렬하므로 3배 넘게 늘려 넣게 되어 뭉갠다.
-      // 720p 면 실제 디테일이 2배가 된다. 대신 업링크 대역폭이 늘어나므로
-      // 연결이 불안정하면 640x480 으로 내리면 된다.
+      // 기본 640x480. 720p 는 GAN 입력 화질(1024 정렬) 때문에 올렸던 값인데 3D 경로엔
+      // 필요 없고, 서버 합성 비용이 픽셀 수에 비례해 720p 에서는 처리 합계가 30ms 를 넘어
+      // 실시간이 깨진다(실측 640x480 20ms, 720p 23~40ms). 화질이 더 필요하면 드롭다운.
       video: { width: capW, height: capH, frameRate: { ideal: 30 } },
       audio: false,
     });

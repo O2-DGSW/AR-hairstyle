@@ -192,6 +192,9 @@ class Config:
     #: 감추는 게 아니라 **읽지 않는다.** 목록에서만 빼면 /references 와
     #: stats.assets 중 한쪽에 남기 쉽다. 아예 안 읽으면 양쪽에서 동시에 사라지고
     #: fit {asset:...} 도 자연히 안 먹는다.
+    #: 이 프레임의 랜드마커 결과를 기다리는 상한(초). 넘기면 직전 프레임 포즈로 그린다.
+    #: 포즈 7.9ms(p95 10.7) 가 GPU 추론과 겹치므로 보통 수 ms 만 실제로 기다린다.
+    pose_wait_s: float = 0.025
     #: 진단용으로 되살리려면 HEDDY_SERVE_STATIC_ASSETS=1.
     serve_static_assets: bool = False
 
@@ -200,17 +203,25 @@ class Config:
     groom_color_alpha: float = 0.2
     #: 이보다 머리 픽셀이 적으면(모자/삭발) 색을 맞추지 않고 GLB 색을 쓴다.
     groom_color_min_px: int = 400
-    #: 리본 가장자리 페더 폭 (눈 간격 배수). 0 이면 MSAA 만.
-    groom_feather: float = 0.04
+    #: 리본 가장자리 페더 폭 (눈 간격 배수). v1 그룸(가는 결 + 8x MSAA 확률적 투명도)은 페더가
+    #: 결을 뭉개므로 0. v0 굵은 리본에서만 0.04 가 유효했다.
+    groom_feather: float = 0.0
     #: 머리색 샘플링을 허용하는 포즈 범위(도). 벗어나면 이전 값 유지(파서가 피부를 머리로 찍는다).
     groom_color_max_yaw: float = 25.0
     groom_color_max_pitch: float = 20.0
-    #: 휘도 대비(표준편차) 맞춤 세기. 0=평균색만, 1=완전 일치.
-    groom_contrast_match: float = 0.8
+    #: 휘도 대비(표준편차) 맞춤 세기. 0=평균색만, 1=완전 일치. 배율은 [min,max] 로 제한.
+    #: 기본 0: v1 그룸(가닥별 변주 + 이방성 하이라이트)은 자체 대비가 충분하고, 1.5배만 늘려도
+    #: 어두운 결 뭉치가 근검정 얼룩이 됐다(실측). v0 굵은 리본에서만 유효했던 보정.
+    groom_contrast_match: float = 0.0
+    groom_contrast_min: float = 0.6
+    groom_contrast_max: float = 1.5
+    #: 이마 패치 알파를 |yaw| 에 따라 빼는 구간(도): lo 이하 1, hi 이상 0.
+    face_patch_yaw_lo: float = 25.0
+    face_patch_yaw_hi: float = 50.0
     #: 맨이마 패치(forehead.py) 주기 갱신 간격(초). 0 이면 선택/수동 때만. 조명·표정 변화를 따라간다.
     #: 인페인트(LaMa ~45ms)는 별도 스레드/스트림이지만 GPU 경합+GIL 로 그 순간 프레임 하나가
     #: 40~50ms 로 튄다(실측). 2초에 한 프레임이면 체감이 안 되는 수준. 더 줄이려면 별도 프로세스.
-    forehead_refresh_s: float = 2.0
+    forehead_refresh_s: float = 3.0
     #: 이 각도(|yaw|, 도) 안일 때만 갱신 - 돌린 얼굴은 인페인트 문맥이 나쁘다.
     forehead_refresh_yaw: float = 15.0
     #: 새 패치로 바꿀 때 이전 패치와 섞는 시간(초). 툭 바뀌면 이마가 깜빡인다.

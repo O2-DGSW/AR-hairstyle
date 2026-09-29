@@ -574,9 +574,13 @@ class SegmentedVideoTrack(VideoStreamTrack):
                 logger.exception("랜드마커 실패")
             st.pose_future = None
         # 아직 안 끝났으면 새로 던지지 않는다(자연스러운 백프레셔).
+        # concurrent Future 로 던진다 - gpu_executor 스레드의 seg.process 가 앵커가 필요한
+        # 시점에 .result(timeout) 으로 **이 프레임의** 포즈를 받아 쓰기 위해서다(asyncio Future
+        # 는 다른 스레드에서 못 기다린다). 예전엔 항상 직전 프레임 포즈로 그려 한 프레임 뒤처졌다.
+        pose_cf = None
         if st.pose_future is None:
-            st.pose_future = loop.run_in_executor(app.pose_executor,
-                                                  self._pose_rgb, img)
+            pose_cf = app.pose_executor.submit(self._pose_rgb, img)
+            st.pose_future = asyncio.wrap_future(pose_cf, loop=loop)
         pose = self._last_pose
 
         # 다각도 뱅크: 측정된 yaw 에 가장 가까운 각도의 에셋으로 바꾼다.
@@ -635,17 +639,14 @@ class SegmentedVideoTrack(VideoStreamTrack):
             # 그룸은 상하 슬라이더(px)를 cm 로 환산해 쓴다: 눈 간격 ~50px ≈ 6.3cm 이므로 10px ≈ 1.2cm.
             groom_fit = (st.scale_mul, st.offset_up * 0.12, st.groom_fwd_cm)
             groom_dyn = None
+            dyn_dt = None
             if st.groom_obj is not None:
                 # 그룸 경로에서 asset 은 이마 패치(.face) 로만 쓰인다 - 2D 헤어/뱅크는 무시.
                 asset = st.registry.get(st.forehead_name) if st.forehead_name else None
                 asset2, mix = None, 0.0
                 now_m = time.monotonic()
-                # 2차 운동: 이 프레임의 포즈로 스프링을 한 스텝 굴린다 (실제 경과 시간 사용).
-                if pose is not None and pose.get("matrix") is not None and st.dyn_amount > 0:
-                    dt = 1 / 30 if st.dyn_last_t is None else now_m - st.dyn_last_t
-                    groom_dyn = st.hair_dyn.step(pose["matrix"], dt)
-                    groom_dyn["tip"] = st.dyn_amount
-                    groom_dyn["idle"] = groom_dyn["idle"] * st.dyn_amount
+                # 2차 운동은 seg.process 안에서 이 프레임의 포즈가 확정된 뒤 굴린다(dyn 인자).
+                dyn_dt = 1 / 30 if st.dyn_last_t is None else now_m - st.dyn_last_t
                 st.dyn_last_t = now_m
                 # 방금 갱신됐으면 이전 패치와 크로스페이드 (둘 다 같은 앵커로 워핑되므로 겹침 없음)
                 if st.forehead_prev is not None:
@@ -668,11 +669,17 @@ class SegmentedVideoTrack(VideoStreamTrack):
                 app.gpu_executor, seg.process, img, st.plate, st.mode,
                 asset, st.scale_mul, st.offset_up, pose, st.harmonize, st.shadow,
                 st.blend, asset2, mix, st.smoother,
-                st.groom_obj, groom_fit, st.groom_color, groom_dyn)
+                st.groom_obj, groom_fit, st.groom_color, groom_dyn,
+                pose_cf, (st.hair_dyn, st.dyn_amount, dyn_dt) if dyn_dt is not None else None)
         finally:
             st.inflight -= 1
             app.gpu_inflight -= 1
         exec_ms = (time.perf_counter() - t_exec0) * 1000
+        if timings.get("pose") is not None:
+            pose = timings["pose"]
+            self._last_pose = pose
+            if st.pose_future is not None and st.pose_future.done():
+                st.pose_future = None
 
         app.metrics.process.observe(exec_ms / 1000.0)
         app.metrics.infer.observe(float(timings["infer_ms"]) / 1000.0)
@@ -709,6 +716,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
                     "asset_used": ("3D " + st.groom) if st.groom_obj else _asset_label(asset, asset2, mix),
                     "groom": st.groom,
                     "groom_ms": round(timings.get("groom_ms", 0.0), 2),
+                    "pose_ms": round(timings.get("pose_ms", 0.0), 1),
                     "yaw_ema": round(self._yaw_ema, 1) if self._yaw_ema is not None else None,
                     "references": list(app.references.keys()),
                     "gan_loaded": app.gan.loaded if app.gan else False,
@@ -1725,13 +1733,29 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         return
     state.forehead_building = True
     try:
-        frame = state.last_raw.copy()
         seg = await app.get_segmenter()
         loop = asyncio.get_event_loop()
-        cls = await loop.run_in_executor(app.gpu_executor, seg.class_map, frame)
+        # 실시간 경로를 건드리지 않는다: 파싱은 프레임 루프가 방금 계산한 클래스맵을 재사용하고
+        # (gpu_executor 에 6ms 작업을 끼워 넣지 않음), 랜드마크는 forehead_executor 에서 IMAGE
+        # 모드로 - pose_executor 를 쓰면 그 사이 프레임의 포즈 대기가 25ms 까지 늘어난다.
         from face_pose import landmarks_image
-        lm = await loop.run_in_executor(app.pose_executor, landmarks_image,
-                                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        def _parse_and_landmarks(frame, cls_t):
+            frame = frame.copy()
+            cls = cls_t.cpu().numpy() if cls_t is not None else seg.class_map(frame)
+            return frame, cls, landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        # 세그멘터는 세션 공용이라 마지막 클래스맵이 **이 세션의** 프레임인지 확인한다(객체 동일성).
+        # 다른 세션 프레임이면 파싱을 다시 한다(gpu_executor - 드문 경우라 비용 무시).
+        frame = state.last_raw
+        cls_t = seg.last_cls if seg.last_cls_frame is frame else None
+        if cls_t is None:
+            cls_np = await loop.run_in_executor(app.gpu_executor, seg.class_map, frame)
+            frame, cls, lm = await loop.run_in_executor(
+                app.forehead_executor, lambda: (frame.copy(), cls_np,
+                                                landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))))
+        else:
+            frame, cls, lm = await loop.run_in_executor(app.forehead_executor, _parse_and_landmarks, frame, cls_t)
         if lm is None:
             notify_peer(state, {"type": "forehead", "status": "error", "message": "얼굴을 찾지 못했습니다"})
             return
@@ -2234,7 +2258,12 @@ async def offer(request):
     def on_track(track):
         logger.info("track received: %s", track.kind)
         if track.kind == "video":
-            pc.addTrack(SegmentedVideoTrack(app.relay.subscribe(track), state))
+            # buffered=False: 릴레이가 최신 프레임 하나만 들고 있고 밀린 프레임은 버린다.
+            # 기본(True)은 무제한 asyncio.Queue 라, 처리 속도가 도착 속도보다 조금만 느려도
+            # (고개 돌릴 때 포즈 재검출, 3초마다 이마 갱신 스파이크) 밀린 프레임이 쌓이고 그걸
+            # 순서대로 다 처리하느라 **지연이 계속 자랐다** - "처음엔 실시간이다가 점점 늦어짐".
+            # recv() 의 inflight 드롭은 루프가 직렬이라 이 경우를 못 잡는다(항상 0).
+            pc.addTrack(SegmentedVideoTrack(app.relay.subscribe(track, buffered=False), state))
 
         @track.on("ended")
         async def on_ended():

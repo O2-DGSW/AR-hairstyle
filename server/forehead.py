@@ -38,11 +38,17 @@ logger = logging.getLogger("forehead")
 
 #: 얼굴 zone 타원 (눈 간격 배수). gpu_segmenter._face_zone 과 맞춘다.
 ZONE_UP, ZONE_DOWN, ZONE_SIDE = 2.35, 1.6, 1.5
+#: 인페인트/패치는 눈 위 이 높이(눈 간격 배수)까지만 - 이마+헤어라인. 그 위(정수리)는 3D 헤어가 덮고,
+#: 거기까지 채우면 LaMa 가 배경/머리색으로 메운 어두운 영역이 고개 돌릴 때 헤어 밖으로 삐져나와
+#: 검은 덩어리가 된다(실측). 원래 머리가 그 위에 남으면 런타임 플레이트/피부 평면이 처리한다.
+BAND_UP = 1.4
 #: 인페인터 입력 크롭: 눈 간격의 몇 배를 한 변으로 (얼굴 전체가 문맥으로 들어가야 색/음영이 맞는다).
 CROP_EYES = 7.0
 CROP_PX = 512
-#: 얼굴 패치로 쓰는 파싱 클래스 범위 (asset_extract 와 동일: 피부~아랫입술).
-FACE_CLS_MIN, FACE_CLS_MAX = 1, 12
+#: 얼굴 패치로 쓰는 파싱 클래스: 피부(1), 눈썹(2,3), 코(10). asset_extract 는 1~12 전부를 썼는데
+#: 거기엔 안경(6)·귀(7,8,9)·눈(4,5)이 들어간다. 정면에서 구워진 안경테/귀가 고개를 돌리면 닮음변환으로
+#: 엉뚱한 자리에 찍혀 검은 덩어리가 됐다(실측). 이마 채움엔 피부와 눈썹이면 충분하다.
+FACE_CLS = (1, 2, 3, 10)
 
 
 def zone_mask(eye_l, eye_r, h, w):
@@ -107,7 +113,11 @@ def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cl
     d = float(np.linalg.norm(eye_r - eye_l))
     c = (eye_l + eye_r) / 2.0
     zone = zone_mask(eye_l, eye_r, h, w)
-    bangs = ((cls == CLS_HAIR) & zone).astype(np.uint8) * 255
+    ys = np.arange(h, dtype=np.float32)[:, None]
+    # 이마 띠: 눈선(+0.15d 여유) 부터 눈 위 BAND_UP·d 까지. 그 아래(눈·안경·볼·입)는 원래 머리가 덮지
+    # 않는 자리라 채울 이유가 없고, 넣으면 정면 얼굴이 통째로 구워져 고개 돌릴 때 덧씌워진다(실측).
+    band = (ys > c[1] - BAND_UP * d) & (ys < c[1] + 0.15 * d)
+    bangs = ((cls == CLS_HAIR) & zone & band).astype(np.uint8) * 255
     if dilate > 1:
         bangs = cv2.dilate(bangs, np.ones((dilate, dilate), np.uint8))
     bangs_px = int((bangs > 0).sum())
@@ -132,7 +142,7 @@ def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cl
         bald[y0:y0 + S, x0:x0 + S] = crop_out
 
     # 얼굴 패치 = 원래 얼굴 부위 ∪ 방금 채운 자리. asset_extract 와 같은 규칙, 같은 눈 앵커.
-    face_mask = (((cls >= FACE_CLS_MIN) & (cls <= FACE_CLS_MAX)) | (bangs > 0)).astype(np.uint8)
+    face_mask = ((np.isin(cls, FACE_CLS) & band) | (bangs > 0)).astype(np.uint8)
     ref_skin = hair_asset.skin_mean(bald, cls == 1)
     asset, _, px = hair_asset.build_from_photo(bald, face_mask, eye_l, eye_r, name, ref_skin=ref_skin)
     if asset is None:
