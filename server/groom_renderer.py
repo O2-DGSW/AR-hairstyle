@@ -151,6 +151,49 @@ void main() {
 """
 
 
+# 두상 좌표 맵: 오클루더(FLAME 두상) 앞면의 정규 좌표(cm) 를 8비트로 인코딩해 그린다.
+# 합성 쪽이 픽셀마다 "두피/옆머리/목" 을 가려 지운 원래 머리 자리를 무엇으로 채울지 정한다.
+_HEAD_VS = """
+#version 400
+uniform mat4 u_mvp;
+in vec3 in_pos; in float in_scalp;
+out vec3 v_c; out float v_scalp;
+void main() { v_c = in_pos; v_scalp = in_scalp; gl_Position = u_mvp * vec4(in_pos, 1.0); }
+"""
+_HEAD_FS = """
+#version 400
+in vec3 v_c; in float v_scalp;
+layout(location = 0) out vec4 f_color;
+layout(location = 1) out vec4 f_pos;
+layout(location = 2) out vec4 f_nrm;
+void main() {
+    // R: 두피 가중(이 스타일의 뿌리가 나는 자리 1), G: y -> (y+25)/45, B: z -> (z+20)/30, A: 1 = 두상 위
+    f_color = vec4(v_scalp, (v_c.y + 25.0) / 45.0, (v_c.z + 20.0) / 30.0, 1.0);
+    // 정규 좌표(cm, float16) 와 면 노멀 - 다른 순간에 찍은 사진을 이 표면에 투영 텍스처로 붙이는 데 쓴다
+    f_pos = vec4(v_c, 1.0);
+    vec3 n = normalize(cross(dFdx(v_c), dFdy(v_c)));
+    f_nrm = vec4(n * 0.5 + 0.5, 1.0);
+}
+"""
+HEAD_ENC_Y = (25.0, 45.0)   # (offset, range) - 위 셰이더와 맞출 것
+HEAD_ENC_Z = (20.0, 30.0)
+#: 두피 가중: 오클루더 정점에서 가장 가까운 뿌리까지 이 거리(cm) 안이면 1, 밖으로 0 까지 선형.
+SCALP_NEAR_CM, SCALP_FAR_CM = 0.6, 1.6
+
+
+def _scalp_weight(occ_v: np.ndarray, roots: np.ndarray) -> np.ndarray:
+    """오클루더 정점마다 '이 스타일 머리가 나는 자리인가' 0~1. 뿌리 점과의 최근접 거리로."""
+    if roots is None or len(roots) == 0:
+        return np.zeros(len(occ_v), np.float32)
+    r = np.unique(np.round(roots, 1), axis=0).astype(np.float32)
+    best = np.full(len(occ_v), np.inf, np.float32)
+    for i in range(0, len(r), 2048):
+        d = ((occ_v[:, None, :] - r[None, i:i + 2048, :]) ** 2).sum(-1).min(1)
+        best = np.minimum(best, d)
+    d = np.sqrt(best)
+    return np.clip((SCALP_FAR_CM - d) / (SCALP_FAR_CM - SCALP_NEAR_CM), 0.0, 1.0).astype(np.float32)
+
+
 def _perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
     t = 1.0 / math.tan(math.radians(fov_y_deg) / 2.0)
     m = np.zeros((4, 4), np.float32)
@@ -175,6 +218,8 @@ class Groom:
         self.offset_fwd_cm = float(fit.get("offset_fwd_cm", 0.0))
         self.hair_vao = None
         self.occ_vao = None
+        self.head_vao = None     # 오클루더 + 정점별 두피 가중, 두상 좌표 맵 프로그램용
+        self.scalp_cov = 0.0
         self.tex = None
         self.base = (0.23, 0.14, 0.09)
         self.n_tris = 0
@@ -191,8 +236,14 @@ class GroomRenderer:
         self._fbo = None         # 리졸브 대상
         self._fbo_size = None
         self._samples = 8
+        self._head_prog = None
+        self._fbo_head = None    # 두상 좌표 맵 (MSAA 없음)
         self._grooms: dict[str, Groom] = {}
         self.last_ms = 0.0
+        self.last_head = None
+        self.last_geom = None    # (pos (h,w,3) cm, nrm (h,w,3)) - render(geom=True) 때만
+        self.last_fit = None
+        self.last_proj_m = None
 
     # ---- 컨텍스트 ----
     def _ensure_ctx(self):
@@ -205,6 +256,7 @@ class GroomRenderer:
         self._ctx = moderngl.create_standalone_context(require=400)   # gl_SampleMask
         self._thread = threading.get_ident()
         self._prog = self._ctx.program(vertex_shader=_VS, fragment_shader=_FS)
+        self._head_prog = self._ctx.program(vertex_shader=_HEAD_VS, fragment_shader=_HEAD_FS)
         logger.info("moderngl 컨텍스트: %s (%.0fms)", self._ctx.info.get("GL_RENDERER"),
                     (time.perf_counter() - t0) * 1000)
 
@@ -212,9 +264,10 @@ class GroomRenderer:
         if self._fbo_size == (w, h):
             return
         ctx = self._ctx
-        for f in (self._fbo_ms, self._fbo):
+        for f in (self._fbo_ms, self._fbo, self._fbo_head):
             if f is not None:
                 f.release()
+        self._fbo_head = None
         # 8x: 알파-투-커버리지가 알파를 8단계로 디더링한다 (4x 면 4단계라 결이 거칠다)
         ns = min(8, ctx.max_samples)
         self._samples = ns
@@ -222,6 +275,12 @@ class GroomRenderer:
             color_attachments=[ctx.renderbuffer((w, h), components=4, samples=ns)],
             depth_attachment=ctx.depth_renderbuffer((w, h), samples=ns))
         self._fbo = ctx.framebuffer(color_attachments=[ctx.texture((w, h), components=4)])
+        if self._fbo_head is not None:
+            self._fbo_head.release()
+        self._fbo_head = ctx.framebuffer(color_attachments=[ctx.texture((w, h), components=4),
+                                                            ctx.texture((w, h), components=4, dtype="f2"),
+                                                            ctx.texture((w, h), components=4)],
+                                         depth_attachment=ctx.depth_renderbuffer((w, h)))
         self._fbo_size = (w, h)
 
     # ---- 로딩 ----
@@ -236,6 +295,8 @@ class GroomRenderer:
         t0 = time.perf_counter()
         scene = trimesh.load(path, process=False)
         g = Groom(name, path, meta or {})
+        occ = None          # (v, faces) - 두상 좌표 맵은 뿌리를 다 모은 뒤에 만든다
+        all_roots = []
         for gname, geom in scene.geometry.items():
             T = scene.graph.get(gname)[0] if gname in scene.graph.nodes_geometry else np.eye(4)
             v = trimesh.transform_points(geom.vertices, T).astype(np.float32)
@@ -281,7 +342,10 @@ class GroomRenderer:
                                                  "in_center", "in_tangent", "in_side", "in_rand", "in_halfw")], ibo)
             if gname == "head_occluder":
                 g.occ_vao = vao
+                occ = (v, faces)
                 continue
+            if P > 0 and len(v) % (P * 2) == 0:
+                all_roots.append(root[::P * 2])
             g.hair_vao = vao
             g.n_tris += len(faces)
             mat = getattr(geom.visual, "material", None)
@@ -296,6 +360,13 @@ class GroomRenderer:
                 g.base = tuple(float(c) / 255.0 for c in np.asarray(bcf)[:3])
         if g.hair_vao is None:
             raise ValueError(f"{path}: 헤어 메시가 없다")
+        if occ is not None:
+            ov, of = occ
+            sw = _scalp_weight(ov, np.concatenate(all_roots) if all_roots else None)
+            g.scalp_cov = float(sw.mean())
+            hb = ctx.buffer(np.hstack([ov, sw[:, None]]).astype(np.float32).tobytes())
+            g.head_vao = ctx.vertex_array(self._head_prog, [(hb, "3f 1f", "in_pos", "in_scalp")],
+                                          ctx.buffer(of.tobytes()))
         if g.tex is None:
             g.tex = ctx.texture((1, 1), 4, bytes([255, 255, 255, 255]))
         self._grooms[name] = g
@@ -307,19 +378,23 @@ class GroomRenderer:
         g = self._grooms.pop(name, None)
         if g is None:
             return
-        for r in (g.hair_vao, g.occ_vao, g.tex):
+        for r in (g.hair_vao, g.occ_vao, g.head_vao, g.tex):
             if r is not None:
                 r.release()
 
     # ---- 렌더 ----
     def render(self, groom: Groom, matrix: np.ndarray, w: int, h: int,
                scale_mul: float = 1.0, offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0,
-               base_rgb=None, dyn: dict | None = None):
+               base_rgb=None, dyn: dict | None = None, head: bool = False, geom=None):
         """-> (rgb (h,w,3) BGR float 0~255, a (h,w,1) float 0~1) GPU 텐서, 또는 (None, None).
 
         matrix: MediaPipe 4x4 row-major (정규 얼굴 -> 카메라 공간, cm).
         scale/offset: 그룸 json 의 user_fit 위에 세션 슬라이더를 곱/더한 최종값.
         base_rgb: 베이스 색 (0~1 RGB). None 이면 GLB 의 색.
+        head: True 면 self.last_head 에 두상 좌표 맵 (h,w,4) GPU uint8 을 남긴다(오클루더 없으면 None).
+        geom: (head 일 때) 이미지 사각형 (x0, y0, x1, y1). 주어지면 그 안의 두상 표면 정규 좌표 cm 와
+            노멀을 self.last_geom 에 남긴다(fit 은 self.last_fit) - project_uv() 로 다른 순간 사진을
+            투영 텍스처로 붙인다. 전체 프레임을 읽으면 GL 읽기가 ~2ms 라 얼굴 둘레만 읽는다.
         """
         import moderngl
         self._ensure_ctx()
@@ -410,6 +485,34 @@ class GroomRenderer:
             ctx.disable(moderngl.BLEND)
 
         ctx.copy_framebuffer(self._fbo, fbo)                  # MSAA 리졸브
+        self.last_head = None
+        self.last_geom = None
+        if head and groom.head_vao is not None:
+            fh = self._fbo_head
+            fh.use()
+            fh.clear(0.0, 0.0, 0.0, 0.0)
+            hp = self._head_prog
+            hp["u_mvp"].write(np.ascontiguousarray(mvp.T.astype(np.float32)).tobytes())
+            groom.head_vao.render()
+            hraw = fh.read(components=4, dtype="f1")
+            self.last_head = torch.frombuffer(bytearray(hraw), dtype=torch.uint8).view(h, w, 4).to(
+                self.device, non_blocking=True)
+            if geom is not None:
+                x0, y0, x1, y1 = (int(v) for v in geom)
+                x0, y0 = max(0, x0), max(0, y0)
+                x1, y1 = min(w, x1), min(h, y1)
+                if x1 - x0 >= 4 and y1 - y0 >= 4:
+                    gw, gh = x1 - x0, y1 - y0
+                    vp = (x0, y0, gw, gh)      # 프레임버퍼 행 = 이미지 행 (투영 y 반전)
+                    praw = fh.read(viewport=vp, components=4, dtype="f2", attachment=1)
+                    nraw = fh.read(viewport=vp, components=4, dtype="f1", attachment=2)
+                    pos = torch.frombuffer(bytearray(praw), dtype=torch.float16).view(gh, gw, 4).to(
+                        self.device, non_blocking=True).float()
+                    nrm = torch.frombuffer(bytearray(nraw), dtype=torch.uint8).view(gh, gw, 4).to(
+                        self.device, non_blocking=True).float()[:, :, :3] / 127.5 - 1.0
+                    self.last_geom = (pos[:, :, :3], nrm, (x0, y0, x1, y1))
+                self.last_fit = fit
+                self.last_proj_m = proj
         raw = self._fbo.read(components=4, dtype="f1")         # RGBA8, 0행 = 이미지 0행 (투영 y 반전)
         t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(h, w, 4).to(
             self.device, non_blocking=True).float()
@@ -420,13 +523,33 @@ class GroomRenderer:
         self.last_ms = (time.perf_counter() - t0) * 1000
         return rgb, a
 
+    def project_uv(self, matrix_b):
+        """직전 render(geom=True) 의 두상 표면을, 다른 순간의 포즈 matrix_b 로 찍었을 때의 이미지 좌표.
+
+        -> (grid (gh,gw,2) grid_sample 좌표 [-1,1], facing (gh,gw) 그 순간 표면이 카메라를 향한 정도 0~1,
+        rect (x0,y0,x1,y1) 이 결과가 덮는 지금 프레임의 사각형) 또는 None.
+        투영 텍스처: 그 순간 프레임을 grid 로 샘플하면 지금 두상 위에 그대로 붙는다.
+        """
+        if self.last_geom is None:
+            return None
+        pos, nrm, rect = self.last_geom
+        mv = torch.as_tensor(np.asarray(matrix_b, np.float32).reshape(4, 4) @ self.last_fit,
+                             device=pos.device)
+        P = torch.as_tensor(self.last_proj_m, device=pos.device)
+        pc = pos @ mv[:3, :3].T + mv[:3, 3]                     # 그 순간 카메라 공간
+        clip = pc @ P[:, :3].T + P[:, 3]                         # (h,w,4)
+        grid = clip[:, :, :2] / clip[:, :, 3:4].clamp(min=1e-4)
+        nc = nrm @ mv[:3, :3].T
+        facing = (nc * (-pc)).sum(-1).abs() / (nc.norm(dim=-1) * pc.norm(dim=-1)).clamp(min=1e-4)
+        return grid, facing, rect
+
     def close(self):
         for name in list(self._grooms):
             self.evict(name)
-        for f in (self._fbo_ms, self._fbo):
+        for f in (self._fbo_ms, self._fbo, self._fbo_head):
             if f is not None:
                 f.release()
-        self._fbo_ms = self._fbo = None
+        self._fbo_ms = self._fbo = self._fbo_head = None
         if self._ctx is not None:
             self._ctx.release()
             self._ctx = None

@@ -171,6 +171,8 @@ class Config:
     #: 테두리가 남는다. 이 구간을 0~1 로 다시 펴서 확실히 지운다.
     erase_hard_lo: float = 0.25
     erase_hard_hi: float = 0.60
+    #: 얼굴 zone 안에서 눈 위 이 높이(눈 간격 배수)보다 아래는 이마 패치가 덮는 만큼만 지운다(0=끔).
+    erase_eye_keep: float = 0.35
     #: 지운 머리 자리를 채울 때 상수 살색 대신 **휘도 평면**(L=a+bx+cy)을 피팅해
     #: 그라디언트를 살린다. 실제 이마는 중앙이 밝고 관자놀이로 어두워지는데
     #: 상수로 덮으면 스티커처럼 보인다. 0 이면 예전 상수 살색.
@@ -204,6 +206,10 @@ class Config:
     #: 진단용으로 되살리려면 HEDDY_SERVE_STATIC_ASSETS=1.
     serve_static_assets: bool = False
 
+    #: 서버 시작 때 GPU 세그멘터를 미리 올린다(server.py --preload 의 기본값). 끄면 첫 연결이
+    #: 모델 적재를 기다려 그동안 화면이 검다.
+    preload: bool = True
+
     # ---------- 3D 그룸 (groom_renderer.py) ----------
     #: 그룸 색 맞춤 - 사용자 머리 평균색 EMA 계수(stats_every 프레임마다 한 번).
     groom_color_alpha: float = 0.2
@@ -221,6 +227,40 @@ class Config:
     groom_contrast_match: float = 0.0
     groom_contrast_min: float = 0.6
     groom_contrast_max: float = 1.5
+    #: 두피 베이스 레이어 불투명도(0=끔). 그룸의 오클루더(FLAME 두상) 중 이 스타일 뿌리가 나는 자리를
+    #: 헤어 아래에 헤어색(주변 가닥 색을 확산)으로 깐다. 없으면 가닥 사이/귀 위·뒤가 배경으로 뚫려
+    #: 두상이 파여 보였다(실측: 원래 머리를 지운 자리에 플레이트 배경이 나옴). 실제 헤어카드 게임도
+    #: 두피 텍스처를 깐다.
+    groom_scalp: float = 0.92
+    #: 3D 헤어 후처리(gpu_segmenter._groom_post). 몸통 채움 불투명도(0=끔): 헤어 실루엣 안의 성긴 자리
+    #: 밑에 가닥색 베이스를 깐다 - 결 사이로 배경/이마가 비치던 것. body_k 는 밀도 창(눈 간격 배수),
+    #: lohi 는 그 창 안 평균 알파가 lo 이하면 0(바깥 가는 결 유지), hi 이상이면 1.
+    groom_body: float = 0.95
+    groom_body_k: float = 0.25
+    groom_body_lohi: tuple[float, ...] = (0.30, 0.55)
+    #: 카메라 선명도 맞춤 흐림 σ(px, 눈 간격 60px 기준). 가닥 디더 노이즈(뜨개실 느낌)를 누른다. 0=끔.
+    groom_soften: float = 0.7
+    #: 라이트 랩 세기(0=끔): 헤어 가장자리에 뒤 장면 색을 섞는다.
+    groom_light_wrap: float = 0.35
+    #: 두피/몸통 베이스 밝기 배율(뿌리/안쪽 결은 가닥 그늘에 있어 더 어둡다).
+    groom_scalp_dark: float = 0.8
+    #: 두상 정규 좌표 z(cm, +앞) 가 이 값 - 2 부터 이 값까지 두피 레이어를 뺀다(앞이마 제외).
+    groom_scalp_front_cm: float = 3.0
+    #: 두상(오클루더) 안의 두피 아닌 자리(귀/옆얼굴/목덜미)에서 지운 원래 머리를 배경 대신 피부톤으로.
+    #: 플레이트는 배경만 모으므로 거기 채우면 머리 옆이 배경으로 파인다.
+    groom_head_skin: bool = True
+    #: 플레이트가 아직 못 본 자리(가만히 앉아 바로 씌움)의 원래 머리를 주변 배경 확산으로 채운다.
+    #: 없으면 그 자리는 원래 머리가 그대로 남는다. 눈 아래 이 높이(눈 간격 배수)까지만 - 어깨/옷 위는
+    #: 근거 없는 배경으로 칠하지 않는다.
+    bg_diffuse_down: float = 1.2
+    #: 3D 그룸 앞머리가 이마에 떨어뜨리는 아래쪽 그림자 세기(0=끔)와 이동/흐림 폭(눈 간격 배수).
+    groom_drop_shadow: float = 0.30
+    groom_drop_shadow_dy: float = 0.10
+    groom_drop_shadow_k: float = 0.30
+    #: 맨이마 패치를 그룸 두상 오클루더에 3D 투영해 붙인다(0 이면 예전 눈 앵커 닮음변환 + yaw 페이드).
+    forehead_3d: bool = True
+    #: 투영 경로: 패치를 찍은 순간 표면이 카메라를 향한 정도(코사인)가 lo 이하면 알파 0, hi 이상 1.
+    forehead_3d_facing: tuple[float, ...] = (0.25, 0.5)
     #: 이마 패치 알파를 |yaw| 에 따라 빼는 구간(도): lo 이하 1, hi 이상 0.
     face_patch_yaw_lo: float = 25.0
     face_patch_yaw_hi: float = 50.0

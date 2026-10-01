@@ -47,6 +47,11 @@ MOUTH_L, MOUTH_R = 61, 291
 _IMAGE_LM = None
 
 
+#: MediaPipe 눈썹 인덱스 (윗선, 아랫선), 안쪽 -> 바깥. R = 피사체 오른쪽(화면 왼쪽).
+BROW_R = ((107, 66, 105, 63, 70), (55, 65, 52, 53, 46))
+BROW_L = ((336, 296, 334, 293, 300), (285, 295, 282, 283, 276))
+
+
 def landmarks_image(frame_rgb: np.ndarray):
     """정지 이미지 1장의 눈/입꼬리. -> dict 또는 None.
 
@@ -65,6 +70,7 @@ def landmarks_image(frame_rgb: np.ndarray):
                 base_options=BaseOptions(model_asset_path=MODEL_PATH),
                 running_mode=vision.RunningMode.IMAGE,
                 num_faces=1,
+                output_facial_transformation_matrixes=True,
             ))
     res = _IMAGE_LM.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
                                     data=np.ascontiguousarray(frame_rgb)))
@@ -79,7 +85,18 @@ def landmarks_image(frame_rgb: np.ndarray):
     e0 = (px(EYE_L_OUT) + px(EYE_L_IN)) / 2.0
     e1 = (px(EYE_R_IN) + px(EYE_R_OUT)) / 2.0
     m0, m1 = px(MOUTH_L), px(MOUTH_R)
+    matrix = None
+    if res.facial_transformation_matrixes:
+        # FacePose.process 와 같은 row-major 4x4 (정규 얼굴 cm -> 카메라). 맨이마 패치를 3D 두상에
+        # 투영해 붙일 때 "만든 순간의 포즈" 로 쓴다(forehead.py).
+        matrix = np.asarray(res.facial_transformation_matrixes[0].data, np.float32).reshape(4, 4).copy()
+    # 눈썹 윗선/아랫선 (안쪽 -> 바깥, 각 5점). 앞머리에 가려진 눈썹도 메시가 추정해 준다 -
+    # 맨이마를 합성할 때 눈썹을 그려 넣는 데 쓴다(forehead.py).
+    brows = [(np.array([px(i) for i in up], np.float32), np.array([px(i) for i in lo], np.float32))
+             for up, lo in (BROW_R, BROW_L)]
     return {
+        "matrix": matrix,
+        "brows": brows,
         "eye_l": e0 if e0[0] <= e1[0] else e1,
         "eye_r": e1 if e0[0] <= e1[0] else e0,
         "mouth_l": m0 if m0[0] <= m1[0] else m1,

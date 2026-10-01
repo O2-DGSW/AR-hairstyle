@@ -707,6 +707,8 @@ async function pollRtcStats() {
  * 안 붙어 있거나. 세 경우가 화면에서 똑같이 검게 보여서, 구분하려면 매번
  * chrome://webrtc-internals 를 열어야 했다. 그 판정을 여기서 대신한다. */
 let remoteDiag = null;
+let connectedAt = 0;                 // pc 가 connected 된 시각 (performance.now)
+const REMOTE_GRACE_MS = 4000;        // 그 뒤 이만큼은 영상이 없어도 오류로 보지 않는다
 function diagnoseRemote(r, report) {
   const bytes = r.bytesReceived || 0;
   const received = r.framesReceived || 0;     // 패킷이 '프레임'으로 조립된 수
@@ -718,6 +720,20 @@ function diagnoseRemote(r, report) {
   if (r.codecId) {
     const c = report.get(r.codecId);
     if (c && c.mimeType) codec = c.mimeType;
+  }
+
+  // 연결이 아직 수립 중이면(offer 응답 대기, ICE 확인) 영상이 없는 게 정상이다. 예전에는 시작
+  // 1초 뒤부터 판정해서 매번 "track 이벤트에 스트림이 없음" 을 띄웠다 - 오류가 아니라 진행 중이다.
+  // 연결된 뒤에도 첫 프레임까지 유예를 둔다.
+  const settling = !pc || pc.connectionState !== "connected" ||
+                   (connectedAt && performance.now() - connectedAt < REMOTE_GRACE_MS);
+  if (settling && decoded === 0) {
+    if (remoteDiag !== "settling") {
+      remoteDiag = "settling";
+      setStatus(pc && pc.connectionState === "connected"
+        ? "연결됨 — 첫 영상 기다리는 중..." : "서버와 연결 중...");
+    }
+    return;
   }
 
   let verdict;
@@ -782,10 +798,16 @@ async function start() {
   statsTimer = setInterval(pollRtcStats, 1000);
 
   pc.addEventListener("track", (event) => {
-    if (event.track.kind === "video") remoteVideo.srcObject = event.streams[0];
+    if (event.track.kind !== "video") return;
+    // 서버(aiortc)가 msid 없이 트랙을 보내면 event.streams 가 비어 있다. 그때 srcObject 가 undefined
+    // 가 되어 영원히 검은 화면이었다 - 트랙으로 직접 스트림을 만든다.
+    remoteVideo.srcObject = event.streams && event.streams[0]
+      ? event.streams[0] : new MediaStream([event.track]);
+    remoteVideo.play().catch(() => {});
   });
   pc.addEventListener("connectionstatechange", () => {
-    setStatus("연결 상태: " + pc.connectionState);
+    if (pc.connectionState === "connected" && !connectedAt) connectedAt = performance.now();
+    if (pc.connectionState !== "connected") setStatus("연결 상태: " + pc.connectionState);
   });
 
   channel = pc.createDataChannel("stats");
@@ -848,6 +870,7 @@ function stop() {
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   if (pvRaf) { cancelAnimationFrame(pvRaf); pvRaf = null; }
   pvQueue.length = 0; jbPrev = null; lastRtt = 0; lastJitterBuffer = 0;
+  connectedAt = 0; remoteDiag = null;
   pvCtx.clearRect(0, 0, PV_W, PV_H);
   if (channel) { channel.close(); channel = null; }
   if (pc) { pc.close(); pc = null; }

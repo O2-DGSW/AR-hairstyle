@@ -17,6 +17,7 @@ CUDA 그래프로 실행 계획을 통째로 캡처하면 9ms대로 떨어진다
 """
 import logging
 import os
+import math
 import time
 from collections import OrderedDict
 
@@ -140,6 +141,9 @@ class GpuFaceParser:
         self._cgrid = None      # 크롭 좌표 그리드 캐시
         self.last_cls = None    # 마지막 프레임의 클래스맵 (GPU uint8) - 이마 갱신이 재사용
         self.last_cls_frame = None
+        self._bg_pp = None       # 플레이트 빈 자리 확산 캐시 (bg_diffuse_down)
+        self.keep_debug = False  # True 면 process 가 합성 마스크를 debug_maps 에 남긴다(오프라인 진단)
+        self.debug_maps = None
         self._groom = None      # GroomRenderer (3D 헤어카드). 처음 쓸 때 gpu_executor 스레드에서 생성.
         self._hair_color = None # 사용자 머리 평균색 (BGR 텐서, EMA). 그룸 색 맞춤용.
         self._hair_std = None   # 사용자 머리 휘도 표준편차 (EMA). 대비 맞춤용.
@@ -524,6 +528,28 @@ class GpuFaceParser:
         x = F.avg_pool2d(x, (k, 1), stride=1, padding=(k // 2, 0))
         return F.avg_pool2d(x, (1, k), stride=1, padding=(0, k // 2))
 
+    @staticmethod
+    def _pushpull(img, m, levels: int = 7):
+        """(1,C,h,w) 값을 가중 m (1,1,h,w) 0~1 인 곳에서 빈 곳으로 확산한다(피라미드 push-pull).
+
+        빈 자리는 가장 가까운 관측의 부드러운 외삽으로 채워지고, 관측된 자리는 원래 값 그대로다.
+        반복 확산보다 싸다(레벨 7 에 640x480 이 0.2ms 대)."""
+        F = torch.nn.functional
+        pyr = []
+        c, w_ = img * m, m
+        for _ in range(levels):
+            pyr.append((c, w_))
+            if min(c.shape[-2:]) < 4:
+                break
+            c = F.avg_pool2d(c, 2, ceil_mode=True)
+            w_ = F.avg_pool2d(w_, 2, ceil_mode=True)
+        cur = c / w_.clamp(min=1e-6)
+        for c, w_ in reversed(pyr[:-1]):
+            up = F.interpolate(cur, size=c.shape[-2:], mode="bilinear", align_corners=False)
+            k = w_.clamp(0.0, 1e-2) * 100.0          # 이 레벨에서 관측이 충분한 만큼 자기 값
+            cur = (c / w_.clamp(min=1e-6)) * k + up * (1.0 - k)
+        return cur
+
     def _frame_stats(self, frame_f, cls, eyes=None):
         """(장면 블랙레벨 휘도, 피부 노이즈 σ) - 둘 다 GPU 스칼라 텐서.
 
@@ -841,6 +867,7 @@ class GpuFaceParser:
         eyes = None
         new_rgb = new_a = None
         face_rgb = face_a = None   # GAN 이 그려 준 이마/눈썹 패치
+        head_a = scalp_a = None    # 그룸 오클루더(두상) 커버리지 / 그중 두피 (h,w) 0~1
         sigma_f = None             # 프레임 노이즈 σ (그레인 정합용, tryon 에서만)
 
         if mode in ("remove", "tryon"):
@@ -897,16 +924,44 @@ class GpuFaceParser:
                 # 3D 그룸: 그 프레임의 포즈 행렬로 직접 래스터라이즈. 평면 밖 회전이
                 # 그대로 나오므로 각도 뱅크(asset2/mix)가 필요 없다. 조명 정합(ratio/lift)
                 # 대신 아래 색 맞춤이 사용자 머리색(=그 조명 아래의 색)에 맞춘다.
-                new_rgb, new_a = self._render_groom(groom, pose["matrix"], groom_fit, h, w, groom_dyn)
+                fh3d = (CONFIG.forehead_3d and asset is not None
+                        and getattr(asset, "build_matrix", None) is not None)
+                geom_rect = None
+                if fh3d and eyes is not None:
+                    # 이마 패치가 쓰일 수 있는 곳 = 얼굴 zone 사각형(눈 위 2.35d, 옆 1.45d) + 여유
+                    d = float(np.hypot(eye_r[0] - eye_l[0], eye_r[1] - eye_l[1]))
+                    cx, cy = 0.5 * (eye_l[0] + eye_r[0]), 0.5 * (eye_l[1] + eye_r[1])
+                    geom_rect = (cx - 1.8 * d, cy - 2.6 * d, cx + 1.8 * d, cy + 1.2 * d)
+                new_rgb, new_a = self._render_groom(groom, pose["matrix"], groom_fit, h, w, groom_dyn,
+                                                    geom=geom_rect)
                 groom_ms = self._groom.last_ms if self._groom is not None else 0.0
+                hm = self._groom.last_head if (self._groom is not None and new_rgb is not None) else None
+                if hm is not None:
+                    hm = hm.float() / 255.0
+                    from groom_renderer import HEAD_ENC_Y, HEAD_ENC_Z
+                    y_cm = hm[:, :, 1] * HEAD_ENC_Y[1] - HEAD_ENC_Y[0]
+                    z_cm = hm[:, :, 2] * HEAD_ENC_Z[1] - HEAD_ENC_Z[0]
+                    # 목(턱 아래)은 뺀다: 오클루더 목은 실제 목/옷과 안 맞는다(고개만 돌리면 어긋남)
+                    head_a = hm[:, :, 3] * ((y_cm + 8.0) / 3.0).clamp(0.0, 1.0)
+                    # 두피 레이어는 정수리/옆/뒤만. 앞이마(z 큼)까지 깔면 앞머리 아래로 어두운 띠가 생겨
+                    # 헬멧처럼 보였다(실측) - 이마는 이마 패치/피부 평면이 맡는다.
+                    front = ((CONFIG.groom_scalp_front_cm - z_cm) / 2.0).clamp(0.0, 1.0)
+                    # 경계 계단을 누른다(오클루더는 MSAA 없이 그린다)
+                    hs = F.avg_pool2d(torch.stack([head_a, hm[:, :, 0] * front * head_a]).unsqueeze(0), 5,
+                                      stride=1, padding=2)[0]
+                    head_a, scalp_a = hs[0], hs[1]
                 # 이마 패치: 앞머리 있는 사람이 앞머리 없는 스타일을 입으면 지운 자리가
                 # 살색 평면으로 남아 이질적이다. 촬영(GAN, 입력에서 앞머리를 미리 걷어냄)이
                 # 재구성한 맨이마(asset.face)를 2D 경로와 똑같이 눈 앵커로 워핑해 쓴다.
                 # 헤어는 3D 지만 이마는 거의 평면이라 닮음변환으로 충분하다.
                 if asset is not None and getattr(asset, "face", None) is not None and eyes is not None:
                     def _face_patch(a_):
-                        r_, al_ = self._warp_asset(a_.face, eye_l, eye_r,
-                                                   scale_mul * a_.scale_adjust, offset_up, h, w)
+                        r_ = al_ = None
+                        if fh3d and getattr(a_, "build_matrix", None) is not None and head_a is not None:
+                            r_, al_ = self._project_patch(a_, h, w)
+                        if r_ is None:
+                            r_, al_ = self._warp_asset(a_.face, eye_l, eye_r,
+                                                       scale_mul * a_.scale_adjust, offset_up, h, w)
                         if r_ is not None and harmonize and a_.ref_skin is not None:
                             cur = self._skin_tone(frame_f, cls)
                             ref = torch.as_tensor(a_.ref_skin, device=self.device, dtype=torch.float32)
@@ -917,7 +972,7 @@ class GpuFaceParser:
                     harmonized = face_rgb is not None and harmonize and asset.ref_skin is not None
                     # 닮음변환 패치는 큰 yaw 에서 어긋난다(얼굴은 평면이 아니다). 25°→50° 로 서서히 빼면
                     # 그 자리는 플레이트/피부 평면이 잇는다 - 옆모습에선 이마가 거의 안 보여 티가 안 난다.
-                    if face_a is not None and pose is not None:
+                    if face_a is not None and pose is not None and not fh3d:
                         yf = 1.0 - min(1.0, max(0.0, (abs(float(pose.get("yaw", 0.0))) - CONFIG.face_patch_yaw_lo)
                                                   / max(1e-3, CONFIG.face_patch_yaw_hi - CONFIG.face_patch_yaw_lo)))
                         if yf < 1.0:
@@ -933,9 +988,19 @@ class GpuFaceParser:
                             tot = pa + pb
                             face_rgb = (face_rgb * pa + rgb2 * pb) / tot.clamp(min=1e-4)
                             face_a = tot
+                if new_rgb is not None and CONFIG.grain_match > 0:
+                    # 그레인 σ: 지운 자리(이마/피부/두피) 채움이 노이즈 0 이면 실제 카메라 노이즈와
+                    # 대비돼 플라스틱처럼 뜬다. 2D 경로와 같은 캐시(stats_every 프레임마다).
+                    fidx = plate.frames if plate is not None else self._stat_frame + CONFIG.stats_every
+                    if self._stat_cache is None or fidx - self._stat_frame >= CONFIG.stats_every:
+                        self._stat_cache = self._frame_stats(frame_f, cls, eyes)
+                        self._stat_frame = fidx
+                    sigma_f = self._stat_cache[1]
                 if new_rgb is not None:
                     new_rgb = self._match_hair_color(new_rgb, new_a, frame_f, hair_a,
                                                      want_stats, groom_color, pose=pose, eyes=eyes)
+                    if eyes is not None:
+                        new_rgb, new_a = self._groom_post(new_rgb, new_a, scalp_a, eye_l, eye_r)
                     if CONFIG.groom_feather > 0 and eyes is not None:
                         # 리본 가장자리 페더. MSAA 만으로는 원래 머리 경계(소프트 알파)보다
                         # 딱딱해 오려붙인 티가 난다. 눈 간격 비례 폭으로 프리멀티플라이드 블러.
@@ -946,8 +1011,11 @@ class GpuFaceParser:
                             pm = F.avg_pool2d(pm, k, stride=1, padding=k // 2)[0].permute(1, 2, 0)
                             new_a = pm[:, :, 3:4]
                             new_rgb = pm[:, :, :3] / new_a.clamp(min=1e-3)
-            elif mode == "tryon" and asset is not None and eyes is not None:
+            elif (mode == "tryon" and asset is not None and eyes is not None
+                  and getattr(asset, "face", None) is not asset):
                 # 에셋에 구워진 크기 보정까지 함께 적용한다.
+                # (맨이마 패치 에셋(.face 가 자기 자신)은 헤어가 아니다. 3D 그룸에서 얼굴을 놓친
+                #  프레임에 이 분기로 떨어지면 이마 패치를 헤어처럼 그려 검은 덩어리가 번쩍였다)
                 new_rgb, new_a = self._warp_asset(
                     asset, eye_l, eye_r,
                     scale_mul * gain * asset.scale_adjust, offset_up, h, w)
@@ -1058,6 +1126,23 @@ class GpuFaceParser:
 
             fill = plate.plate
             src_ok = plate.seen.float()
+            if eyes is not None and CONFIG.bg_diffuse_down > 0:
+                # 플레이트가 아직 못 본 자리(가만히 앉은 채 바로 씌움 = 머리 뒤 배경이 한 번도 안 드러남)
+                # 를 주변 관측 배경의 확산으로 채운다. 이게 없으면 그 자리는 원래 머리가 그대로 남았다.
+                # 눈 아래 일정 높이까지만: 어깨/옷 위를 근거 없는 배경으로 칠하지 않는다.
+                d = float(np.hypot(eyes[1][0] - eyes[0][0], eyes[1][1] - eyes[0][1]))
+                ey = 0.5 * float(eyes[0][1] + eyes[1][1])
+                ys_, _ = self._ensure_grid(h, w)
+                rows = ((ey + CONFIG.bg_diffuse_down * d - ys_) / max(1.0, 0.3 * d)).clamp(0.0, 1.0)
+                seen = plate.seen.float()
+                # 플레이트는 천천히 변한다 - 확산은 stats_every 프레임에 한 번(매 프레임 ~1.5ms)
+                if self._bg_pp is None or self._bg_pp.shape[:2] != (h, w) or want_stats:
+                    self._bg_pp = self._pushpull(plate.plate.permute(2, 0, 1).unsqueeze(0),
+                                                 seen.unsqueeze(0).unsqueeze(0))[0].permute(1, 2, 0)
+                pp = self._bg_pp
+                okd = (seen.sum() > 0).float()          # 배경을 한 픽셀도 못 봤으면 확산할 게 없다
+                fill = fill * seen.unsqueeze(-1) + pp * (1.0 - seen).unsqueeze(-1)
+                src_ok = torch.maximum(src_ok, rows * okd)
 
             if protect is not None:
                 # 보이는 눈/눈썹 위에 피부톤을 칠하지 않는다.
@@ -1132,17 +1217,42 @@ class GpuFaceParser:
                         corr = (skin_lf - face_lf) * have * CONFIG.face_lf_match
                         face_rgb = (pf + corr).squeeze(0).permute(1, 2, 0).clamp(0, 255)
                     face_fill = face_rgb * fa + tone * (1.0 - fa)
+                if CONFIG.erase_eye_keep > 0:
+                    # 눈 높이 근처에서 패치가 없는 자리는 지우지 않는다. 옆으로 내려온 앞머리가 눈/안경
+                    # 위에 걸린 자리를 평면 살색으로 칠하면 눈이 뭉개져 이중노출처럼 보였다(실측) -
+                    # 원래 머리가 조금 남는 쪽이 낫다. 눈썹 위(이마)는 그대로 지운다.
+                    d = float(np.hypot(eyes[1][0] - eyes[0][0], eyes[1][1] - eyes[0][1]))
+                    ey = 0.5 * float(eyes[0][1] + eyes[1][1])
+                    ys_, _ = self._ensure_grid(h, w)
+                    up = ((ey - CONFIG.erase_eye_keep * d - ys_) / (0.25 * d)).clamp(0.0, 1.0)
+                    have = up if face_rgb is None else torch.maximum(up, face_a.squeeze(-1))
+                    erase = erase * (1.0 - zone * (1.0 - have))
                 if sigma_f is not None and CONFIG.grain_match > 0:
                     # 그레인은 패치 유무와 무관하게 얹는다. 채운 자리가 노이즈 0
                     # 이면 실제 카메라 노이즈와 대비돼 튀는 건 평균색 폴백도 같다.
                     face_fill = face_fill + torch.randn(h, w, 1, device=self.device) * (
                         sigma_f * CONFIG.grain_match)
+                if head_a is not None and CONFIG.groom_head_skin:
+                    # 두상 안(귀/옆얼굴/목덜미)에서 지운 원래 머리는 배경이 아니라 피부다. 두피 쪽은
+                    # 위의 두피 레이어가 new_a 로 이미 덮었다. 피부톤 평면에 그레인만 얹는다.
+                    hsk = (head_a * (1.0 - zone)).unsqueeze(-1)
+                    skin_fill = tone
+                    if sigma_f is not None and CONFIG.grain_match > 0:
+                        skin_fill = skin_fill + torch.randn(h, w, 1, device=self.device) * (
+                            sigma_f * CONFIG.grain_match)
+                    fill = fill * (1.0 - hsk) + skin_fill * hsk
+                    src_ok = torch.clamp(src_ok + hsk.squeeze(-1), 0.0, 1.0)
                 fill = fill * (1.0 - zone).unsqueeze(-1) + face_fill * zone.unsqueeze(-1)
                 # 얼굴 영역은 플레이트 관측 여부와 무관하게 채울 수 있다
                 src_ok = torch.clamp(src_ok + zone, 0.0, 1.0)
 
             a = (erase * src_ok).unsqueeze(-1)
             out = frame_f * (1 - a) + fill * a
+            if self.keep_debug:
+                self.debug_maps = {"hair_a": hair_a, "erase": erase, "src_ok": src_ok, "a": a.squeeze(-1),
+                                   "new_a": None if new_a is None else new_a.squeeze(-1),
+                                   "face_a": None if face_rgb is None else face_a.squeeze(-1),
+                                   "zone": zone if eyes is not None else None}
         elif mode == "plate" and plate is not None and plate.seen is not None:
             out = plate.plate * plate.seen.unsqueeze(-1)
         elif mode == "raw":
@@ -1178,9 +1288,31 @@ class GpuFaceParser:
                     sk = max(3, int(round(CONFIG.shadow_k * d / 50.0))) | 1
                 blurred = F.avg_pool2d(a2, sk, stride=1, padding=sk // 2)
                 band = (blurred - a2).clamp(min=0.0).squeeze(0).permute(1, 2, 0)
-                out = out * (1.0 - shadow * band)
+                if groom is not None and eyes is not None and CONFIG.groom_drop_shadow > 0:
+                    # 3D 그룸: 위에서 오는 빛에 앞머리가 이마로 떨어뜨리는 **아래쪽** 그림자.
+                    # 윤곽 둘레의 얇은 띠만으로는 헤어가 이마 위에 떠 있어 보였다(실측). 알파를
+                    # 아래로 밀고 넓게 흐려서 헤어 바깥(1-a)에만 얹는다 - 끝에서 멀수록 옅어진다.
+                    d = float(np.hypot(eyes[1][0] - eyes[0][0], eyes[1][1] - eyes[0][1]))
+                    dy = max(1, int(round(CONFIG.groom_drop_shadow_dy * d)))
+                    kk = max(3, int(round(CONFIG.groom_drop_shadow_k * d))) | 1
+                    sh = F.pad(a2, (0, 0, dy, 0))[:, :, :h, :]              # 아래로 dy 이동
+                    sh = self._box(sh, kk)
+                    drop = (sh * (1.0 - a2)).clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0)
+                    band = torch.maximum(band, drop * CONFIG.groom_drop_shadow / max(shadow, 1e-3))
+                out = out * (1.0 - (shadow * band).clamp(max=0.6))
 
-            if CONFIG.hair_sharpen > 0:
+            if groom is not None and CONFIG.groom_light_wrap > 0 and eyes is not None:
+                # 라이트 랩: 헤어 가장자리에 뒤 장면 색을 스며들게 한다. 실제 카메라에서는 역광/난반사로
+                # 경계 가닥이 배경색을 띤다 - 없으면 칼로 오린 실루엣이 된다.
+                d = float(np.hypot(eyes[1][0] - eyes[0][0], eyes[1][1] - eyes[0][1]))
+                kw = max(3, int(round(0.12 * d))) | 1
+                a4 = new_a.permute(2, 0, 1).unsqueeze(0)
+                bg = out.permute(2, 0, 1).unsqueeze(0) * (1.0 - a4)
+                bg_b = self._box(bg, kw) / self._box(1.0 - a4, kw).clamp(min=1e-3)
+                inner = self._box(a4, kw)
+                wrap = ((1.0 - inner) * CONFIG.groom_light_wrap).clamp(0.0, 1.0)     # 가장자리일수록 큼
+                new_rgb = (new_rgb.permute(2, 0, 1).unsqueeze(0) * (1.0 - wrap) + bg_b * wrap)[0].permute(1, 2, 0)
+            if CONFIG.hair_sharpen > 0 and groom is None:
                 # 언샤프 마스크. 두 곳에서 디테일이 깎인다: (1) 웹캠 입력이 눈
                 # 간격 ~50px 라 GAN 입력이 4배 업스케일된다 (2) 에셋을 프레임에
                 # 얹을 때 안티에일리어스 축소가 통과대역을 조금 누른다. 잃은
@@ -1249,7 +1381,7 @@ class GpuFaceParser:
             self._groom = GroomRenderer(self.device)
         return self._groom
 
-    def _render_groom(self, groom: dict, matrix, fit, h: int, w: int, dyn=None):
+    def _render_groom(self, groom: dict, matrix, fit, h: int, w: int, dyn=None, geom=None):
         r = self._groom_renderer()
         g = r.load(groom["name"], groom["path"], groom.get("meta"))
         sm, up, fwd = fit if fit is not None else (1.0, 0.0, 0.0)
@@ -1257,10 +1389,86 @@ class GpuFaceParser:
             # 흰 베이스: 색은 _match_hair_color 가 입힌다 (GLB 의 갈색은 무시)
             return r.render(g, matrix, w, h, g.scale_mul * float(sm),
                             g.offset_up_cm + float(up), g.offset_fwd_cm + float(fwd),
-                            base_rgb=(1.0, 1.0, 1.0), dyn=dyn)
+                            base_rgb=(1.0, 1.0, 1.0), dyn=dyn, head=True, geom=geom)
         except Exception:
             logger.exception("그룸 렌더 실패")
             return None, None
+
+    def _groom_post(self, new_rgb, new_a, scalp_a, eye_l, eye_r):
+        """렌더된 3D 헤어 레이어 후처리 (합성 전). -> (rgb, a)
+
+        렌더 그대로 얹으면 (1) 가는 결 사이로 배경/이마가 비치고 (2) 가닥 단위 디더 노이즈가
+        뜨개실처럼 보이며 (3) 웹캠보다 훨씬 선명해 오려 붙인 티가 났다(사용자 피드백 + 실측).
+
+        1) 몸통 채움: 알파를 크게 흐려 '헤어 덩어리' 실루엣을 구하고, 그 안의 성긴 자리 밑에
+           가닥 색을 확산한 베이스를 깐다. 바깥 가장자리(흐린 알파가 낮은 곳)는 그대로 가늘게.
+        2) 두피 베이스: 두상 오클루더 중 이 스타일 뿌리 자리(scalp_a) - 귀 위/뒤 덜 덮인 곳.
+        3) 카메라 선명도 맞춤: 프리멀티플라이드 가우시안으로 살짝 흐린다. 웹캠(눈 간격 ~60px)은
+           머리카락 한 올을 못 푼다 - 결 단위 고주파는 '진짜 같음'이 아니라 CG 티다.
+        """
+        F = torch.nn.functional
+        d = float(np.hypot(eye_r[0] - eye_l[0], eye_r[1] - eye_l[1]))
+        rgb_c = new_rgb.permute(2, 0, 1).unsqueeze(0)
+        a_c = new_a.permute(2, 0, 1).unsqueeze(0)
+        under = torch.zeros_like(a_c)
+        if CONFIG.groom_body > 0:
+            k = max(3, int(round(CONFIG.groom_body_k * d))) | 1
+            dens = self._box(a_c, k)
+            lo, hi = CONFIG.groom_body_lohi
+            body = ((dens - lo) / max(1e-3, hi - lo)).clamp(0.0, 1.0)
+            under = torch.maximum(under, body * CONFIG.groom_body)
+        if scalp_a is not None and CONFIG.groom_scalp > 0:
+            under = torch.maximum(under, scalp_a.unsqueeze(0).unsqueeze(0) * CONFIG.groom_scalp)
+        if float(CONFIG.groom_body) > 0 or scalp_a is not None:
+            # 베이스 색: 자리마다 근처 가닥 색을 확산해 어둡게(뿌리/안쪽 결은 그늘) - 단색이면 스티커
+            pr = self._pushpull(rgb_c, a_c) * CONFIG.groom_scalp_dark
+            tot = a_c + under * (1.0 - a_c)
+            rgb_c = (rgb_c * a_c + pr * under * (1.0 - a_c)) / tot.clamp(min=1e-4)
+            a_c = tot
+        if CONFIG.groom_soften > 0:
+            sig = CONFIG.groom_soften * d / 60.0
+            r = max(1, int(math.ceil(sig * 2.5)))
+            x = torch.arange(-r, r + 1, device=self.device, dtype=torch.float32)
+            g = torch.exp(-0.5 * (x / max(sig, 1e-3)) ** 2)
+            g = g / g.sum()
+            pm = torch.cat([rgb_c * a_c, a_c], 1)                           # (1,4,h,w)
+            pm = F.conv2d(F.pad(pm, (r, r, 0, 0), mode="replicate"), g.view(1, 1, 1, -1).repeat(4, 1, 1, 1), groups=4)
+            pm = F.conv2d(F.pad(pm, (0, 0, r, r), mode="replicate"), g.view(1, 1, -1, 1).repeat(4, 1, 1, 1), groups=4)
+            a_c = pm[:, 3:4]
+            rgb_c = pm[:, :3] / a_c.clamp(min=1e-3)
+        return rgb_c[0].permute(1, 2, 0), a_c[0].permute(1, 2, 0)
+
+    def _project_patch(self, asset, h: int, w: int):
+        """맨이마 패치를 만든 순간의 프레임(asset.bald_bgr)을 지금 두상에 투영 텍스처로 붙인다.
+
+        -> (rgb (h,w,3), a (h,w,1)) 또는 (None, None). 직전 _render_groom(geom=True) 의 두상 표면
+        좌표를 패치 순간의 포즈로 다시 투영해 그 프레임을 샘플한다. 닮음변환과 달리 고개를
+        돌려도 이마가 두상 곡면을 따라 돌아간다. 그 순간 비스듬했던 표면(텍스처가 늘어난 자리)은
+        알파를 뺀다.
+        """
+        r = self._groom
+        if r is None or r.last_geom is None or r.last_head is None:
+            return None, None
+        pu = r.project_uv(asset.build_matrix)
+        if pu is None:
+            return None, None
+        grid, facing, (x0, y0, x1, y1) = pu
+        tex = getattr(asset, "_proj_tex", None)
+        if tex is None:
+            img = torch.from_numpy(np.ascontiguousarray(asset.bald_bgr)).to(self.device).float()
+            m = torch.from_numpy(np.ascontiguousarray(asset.face_mask_full)).to(self.device).float()
+            tex = torch.cat([img, m.unsqueeze(-1)], -1).permute(2, 0, 1).unsqueeze(0)   # (1,4,H,W)
+            asset._proj_tex = tex
+        smp = torch.nn.functional.grid_sample(tex, grid.unsqueeze(0), mode="bilinear",
+                                              padding_mode="zeros", align_corners=False)[0]
+        cov = r.last_head[y0:y1, x0:x1, 3].float() / 255.0
+        lo, hi = CONFIG.forehead_3d_facing
+        fa = ((facing - lo) / max(1e-3, hi - lo)).clamp(0.0, 1.0)
+        rgb = torch.zeros(h, w, 3, device=self.device)
+        a = torch.zeros(h, w, 1, device=self.device)
+        rgb[y0:y1, x0:x1] = smp[:3].permute(1, 2, 0)
+        a[y0:y1, x0:x1, 0] = (smp[3] * cov * fa).clamp(0.0, 1.0)
+        return rgb, a
 
     def _match_hair_color(self, new_rgb, new_a, frame_f, hair_a, refresh: bool, color=None,
                           pose=None, eyes=None):

@@ -1766,7 +1766,7 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         name = f"forehead-{int(time.time() * 1000) % 1000000}"
         asset, bangs_px, ms = await loop.run_in_executor(
             app.forehead_executor, forehead.build_forehead_asset,
-            app.forehead, frame, cls, lm["eye_l"], lm["eye_r"], name)
+            app.forehead, frame, cls, lm["eye_l"], lm["eye_r"], name, 7, lm.get("matrix"), lm.get("brows"))
         if asset is None:
             if not quiet:
                 notify_peer(state, {"type": "forehead", "status": "error", "message": "얼굴 패치를 만들지 못했습니다"})
@@ -2479,8 +2479,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=CONFIG.host)
     parser.add_argument("--port", type=int, default=CONFIG.port)
-    parser.add_argument("--preload", action="store_true",
-                        help="첫 연결을 기다리지 않고 시작할 때 세그멘터를 미리 올린다")
+    # 기본 켬(CONFIG.preload). 끄면 서버를 띄운 뒤 첫 연결이 모델 적재(수 초)를 기다려서, 그동안
+    # 화면이 검게 멈춰 있었다 - 재시작할 때마다 "연결이 너무 느리다" 로 보였다(사용자 피드백).
+    parser.add_argument("--preload", action=argparse.BooleanOptionalAction, default=CONFIG.preload,
+                        help="시작할 때 세그멘터를 미리 올린다 (--no-preload 로 끔)")
     parser.add_argument("--preload-gan", action="store_true",
                         help="HairFastGAN 도 미리 올린다 (~90초. 기본으로 켜면 안 된다)")
     args = parser.parse_args()
