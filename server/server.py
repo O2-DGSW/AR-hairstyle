@@ -2352,9 +2352,42 @@ async def _reaper(app_state: AppState):
                     logger.exception("pc.close 실패")
 
 
+def _cors_origin(request, cfg):
+    """허용 출처면 그 Origin 을 돌려준다. 포트는 무시한다(vite 등 dev 서버 포트가 제각각)."""
+    origin = request.headers.get("Origin")
+    if not origin:
+        return None
+    u = urllib.parse.urlsplit(origin)
+    return origin if f"{u.scheme}://{u.hostname}" in cfg.cors_origins else None
+
+
+def _cors_middleware(cfg):
+    @web.middleware
+    async def cors(request, handler):
+        origin = _cors_origin(request, cfg)
+        if request.method == "OPTIONS" and origin and request.headers.get("Access-Control-Request-Method"):
+            resp = web.Response(status=204)
+            resp.headers["Access-Control-Allow-Methods"] = "GET, HEAD, POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = request.headers.get(
+                "Access-Control-Request-Headers", "Content-Type")
+            resp.headers["Access-Control-Max-Age"] = "600"
+        else:
+            try:
+                resp = await handler(request)
+            except web.HTTPException as e:    # 404 등도 헤더가 없으면 브라우저가 원인을 숨긴다
+                resp = e
+        if origin:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+        if isinstance(resp, web.HTTPException):
+            raise resp
+        return resp
+    return cors
+
+
 def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
     """aiohttp 앱을 만든다. 무거운 초기화는 전부 on_startup 에서."""
-    app = web.Application()
+    app = web.Application(middlewares=[_cors_middleware(cfg)])
     state = AppState(cfg)
     app["state"] = state
 

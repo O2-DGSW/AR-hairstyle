@@ -52,6 +52,11 @@ class Config:
     tls_ts_cert: str = os.path.join(ROOT, "tls", "ts.crt")
     tls_ts_key: str = os.path.join(ROOT, "tls", "ts.key")
     tls_port: int = 8443
+    #: 다른 출처에서 이 서버를 부를 수 있는 출처(포트 무시). 웹뷰 앱(Capacitor) 의 페이지 출처는
+    #: capacitor://localhost 라 시그널링/참고사진 요청이 전부 교차 출처다 - 없으면 OPTIONS 사전
+    #: 요청이 405 로 막힌다. 서버에 인증이 없으므로 "*" 로 열지 않는다.
+    cors_origins: tuple[str, ...] = ("capacitor://localhost", "ionic://localhost",
+                                     "http://localhost", "https://localhost")
     #: 동시에 받을 수 있는 피어 수. GPU 워커가 1개라 초과분은 거절하는 편이
     #: 전부 같이 느려지는 것보다 낫다.
     max_sessions: int = 2
