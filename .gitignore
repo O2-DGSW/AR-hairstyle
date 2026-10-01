@@ -142,6 +142,11 @@ server/assets/*.png
 # 자체서명 TLS 인증서/키 (make_cert.sh 로 생성)
 server/tls/server.crt
 server/tls/server.key
+server/tls/ts.crt
+server/tls/ts.key
 
 # 3D 그룸 GLB (11MB/개) - _hair3d_work/strands_to_cards.py 로 재생성. json(정합 메타)만 추적.
 server/grooms/*.glb
+
+# Git Bash 크래시 덤프
+*.stackdump

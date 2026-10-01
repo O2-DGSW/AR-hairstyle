@@ -45,6 +45,12 @@ class Config:
     #: 자체서명이면 브라우저 경고를 한 번 넘기면 된다. 만들기: server/tls/make_cert.sh
     tls_cert: str = os.path.join(ROOT, "tls", "server.crt")
     tls_key: str = os.path.join(ROOT, "tls", "server.key")
+    #: Tailscale 정식 인증서(Let's Encrypt). iOS 네이티브 앱(URLSession/WKWebView)은
+    #: 자체서명을 "이동" 버튼 없이 거부하므로 앱은 이 도메인으로 붙는다.
+    #: 있으면 SNI 로 갈라 쓴다: *.ts.net 으로 들어오면 이 인증서, IP 로 들어오면
+    #: (SNI 없음) 위 자체서명. 받기/갱신: server/tls/renew_ts_cert.sh (90일 만료)
+    tls_ts_cert: str = os.path.join(ROOT, "tls", "ts.crt")
+    tls_ts_key: str = os.path.join(ROOT, "tls", "ts.key")
     tls_port: int = 8443
     #: 동시에 받을 수 있는 피어 수. GPU 워커가 1개라 초과분은 거절하는 편이
     #: 전부 같이 느려지는 것보다 낫다.

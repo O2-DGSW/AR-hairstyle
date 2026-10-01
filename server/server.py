@@ -2488,12 +2488,28 @@ def main():
     app = create_app(CONFIG, preload=args.preload, preload_gan=args.preload_gan)
 
     # 인증서가 있으면 HTTPS 도 같이 연다 (run_app 은 사이트 하나만 열어서 직접 구성).
-    ssl_ctx = None
-    if os.path.isfile(CONFIG.tls_cert) and os.path.isfile(CONFIG.tls_key):
-        import ssl
-        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        ssl_ctx.load_cert_chain(CONFIG.tls_cert, CONFIG.tls_key)
-        logger.info("starting on http://%s:%s + https://%s:%s", args.host, args.port, args.host, CONFIG.tls_port)
+    # 자체서명(IP 접속용)과 Tailscale 정식 인증서(앱용)는 SNI 로 갈라 쓴다.
+    import ssl
+
+    def _tls_ctx(cert, key):
+        if not (os.path.isfile(cert) and os.path.isfile(key)):
+            return None
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(cert, key)
+        return ctx
+
+    self_ctx = _tls_ctx(CONFIG.tls_cert, CONFIG.tls_key)
+    ts_ctx = _tls_ctx(CONFIG.tls_ts_cert, CONFIG.tls_ts_key)
+    ssl_ctx = self_ctx or ts_ctx
+    if self_ctx is not None and ts_ctx is not None:
+        def _sni(sock, server_name, _ctx):
+            if server_name and server_name.lower().endswith(".ts.net"):
+                sock.context = ts_ctx
+        self_ctx.sni_callback = _sni
+    if ssl_ctx is not None:
+        logger.info("starting on http://%s:%s + https://%s:%s (자체서명=%s, tailscale=%s)",
+                    args.host, args.port, args.host, CONFIG.tls_port,
+                    self_ctx is not None, ts_ctx is not None)
     else:
         logger.info("starting on http://%s:%s (TLS 없음: %s 없음)", args.host, args.port, CONFIG.tls_cert)
 
