@@ -569,7 +569,16 @@ class SegmentedVideoTrack(VideoStreamTrack):
         # 백프레셔가 막고 있어 실시간 경로를 늦추지 않는다.
         if st.pose_future is not None and st.pose_future.done():
             try:
-                self._last_pose = st.pose_future.result()
+                p_new = st.pose_future.result()
+                # 고개를 크게 숙이거나 젖히면 랜드마커가 한두 프레임씩 얼굴을 놓친다. 그때 None 으로 덮으면
+                # 그 프레임은 헤어 없이 원래 머리만 지워져 빈 공간이 보였다(실측). 짧은 끊김은 직전 포즈 유지.
+                if p_new is not None:
+                    self._last_pose = p_new
+                    self._pose_miss = 0
+                else:
+                    self._pose_miss = getattr(self, "_pose_miss", 0) + 1
+                    if self._pose_miss > CONFIG.pose_hold_frames:
+                        self._last_pose = None
             except Exception:
                 logger.exception("랜드마커 실패")
             st.pose_future = None

@@ -18,6 +18,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gpu_segmenter import GpuFaceParser, SessionPlate      # noqa: E402
+from config import CONFIG                                   # noqa: E402
 from face_pose import FacePose                              # noqa: E402
 import hair_asset                                           # noqa: E402
 import server                                               # noqa: E402  (list_grooms / GROOM_DIR)
@@ -76,9 +77,18 @@ def main():
     from hair_dynamics import HairDynamics
     hd = HairDynamics()
 
+    hold = {"pose": None, "miss": 0}
+
     def run(idx, mode):
         img = cv2.imread(os.path.join(a.frames, files[idx]))
         pose = poser.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), idx * 33)
+        # 서버와 같은 짧은 끊김 유지 (config.pose_hold_frames)
+        if pose is None:
+            hold["miss"] += 1
+            if hold["miss"] <= CONFIG.pose_hold_frames:
+                pose = hold["pose"]
+        else:
+            hold["pose"], hold["miss"] = pose, 0
         dyn = None
         if a.dyn > 0 and pose is not None and pose.get("matrix") is not None:
             dyn = hd.step(pose["matrix"], 1 / 30)

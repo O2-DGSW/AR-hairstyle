@@ -52,6 +52,10 @@ BROW_R = ((107, 66, 105, 63, 70), (55, 65, 52, 53, 46))
 BROW_L = ((336, 296, 334, 293, 300), (285, 295, 282, 283, 276))
 
 
+#: 그룸 자동 맞춤에 쓰는 MediaPipe 랜드마크 (mp_flame_corr.npz 로 FLAME head_prior 정점과 대응)
+FIT_LM = (54, 284, 234, 454, 151, 152)
+
+
 def landmarks_image(frame_rgb: np.ndarray):
     """정지 이미지 1장의 눈/입꼬리. -> dict 또는 None.
 
@@ -237,6 +241,8 @@ class FacePose:
             "tz": tz,
             "matrix": matrix,
             "calibrated": self._k is not None,
+            # 3D 그룸 자동 맞춤 대응점 (관자놀이 54/284, 광대 옆 234/454, 이마 151, 턱 152) - 이미지 px
+            "fit_lm": {i: px(i) for i in FIT_LM},
         }
 
     def close(self):

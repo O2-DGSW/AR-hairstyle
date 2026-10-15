@@ -40,6 +40,8 @@ import time
 import numpy as np
 import torch
 
+from config import CONFIG
+
 logger = logging.getLogger("groom")
 
 #: MediaPipe face geometry 의 기본 가상 카메라. 이 값으로 PnP 를 풀었으니 이 값으로 투영한다.
@@ -58,6 +60,8 @@ uniform float u_idle;       // 미세 흔들림 진폭 (cm)
 uniform float u_time;
 uniform int u_billboard;    // 1: _center/_tangent/_side/_halfw 로 카메라를 향하는 리본을 만든다 (v1 GLB)
 uniform float u_scale;      // 두상 스케일(폭에 곱함)
+uniform float u_volume;     // 머리숱 부피(1=원본): 두피에서 바깥으로 뜬 거리를 줄인다. 오클루더 패스는 1
+uniform float u_vol_y0;     // 이 높이(정규 cm, +위) 아래로 늘어진 머리는 그대로 (3cm 램프)
 in vec3 in_pos; in vec2 in_uv; in vec3 in_nrm; in vec3 in_root;
 in vec3 in_center; in vec3 in_tangent; in float in_side; in float in_rand; in float in_halfw;
 out vec2 v_uv; out vec3 v_nrm; out vec3 v_tan; out vec3 v_pos; flat out float v_rand;
@@ -74,6 +78,17 @@ void main() {
     float Ld = length(d);
     if (L > 1e-4 && Ld > 1e-4) d *= L / Ld;
     vec3 p = in_root + d;                   // 두상 공간
+    if (u_volume < 0.999) {
+        // Im2Haircut 재구성은 머리숱이 두피에서 3~4cm 떠 있어 실제 머리에 얹으면 헬멧처럼 붕 떴다(실측:
+        // 정수리에서 그룸 외곽-두상 34px, 눈 간격 60px 기준). 두상 중심 기준 반지름이 뿌리보다 큰 만큼만
+        // 줄인다. 귀 아래로 늘어진 머리까지 줄이면 긴 머리가 목 쪽으로 빨려 들어가므로 위쪽만.
+        float rr = length(in_root);
+        float r = length(p);
+        if (r > rr && r > 1e-3) {
+            float wy = clamp((p.y - u_vol_y0) / 3.0, 0.0, 1.0);
+            p *= (rr + (r - rr) * mix(1.0, u_volume, wy)) / r;
+        }
+    }
     vec4 pc = u_model * vec4(p, 1.0);       // 카메라 공간
     vec3 tc = normalize(mat3(u_model) * ((u_billboard == 1) ? in_tangent : in_nrm));
     if (u_billboard == 1) {
@@ -218,6 +233,7 @@ class Groom:
         self.offset_fwd_cm = float(fit.get("offset_fwd_cm", 0.0))
         self.hair_vao = None
         self.occ_vao = None
+        self.occ_v = None
         self.head_vao = None     # 오클루더 + 정점별 두피 가중, 두상 좌표 맵 프로그램용
         self.scalp_cov = 0.0
         self.tex = None
@@ -343,6 +359,7 @@ class GroomRenderer:
             if gname == "head_occluder":
                 g.occ_vao = vao
                 occ = (v, faces)
+                g.occ_v = v                     # 정규 cm. FLAME head_prior 순서(5023)면 자동 맞춤 대응점으로 쓴다
                 continue
             if P > 0 and len(v) % (P * 2) == 0:
                 all_roots.append(root[::P * 2])
@@ -383,9 +400,40 @@ class GroomRenderer:
                 r.release()
 
     # ---- 렌더 ----
+    @staticmethod
+    def _model(matrix, scale_mul, offset_up_cm, offset_fwd_cm, sx=1.0, sy=1.0):
+        """정규 프레임 안의 사용자 보정을 붙인 모델 행렬. sx/sy 는 자동 맞춤의 가로/세로 상대 배율
+        (깊이는 둘의 평균) - 헤어를 만든 원래 인물과 사용자의 두상 비율이 다른 만큼."""
+        return np.asarray(matrix, np.float32).reshape(4, 4) @ GroomRenderer._fitmat(
+            scale_mul, offset_up_cm, offset_fwd_cm, sx, sy)
+
+    @staticmethod
+    def _fitmat(scale_mul, offset_up_cm, offset_fwd_cm, sx=1.0, sy=1.0):
+        fit = np.eye(4, dtype=np.float32)
+        s = float(scale_mul)
+        fit[0, 0] = s * float(sx)
+        fit[1, 1] = s * float(sy)
+        fit[2, 2] = s * 0.5 * (float(sx) + float(sy))
+        fit[1, 3] = float(offset_up_cm)
+        fit[2, 3] = float(offset_fwd_cm)
+        return fit
+
+    def project_occ(self, groom: Groom, idx, matrix, w: int, h: int, scale_mul: float = 1.0,
+                    offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0, sx: float = 1.0, sy: float = 1.0):
+        """오클루더 정점 idx 를 이미지 px 로 투영 (N,2). 오클루더가 없거나 FLAME 순서가 아니면 None. CPU."""
+        ov = groom.occ_v
+        if ov is None or len(ov) != 5023:
+            return None
+        model = self._model(matrix, scale_mul, offset_up_cm, offset_fwd_cm, sx, sy)
+        proj = _perspective(MP_VERTICAL_FOV_DEG, w / float(h), 1.0, 1000.0)
+        p = np.c_[ov[np.asarray(idx)], np.ones(len(idx), np.float32)] @ (proj @ model).T
+        ndc = p[:, :2] / p[:, 3:4]
+        return np.c_[(ndc[:, 0] * 0.5 + 0.5) * w, (0.5 - ndc[:, 1] * 0.5) * h].astype(np.float32)
+
     def render(self, groom: Groom, matrix: np.ndarray, w: int, h: int,
                scale_mul: float = 1.0, offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0,
-               base_rgb=None, dyn: dict | None = None, head: bool = False, geom=None):
+               base_rgb=None, dyn: dict | None = None, head: bool = False, geom=None,
+               sx: float = 1.0, sy: float = 1.0):
         """-> (rgb (h,w,3) BGR float 0~255, a (h,w,1) float 0~1) GPU 텐서, 또는 (None, None).
 
         matrix: MediaPipe 4x4 row-major (정규 얼굴 -> 카메라 공간, cm).
@@ -402,13 +450,9 @@ class GroomRenderer:
         t0 = time.perf_counter()
         ctx, prog = self._ctx, self._prog
 
-        M = np.asarray(matrix, np.float32).reshape(4, 4)
-        # 정규 프레임 안에서의 사용자 보정: 두상 중심 기준 스케일 + 위/앞 이동 (hair3d.js 와 동일)
-        fit = np.eye(4, dtype=np.float32)
-        fit[0, 0] = fit[1, 1] = fit[2, 2] = float(scale_mul)
-        fit[1, 3] = float(offset_up_cm)
-        fit[2, 3] = float(offset_fwd_cm)
-        model = M @ fit
+        # 정규 프레임 안에서의 사용자 보정: 두상 중심 기준 스케일 + 위/앞 이동 (hair3d.js 와 동일) + 자동 맞춤 sx/sy
+        fit = self._fitmat(scale_mul, offset_up_cm, offset_fwd_cm, sx, sy)
+        model = np.asarray(matrix, np.float32).reshape(4, 4) @ fit
         # 셰이더의 상대좌표 변형은 정규 공간(fit 적용 전)에서 일어나므로 u_shift 는 스케일과 무관
         proj = _perspective(MP_VERTICAL_FOV_DEG, w / float(h), 1.0, 1000.0)
         # 이미지 좌표는 y 가 아래로 자란다. 투영의 y 를 뒤집어 프레임버퍼 0행이 이미지 0행이 되게 한다.
@@ -426,6 +470,8 @@ class GroomRenderer:
         prog["u_nrm"].write(np.ascontiguousarray(nrm.T.astype(np.float32)).tobytes())
         prog["u_billboard"].value = 1 if groom.billboard else 0
         prog["u_scale"].value = float(scale_mul)
+        prog["u_vol_y0"].value = float(CONFIG.groom_volume_y0)
+        prog["u_volume"].value = 1.0            # 오클루더(두상)는 줄이지 않는다
         prog["u_light"].value = (0.3, 0.8, 1.0)
         # 2차 운동 (hair_dynamics.HairDynamics.step 의 결과). 없으면 강체.
         if dyn is not None:
@@ -459,6 +505,7 @@ class GroomRenderer:
             prog["u_pass"].value = 2
             groom.occ_vao.render()
             fbo.color_mask = (True, True, True, True)
+        prog["u_volume"].value = float(CONFIG.groom_volume)
         if groom.billboard:
             # v1: 알파-투-커버리지 단일 패스. 알파가 MSAA 샘플 커버리지로 바뀌어 깊이 쓰기와
             # 함께 순서 무관하게 반투명 가닥이 겹친다(정렬 불필요, 2패스 불필요). 리졸브 결과는

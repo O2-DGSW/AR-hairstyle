@@ -87,13 +87,36 @@ def cmd_stop():
     return 0
 
 
+def _ensure_bom(path):
+    """로그 파일 맨 앞에 UTF-8 BOM 을 둔다. 내용은 원래 UTF-8 인데 BOM 이 없으면 메모장(구버전)/
+    PowerShell 5.1 Get-Content 같은 윈도우 도구가 CP949 로 읽어 한글이 깨져 보였다(사용자 제보).
+    서버 자식을 띄우기 전(파일을 아무도 안 잡고 있을 때)에만 부른다."""
+    bom = b"\xef\xbb\xbf"
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            with open(path, "wb") as f:
+                f.write(bom)
+            return
+        with open(path, "rb") as f:
+            head = f.read(3)
+        if head != bom:
+            with open(path, "rb") as f:
+                data = f.read()
+            with open(path, "wb") as f:
+                f.write(bom + data)
+    except OSError:
+        pass
+
+
 def main(extra):
     with open(PIDFILE, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
+    _ensure_bom(LOG)
 
     cmd = [sys.executable, "-u", os.path.join(ROOT, "server.py")] + extra
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
 
     fails = 0
     stopping = False

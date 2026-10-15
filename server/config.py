@@ -208,6 +208,8 @@ class Config:
     #: 이 프레임의 랜드마커 결과를 기다리는 상한(초). 넘기면 직전 프레임 포즈로 그린다.
     #: 포즈 7.9ms(p95 10.7) 가 GPU 추론과 겹치므로 보통 수 ms 만 실제로 기다린다.
     pose_wait_s: float = 0.025
+    #: 랜드마커가 얼굴을 놓쳐도 직전 포즈를 이 프레임 수까지 유지한다(고개 숙임/젖힘의 짧은 끊김).
+    pose_hold_frames: int = 6
     #: 진단용으로 되살리려면 HEDDY_SERVE_STATIC_ASSETS=1.
     serve_static_assets: bool = False
 
@@ -220,6 +222,8 @@ class Config:
     groom_color_alpha: float = 0.2
     #: 이보다 머리 픽셀이 적으면(모자/삭발) 색을 맞추지 않고 GLB 색을 쓴다.
     groom_color_min_px: int = 400
+    #: 머리색 측정에 쓰는 휘도 분위(1=전체 평균). 0.5 면 어두운 절반만 - 윤기/반사광/조명 번짐 제외.
+    groom_color_quantile: float = 0.5
     #: 리본 가장자리 페더 폭 (눈 간격 배수). v1 그룸(가는 결 + 8x MSAA 확률적 투명도)은 페더가
     #: 결을 뭉개므로 0. v0 굵은 리본에서만 0.04 가 유효했다.
     groom_feather: float = 0.0
@@ -229,9 +233,34 @@ class Config:
     #: 휘도 대비(표준편차) 맞춤 세기. 0=평균색만, 1=완전 일치. 배율은 [min,max] 로 제한.
     #: 기본 0: v1 그룸(가닥별 변주 + 이방성 하이라이트)은 자체 대비가 충분하고, 1.5배만 늘려도
     #: 어두운 결 뭉치가 근검정 얼룩이 됐다(실측). v0 굵은 리본에서만 유효했던 보정.
-    groom_contrast_match: float = 0.0
-    groom_contrast_min: float = 0.6
-    groom_contrast_max: float = 1.5
+    #: 2026-10-15: 줄이기 전용으로 켬(max 1.0). v1 그룸은 이방성 하이라이트 때문에 대비가 실제 머리보다 커서
+    #: 같은 평균색이어도 은색/가발처럼 떠 보였다(실측). 늘리기(>1)는 위 이유로 여전히 막는다.
+    groom_contrast_match: float = 1.0
+    groom_contrast_min: float = 0.5
+    groom_contrast_max: float = 1.0
+    #: 머리숱 부피(1=재구성 원본). 두피에서 바깥으로 뜬 거리를 이 배율로 줄인다 - 헬멧처럼 붕 뜨는 것 방지.
+    #: y0(정규 cm, 두상 중심 기준 +위) 아래로 늘어진 머리는 그대로(긴 머리가 목 쪽으로 빨려드는 것 방지).
+    #: 3D 그룸에서 눈/안경 보호로 헤어를 깎는 것을 이 yaw(도) 구간에서 서서히 끈다(옆모습 렌즈 모양 구멍 방지).
+    groom_protect_yaw_lo: float = 15.0
+    groom_protect_yaw_hi: float = 30.0
+    groom_volume: float = 0.6
+    #: 그룸 자동 맞춤 (gpu_segmenter._update_autofit): 정면 포즈에서 얼굴 랜드마크와 그룸 두상의 대응점으로
+    #: 가로/세로 배율과 이마 높이를 사용자에게 맞춘다. range 는 배율 한계, alpha 는 프레임당 EMA.
+    #: 헤어 안쪽과 얼굴 사이에 끼인 틈(뒤 배경이 비침)을 헤어 그늘색으로 메우는 세기(0=끔). k 는 메울 수
+    #: 있는 최대 틈 폭(눈 간격 배수, 닫힘 커널), down 은 눈 아래 이 높이까지만(목 옆 긴 머리 틈은 그대로).
+    groom_gapfill: float = 1.0
+    groom_gapfill_k: float = 0.35
+    groom_gapfill_down: float = 0.6
+    groom_gapfill_fh_w: float = 0.8
+    groom_autofit: bool = True
+    groom_autofit_max_yaw: float = 15.0
+    groom_autofit_max_pitch: float = 15.0
+    groom_autofit_range: tuple[float, ...] = (0.75, 1.35)
+    groom_autofit_max_up_cm: float = 4.0
+    groom_autofit_alpha: float = 0.1
+    #: 두상 정규 좌표 y(cm, 두상 중심 기준 +위) 가 이보다 위면 두피 - 얼굴면/피부 채움에서 뺀다.
+    groom_face_top_cm: float = 5.0
+    groom_volume_y0: float = -1.0
     #: 두피 베이스 레이어 불투명도(0=끔). 그룸의 오클루더(FLAME 두상) 중 이 스타일 뿌리가 나는 자리를
     #: 헤어 아래에 헤어색(주변 가닥 색을 확산)으로 깐다. 없으면 가닥 사이/귀 위·뒤가 배경으로 뚫려
     #: 두상이 파여 보였다(실측: 원래 머리를 지운 자리에 플레이트 배경이 나옴). 실제 헤어카드 게임도
@@ -241,6 +270,12 @@ class Config:
     #: 밑에 가닥색 베이스를 깐다 - 결 사이로 배경/이마가 비치던 것. body_k 는 밀도 창(눈 간격 배수),
     #: lohi 는 그 창 안 평균 알파가 lo 이하면 0(바깥 가는 결 유지), hi 이상이면 1.
     groom_body: float = 0.95
+    #: 실루엣 안쪽 채우기(gpu_segmenter._groom_core): close(눈 간격 배수) 창 안 헤어 밀도가 lohi 이상인 곳을
+    #: 속으로 보고 edge 만큼 깎아 이 불투명도로 채운다(0=끔). 가장자리 가는 머리끝은 원래 알파 그대로.
+    groom_core: float = 0.97
+    groom_core_close: float = 0.25
+    groom_core_edge: float = 0.10
+    groom_core_lohi: tuple[float, ...] = (0.55, 0.75)
     groom_body_k: float = 0.25
     groom_body_lohi: tuple[float, ...] = (0.30, 0.55)
     #: 카메라 선명도 맞춤 흐림 σ(px, 눈 간격 60px 기준). 가닥 디더 노이즈(뜨개실 느낌)를 누른다. 0=끔.
@@ -259,7 +294,16 @@ class Config:
     #: 근거 없는 배경으로 칠하지 않는다.
     bg_diffuse_down: float = 1.2
     #: 3D 그룸 앞머리가 이마에 떨어뜨리는 아래쪽 그림자 세기(0=끔)와 이동/흐림 폭(눈 간격 배수).
-    groom_drop_shadow: float = 0.30
+    #: 원래 머리가 3D 헤어 실루엣 밖으로 삐져나온 자리를 헤어로 메우는 세기(0=끔, 예전처럼 배경으로
+    #: 지움). 지우면 헤어 둘레에 뿌연 후광이 떴다(gpu_segmenter._groom_extend). k 는 그룸에서 이만큼
+    #: (눈 간격 배수) 떨어진 곳까지만, eye 는 눈 위 이 높이부터(귀/옆얼굴 제외), fh_w 는 이마로 빼는
+    #: 가로 반폭, detail 은 원래 머리 휘도 결을 빌리는 세기.
+    groom_extend: float = 0.95
+    groom_extend_k: float = 0.45
+    groom_extend_eye: float = 0.2
+    groom_extend_fh_w: float = 0.95
+    groom_extend_detail: float = 0.8
+    groom_drop_shadow: float = 0.45
     groom_drop_shadow_dy: float = 0.10
     groom_drop_shadow_k: float = 0.30
     #: 맨이마 패치를 그룸 두상 오클루더에 3D 투영해 붙인다(0 이면 예전 눈 앵커 닮음변환 + yaw 페이드).
