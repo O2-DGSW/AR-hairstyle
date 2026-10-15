@@ -17,5 +17,13 @@
     "scale_mul": 1.12,
     "offset_up_cm": -2.5,
     "offset_fwd_cm": 1.0
-  }
+  },
+  "label": "히피펌",
+  "gender": "여자",
+  "type": "펌",
+  "tags": [
+    "미디움",
+    "웨이브",
+    "내추럴"
+  ]
 }

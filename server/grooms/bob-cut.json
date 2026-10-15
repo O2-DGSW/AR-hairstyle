@@ -17,5 +17,13 @@
     "scale_mul": 1.12,
     "offset_up_cm": -2.5,
     "offset_fwd_cm": 1.0
-  }
+  },
+  "label": "보브컷",
+  "gender": "여자",
+  "type": "컷",
+  "tags": [
+    "숏",
+    "클래식",
+    "러블리"
+  ]
 }

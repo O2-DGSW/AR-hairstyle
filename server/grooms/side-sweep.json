@@ -17,5 +17,12 @@
     "scale_mul": 1.12,
     "offset_up_cm": -2.5,
     "offset_fwd_cm": 1.0
-  }
+  },
+  "label": "사이드 스윕",
+  "gender": "여자",
+  "type": "컷",
+  "tags": [
+    "롱",
+    "내추럴"
+  ]
 }

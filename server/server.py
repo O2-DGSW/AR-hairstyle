@@ -1674,6 +1674,11 @@ async def grooms_list(request):
     for name, meta in list_grooms().items():
         items.append({
             "name": name,
+            # 화면 표시용 (그룸 json 에서. 노션 '헤어스타일 목록' 기준) - 없으면 name 그대로
+            "label": meta.get("label", name),
+            "gender": meta.get("gender"),
+            "type": meta.get("type"),
+            "tags": meta.get("tags", []),
             "url": f"/grooms/{name}.glb",
             # 프론트 목록용 미리보기 (_hair3d_work/preview_groom.py 로 생성, 없으면 null)
             "thumb": f"/grooms/{name}.png" if os.path.isfile(os.path.join(GROOM_DIR, name + ".png")) else None,
