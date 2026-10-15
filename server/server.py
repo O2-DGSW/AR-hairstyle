@@ -1675,6 +1675,10 @@ async def grooms_list(request):
         items.append({
             "name": name,
             "url": f"/grooms/{name}.glb",
+            # 프론트 목록용 미리보기 (_hair3d_work/preview_groom.py 로 생성, 없으면 null)
+            "thumb": f"/grooms/{name}.png" if os.path.isfile(os.path.join(GROOM_DIR, name + ".png")) else None,
+            "views": (f"/grooms/{name}_views.png"
+                      if os.path.isfile(os.path.join(GROOM_DIR, name + "_views.png")) else None),
             "n_strands": meta.get("n_strands"),
             "user_fit": meta.get("user_fit", {}),
         })
@@ -1806,12 +1810,13 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
 
 async def groom_file(request):
     name = request.match_info["name"]
-    if "/" in name or "\\" in name or ".." in name or not name.endswith(".glb"):
+    if "/" in name or "\\" in name or ".." in name or not name.endswith((".glb", ".png")):
         raise web.HTTPNotFound()
     path = os.path.join(GROOM_DIR, name)
     if not os.path.isfile(path):
         raise web.HTTPNotFound()
-    return web.FileResponse(path, headers={"Content-Type": "model/gltf-binary"})
+    ctype = "model/gltf-binary" if name.endswith(".glb") else "image/png"
+    return web.FileResponse(path, headers={"Content-Type": ctype})
 
 
 # 개발 중에는 브라우저 캐시가 계속 발목을 잡는다. 코드를 고쳐도 예전 client.js가
