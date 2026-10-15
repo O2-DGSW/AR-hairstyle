@@ -47,7 +47,9 @@ HIDE_HAIR_CONTEXT = True
 #: 앞머리 자리 채우는 방법. "synth": 주변 실제 피부 확산 + 피부결 + 눈썹 그리기(기본).
 #: "lama": LaMa 인페인트. 웹캠 해상도에서 이마만 한 영역은 LaMa 가 머리 결을 다시 그리거나(머리 문맥)
 #: 배경/갈색 얼룩을 끌어와(문맥 제거) 둘 다 부자연스러웠다(2026-09-30 실측 비교).
-FILL_METHOD = "synth"
+#: "learned": FFHQ 로 학습한 이마 전용 인페인터(forehead_net.py, 가중치 models/forehead_net.pt). 가중치가
+#: 없으면 synth 로 떨어진다.
+FILL_METHOD = "learned"
 #: 앞머리를 지우는 띠의 아래 끝 (눈 아래, 눈 간격 배수).
 BANGS_DOWN = 0.35
 #: 인페인터 입력 크롭: 눈 간격의 몇 배를 한 변으로 (얼굴 전체가 문맥으로 들어가야 색/음영이 맞는다).
@@ -95,6 +97,22 @@ class ForeheadInpainter:
         for _ in range(3):
             self._model(blank, Image.fromarray(m))
         logger.info("LaMa 적재+워밍업 %.1fs", time.perf_counter() - t0)
+
+    def learned(self):
+        """학습된 이마 인페인터 (없으면 None). 처음 부를 때 적재."""
+        if getattr(self, "_learned", None) is None and not getattr(self, "_learned_failed", False):
+            import os
+            import forehead_net
+            if os.path.isfile(forehead_net.WEIGHTS):
+                try:
+                    self._learned = forehead_net.LearnedForehead(self.device)
+                    logger.info("학습 이마 인페인터 적재")
+                except Exception:
+                    logger.exception("학습 이마 인페인터 적재 실패 - synth 사용")
+                    self._learned_failed = True
+            else:
+                self._learned_failed = True
+        return getattr(self, "_learned", None)
 
     def inpaint(self, img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """mask(0/255) 자리를 채운 BGR. 크기는 임의(내부에서 8의 배수로 패딩)."""
@@ -212,7 +230,17 @@ def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cl
 
     bald = frame_bgr.copy()
     ms = 0.0
-    if bangs_px > 0 and FILL_METHOD == "synth":
+    learned = inpainter.learned() if (bangs_px > 0 and FILL_METHOD == "learned" and inpainter is not None) else None
+    if learned is not None:
+        t0 = time.perf_counter()
+        hole = bangs > 0
+        ys_, xs_ = np.mgrid[0:h, 0:w].astype(np.float32)
+        for e in (eye_l, eye_r):        # 눈 자체는 채우지 않는다 (synth 와 같은 기하 타원)
+            hole &= ((xs_ - e[0]) / (0.42 * d)) ** 2 + ((ys_ - e[1]) / (0.26 * d)) ** 2 > 1.0
+        with inpainter._lock:
+            bald = learned.fill(frame_bgr, hole, eye_l, eye_r)
+        ms = (time.perf_counter() - t0) * 1000
+    elif bangs_px > 0 and FILL_METHOD in ("synth", "learned"):
         t0 = time.perf_counter()
         bald = synthesize_forehead(frame_bgr, cls, bangs > 0, eye_l, eye_r, brows)
         ms = (time.perf_counter() - t0) * 1000
