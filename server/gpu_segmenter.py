@@ -1055,7 +1055,8 @@ class GpuFaceParser:
                     sigma_f = self._stat_cache[1]
                 if new_rgb is not None:
                     new_rgb = self._match_hair_color(new_rgb, new_a, frame_f, hair_a,
-                                                     want_stats, groom_color, pose=pose, eyes=eyes)
+                                                     want_stats, groom_color, pose=pose, eyes=eyes,
+                                                     spec=self._groom.last_spec if self._groom is not None else None)
                     if eyes is not None:
                         new_rgb, new_a = self._groom_post(new_rgb, new_a, scalp_a, eye_l, eye_r)
                         new_a_core = new_a
@@ -1534,7 +1535,8 @@ class GpuFaceParser:
             # 흰 베이스: 색은 _match_hair_color 가 입힌다 (GLB 의 갈색은 무시)
             return r.render(g, matrix, w, h, g.scale_mul * float(sm),
                             g.offset_up_cm + up_auto + float(up), g.offset_fwd_cm + float(fwd),
-                            base_rgb=(1.0, 1.0, 1.0), dyn=dyn, head=True, geom=geom, sx=sx, sy=sy)
+                            base_rgb=(1.0, 1.0, 1.0), dyn=dyn, head=True, geom=geom, sx=sx, sy=sy,
+                            split_spec=True)
         except Exception:
             logger.exception("그룸 렌더 실패")
             return None, None
@@ -1747,7 +1749,7 @@ class GpuFaceParser:
         return rgb, a
 
     def _match_hair_color(self, new_rgb, new_a, frame_f, hair_a, refresh: bool, color=None,
-                          pose=None, eyes=None):
+                          pose=None, eyes=None, spec=None):
         """렌더된 헤어(흰 베이스: 음영·텍스처만)에 색을 입힌다 - 알파가중 평균이 목표색이 되도록.
 
         목표색은 사용자 머리(파싱 마스크)의 평균색. **그 조명 아래에서 관측된** 색이라
@@ -1759,6 +1761,9 @@ class GpuFaceParser:
         회색일 때 4배 넘게 필요하고, 클램프에 걸리면 갈색 색상이 남아 **주황**이 된다
         (실측). 흰 베이스면 채널별 배율 = 목표/휘도 라 색상이 정확히 목표를 따른다.
         color 가 주어지면(염색 미리보기) 사용자 색 대신 그 색.
+
+        spec: 렌더러가 따로 낸 윤기 (h,w,1). 주면 new_rgb 는 확산 음영만이다. 배율·대비는 예전처럼
+        (확산 + 윤기) 전체에 적용하고, 배율이 어두워 윤기가 묻히는 만큼(groom_spec_floor)만 흰빛을 더한다.
         """
         if color is not None:
             target = torch.as_tensor(color, device=self.device, dtype=torch.float32)
@@ -1817,6 +1822,8 @@ class GpuFaceParser:
             self._groom_rgb = [int(round(r)), int(round(g)), int(round(b))]
             self._groom_rgb_src = ("manual" if color is not None
                                    else "auto" if self._hair_color is not None else "default")
+        if spec is not None:
+            new_rgb = new_rgb + spec
         # 1) 평균색 맞춤 (채널별 배율)
         asum = new_a.sum().clamp(min=1.0)
         rmean = (new_rgb * new_a).sum((0, 1)) / asum
@@ -1836,6 +1843,12 @@ class GpuFaceParser:
             # 밝을 때 어두운 결이 음수 -> 0 으로 눌려 가닥 뭉치가 새까맣게 됐다(실측).
             tv = target.view(1, 1, 3).clamp(min=1.0)
             out = tv * torch.pow((out / tv).clamp(min=1e-3), k)
+        # 3) 윤기 흰빛. 실제 머리의 1차 반사는 표면 반사라 머리색을 띠지 않는다 - 검은 머리의 입체감은
+        #    거의 이것뿐이다. 대비 맞춤(줄이기 전용) 뒤에 더해 검은 머리 하이라이트가 다시 눌리지 않게 한다.
+        if spec is not None and CONFIG.groom_spec_floor > 0:
+            glum = (gain * self._lum_w.view(-1)).sum()
+            white = (CONFIG.groom_spec_floor - glum).clamp(min=0.0)
+            out = out + spec * white
         return out.clamp(0.0, 255.0)
 
     def close(self):

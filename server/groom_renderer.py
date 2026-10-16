@@ -117,6 +117,7 @@ uniform int u_pass;         // 0: 컷아웃(a>=0.5), 1: 반투명 가장자리(a
 uniform vec3 u_light;       // 카메라 공간 광원 방향
 uniform int u_billboard;
 uniform int u_samples;      // MSAA 샘플 수 (패스 3)
+uniform int u_split;        // 1: R=확산 x0.5, G=윤기 x2, B=확산 x0.5 로 나눠 낸다 (흰 베이스 + 회색 텍스처 전제)
 in vec2 v_uv; in vec3 v_nrm; in vec3 v_tan; in vec3 v_pos; flat in float v_rand;
 out vec4 f_color;
 float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
@@ -144,6 +145,7 @@ void main() {
     }
     vec3 Ld = normalize(u_light);
     float shade;
+    float spec_s = 0.0;
     if (u_billboard == 1) {
         // Kajiya-Kay: 머리카락은 접선 방향으로 늘어진 원기둥. 확산은 sin(T,L), 반사는 결을 따라 흐른다.
         vec3 V = normalize(-v_pos);
@@ -152,13 +154,18 @@ void main() {
         float diff = sqrt(max(0.0, 1.0 - tl * tl));
         float th = dot(v_tan, H);
         float spec = pow(sqrt(max(0.0, 1.0 - th * th)), 48.0);
-        shade = 0.45 + 0.55 * diff + 0.35 * spec;
-        shade *= 0.82 + 0.36 * v_rand;      // 가닥별 밝기 변주 (뭉침 방지)
+        float var = 0.82 + 0.36 * v_rand;   // 가닥별 밝기 변주 (뭉침 방지)
+        shade = (0.45 + 0.55 * diff) * var;
+        spec_s = 0.35 * spec * var;
     } else {
         float nl = abs(dot(v_nrm, Ld));
         shade = 0.55 + 0.45 * nl;
     }
-    vec3 c = u_base * t.rgb * shade;
+    // 윤기를 따로 내면 합성 쪽에서 머리색을 곱한 뒤 흰빛으로 더할 수 있다. 섞어 내면 윤기까지 머리색이
+    // 곱해져 검은 머리에서 하이라이트가 사라지고 점토처럼 보였다(사용자 피드백, 실측 명암 폭 13/255).
+    vec3 c = (u_split == 1)
+        ? vec3(t.r * shade * 0.5, t.r * spec_s * 2.0, t.r * shade * 0.5)
+        : u_base * t.rgb * (shade + spec_s);
     // 패스 0 은 컷아웃이라 완전 불투명으로 쓴다(블렌드 없음). 패스 1 은 SRC_ALPHA 블렌드가
     // 프리멀티플라이드로 누적하므로 스트레이트 색을 낸다. 패스 3(A2C)은 커버리지가 알파를 나른다.
     // 패스 3 은 샘플 마스크가 알파를 나르므로 알파 1 로 쓴다(리졸브 = 커버리지).
@@ -259,6 +266,7 @@ class GroomRenderer:
         self._grooms: dict[str, Groom] = {}
         self.last_ms = 0.0
         self.last_head = None
+        self.last_spec = None    # render(split_spec=True) 의 윤기 (h,w,1)
         self.last_geom = None    # (pos (h,w,3) cm, nrm (h,w,3)) - render(geom=True) 때만
         self.last_fit = None
         self.last_proj_m = None
@@ -448,8 +456,11 @@ class GroomRenderer:
     def render(self, groom: Groom, matrix: np.ndarray, w: int, h: int,
                scale_mul: float = 1.0, offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0,
                base_rgb=None, dyn: dict | None = None, head: bool = False, geom=None,
-               sx: float = 1.0, sy: float = 1.0):
+               sx: float = 1.0, sy: float = 1.0, split_spec: bool = False):
         """-> (rgb (h,w,3) BGR float 0~255, a (h,w,1) float 0~1) GPU 텐서, 또는 (None, None).
+
+        split_spec: True 면 rgb 는 윤기를 뺀 확산 음영만(0~255 넘을 수 있음, 회색)이고 윤기는
+            self.last_spec (h,w,1) 에 따로 남는다. 흰 베이스(base_rgb=1)와 회색 텍스처 전제.
 
         matrix: MediaPipe 4x4 row-major (정규 얼굴 -> 카메라 공간, cm).
         scale/offset: 그룸 json 의 user_fit 위에 세션 슬라이더를 곱/더한 최종값.
@@ -504,6 +515,7 @@ class GroomRenderer:
         base = groom.base if base_rgb is None else tuple(float(c) for c in base_rgb)
         prog["u_base"].value = base
         prog["u_tex"].value = 0
+        prog["u_split"].value = 1 if split_spec else 0
         groom.tex.use(0)
 
         fbo = self._fbo_ms
@@ -578,7 +590,13 @@ class GroomRenderer:
         # 컷아웃/A2C 는 커버리지, 가장자리는 SRC_ALPHA 누적 -> 어느 쪽이든 프리멀티플라이드라 알파로 나눈다
         a = t[:, :, 3:4] / 255.0
         rgb = t[:, :, :3] / a.clamp(min=1e-3)
-        rgb = rgb[:, :, [2, 1, 0]].clamp(0.0, 255.0)          # 합성 코드는 BGR
+        if split_spec:
+            # 8비트에 담으려고 확산은 절반, 윤기는 2배로 냈다 - 되돌린다. 확산은 255 를 넘을 수 있다(예전엔 잘렸음).
+            self.last_spec = (rgb[:, :, 1:2] * 0.5).clamp(0.0, 255.0)
+            rgb = (rgb[:, :, 0:1] * 2.0).expand(-1, -1, 3).clamp(0.0, 510.0)
+        else:
+            self.last_spec = None
+            rgb = rgb[:, :, [2, 1, 0]].clamp(0.0, 255.0)      # 합성 코드는 BGR
         self.last_ms = (time.perf_counter() - t0) * 1000
         return rgb, a
 
