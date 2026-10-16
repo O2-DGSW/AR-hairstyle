@@ -725,6 +725,10 @@ class SegmentedVideoTrack(VideoStreamTrack):
                     "bank": st.bank,
                     "asset_used": ("3D " + st.groom) if st.groom_obj else _asset_label(asset, asset2, mix),
                     "groom": st.groom,
+                    # 그룸에 입힌 머리색 [r,g,b] 0~255 와 출처("auto"=사용자 머리색 자동 맞춤,
+                    # "manual"=groom_color 염색 미리보기, "default"=머리가 안 보여 기본색). 그룸 없으면 null.
+                    "groom_rgb": timings.get("groom_rgb") if st.groom_obj else None,
+                    "groom_rgb_src": timings.get("groom_rgb_src") if st.groom_obj else None,
                     "groom_ms": round(timings.get("groom_ms", 0.0), 2),
                     "pose_ms": round(timings.get("pose_ms", 0.0), 1),
                     "yaw_ema": round(self._yaw_ema, 1) if self._yaw_ema is not None else None,

@@ -148,6 +148,8 @@ class GpuFaceParser:
         self._groom = None      # GroomRenderer (3D 헤어카드). 처음 쓸 때 gpu_executor 스레드에서 생성.
         self._hair_color = None # 사용자 머리 평균색 (BGR 텐서, EMA). 그룸 색 맞춤용.
         self._hair_std = None   # 사용자 머리 휘도 표준편차 (EMA). 대비 맞춤용.
+        self._groom_rgb = None  # 그룸에 실제로 입힌 색 [r,g,b] 0~255 (stats 로 프론트에 보고). 그룸 없으면 None.
+        self._groom_rgb_src = None  # "manual"(염색 미리보기) / "auto"(사용자 머리색) / "default"(머리 안 보임)
 
         # 추론 시간 측정용 CUDA 이벤트. 쌍을 두 조 두고 번갈아 쓴다 - 자세한
         # 이유는 _begin_infer() 주석 참고.
@@ -1177,6 +1179,11 @@ class GpuFaceParser:
             protect = p.clamp(0.0, 1.0)
             if new_a is not None:
                 cut = protect
+                if groom is not None:
+                    # 3D 그룸은 앞머리가 실제로 눈 앞에 있는 기하다. 눈 모양 타원으로 깎으면 앞머리에 동그란
+                    # 구멍이 뚫려 '눈을 원으로 막아 둔' 것처럼 보였다(사용자 피드백). 가는 결 사이로 눈이
+                    # 비치는 건 렌더 알파가 이미 표현한다. 깎는 정도는 groom_protect_eyes 로 따로 둔다.
+                    cut = protect * float(CONFIG.groom_protect_eyes)
                 if groom is not None and pose is not None and CONFIG.groom_protect_yaw_hi > CONFIG.groom_protect_yaw_lo:
                     # 3D 그룸 옆모습: 옆머리가 눈가를 지나가면 눈/안경 보호가 렌즈 모양 그대로 헤어에 구멍을
                     # 뚫어 살색 타원이 떴다(실측 yaw -47°). 정면 앞머리가 눈을 덮는 걸 막는 장치라 고개를
@@ -1184,7 +1191,7 @@ class GpuFaceParser:
                     ay = abs(float(pose.get("yaw", 0.0)))
                     f = 1.0 - min(1.0, max(0.0, (ay - CONFIG.groom_protect_yaw_lo)
                                            / (CONFIG.groom_protect_yaw_hi - CONFIG.groom_protect_yaw_lo)))
-                    cut = protect * f
+                    cut = cut * f
                 new_a = new_a * (1.0 - cut).unsqueeze(-1)
 
         if mode in ("remove", "tryon") and plate is not None and plate.seen is not None:
@@ -1444,6 +1451,8 @@ class GpuFaceParser:
             "groom_ms": groom_ms if mode in ("remove", "tryon") else 0.0,
             "pose_ms": pose_ms,
             "pose": pose,
+            "groom_rgb": self._groom_rgb,
+            "groom_rgb_src": self._groom_rgb_src,
         }
 
     # ---- 3D 그룸 ----
@@ -1802,6 +1811,12 @@ class GpuFaceParser:
                                          dtype=torch.float32)
             else:
                 target = self._hair_color
+        # 프론트 보고용 RGB. .tolist() 는 동기화라 stats 프레임(이미 동기화됨)과 첫 값에서만 뽑는다.
+        if refresh or self._groom_rgb is None:
+            b, g, r = target.tolist()
+            self._groom_rgb = [int(round(r)), int(round(g)), int(round(b))]
+            self._groom_rgb_src = ("manual" if color is not None
+                                   else "auto" if self._hair_color is not None else "default")
         # 1) 평균색 맞춤 (채널별 배율)
         asum = new_a.sum().clamp(min=1.0)
         rmean = (new_rgb * new_a).sum((0, 1)) / asum

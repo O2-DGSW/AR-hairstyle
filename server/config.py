@@ -261,6 +261,10 @@ class Config:
     #: 3D 그룸에서 눈/안경 보호로 헤어를 깎는 것을 이 yaw(도) 구간에서 서서히 끈다(옆모습 렌즈 모양 구멍 방지).
     groom_protect_yaw_lo: float = 15.0
     groom_protect_yaw_hi: float = 30.0
+    #: 3D 그룸 헤어를 눈 보호 마스크로 깎는 정도(0~1, protect_eyes 에 곱한다). 0 이면 앞머리가 눈을
+    #: 실제처럼 덮는다(가는 결 사이로 비치는 건 렌더 알파). 1 이면 예전처럼 눈 둘레에 타원 구멍.
+    #: 기존 머리를 지울 때 눈 위에 살색을 안 칠하는 보호(erase 쪽)는 이 값과 무관하게 그대로다.
+    groom_protect_eyes: float = 0.0
     groom_volume: float = 0.6
     #: 그룸 자동 맞춤 (gpu_segmenter._update_autofit): 정면 포즈에서 얼굴 랜드마크와 그룸 두상의 대응점으로
     #: 가로/세로 배율과 이마 높이를 사용자에게 맞춘다. range 는 배율 한계, alpha 는 프레임당 EMA.
