@@ -50,6 +50,10 @@ _IMAGE_LM = None
 #: MediaPipe 눈썹 인덱스 (윗선, 아랫선), 안쪽 -> 바깥. R = 피사체 오른쪽(화면 왼쪽).
 BROW_R = ((107, 66, 105, 63, 70), (55, 65, 52, 53, 46))
 BROW_L = ((336, 296, 334, 293, 300), (285, 295, 282, 283, 276))
+#: 눈 윤곽 (닫힌 고리 16점). 앞머리가 눈을 찔러 덮어도 메시가 눈 자리를 추정한다 - 이마 인페인터가
+#: 눈 위 머리카락을 지우고 눈을 다시 그릴 때 위치 안내로 쓴다(forehead_net, v5).
+EYE_R_RING = (33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7)
+EYE_L_RING = (263, 466, 388, 387, 386, 385, 384, 398, 362, 382, 381, 380, 374, 373, 390, 249)
 
 
 #: 그룸 자동 맞춤에 쓰는 MediaPipe 랜드마크 (mp_flame_corr.npz 로 FLAME head_prior 정점과 대응)
@@ -98,9 +102,11 @@ def landmarks_image(frame_rgb: np.ndarray):
     # 맨이마를 합성할 때 눈썹을 그려 넣는 데 쓴다(forehead.py).
     brows = [(np.array([px(i) for i in up], np.float32), np.array([px(i) for i in lo], np.float32))
              for up, lo in (BROW_R, BROW_L)]
+    eyes = [np.array([px(i) for i in ring], np.float32) for ring in (EYE_R_RING, EYE_L_RING)]
     return {
         "matrix": matrix,
         "brows": brows,
+        "eyes": eyes,
         "eye_l": e0 if e0[0] <= e1[0] else e1,
         "eye_r": e1 if e0[0] <= e1[0] else e0,
         "mouth_l": m0 if m0[0] <= m1[0] else m1,

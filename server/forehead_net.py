@@ -7,6 +7,11 @@
 
 크롭 정의(crop_box)는 학습 데이터(train/prep_forehead_data.py)와 런타임이 공유한다: 눈 중심 기준,
 한 변 CROP_D·d, 눈이 위에서 EYE_Y 비율에 오게.
+
+v4 부터 5번째 입력 = 눈썹 안내(brow_guide): MediaPipe 메시가 추정한 눈썹 윗선/아랫선을 칠한 마스크.
+앞머리가 눈썹을 다 덮으면 문맥만으로는 눈썹 위치/모양을 알 수 없어 흐린 얼룩이나 맨살이 됐다.
+v5 부터 6번째 입력 = 눈 안내(eye_guide, 눈 윤곽). 눈을 찌르는 앞머리도 지운다 - 그 전엔 눈 둘레 타원을
+구멍에서 빼서 눈 위 머리카락이 그대로 남았다. 가중치의 첫 conv 입력 채널 수로 4/5/6ch 를 자동 판별한다.
 """
 from __future__ import annotations
 
@@ -43,6 +48,41 @@ def band_mask(px: int = NET_PX) -> np.ndarray:
     return (ys > cy - BAND_UP * d) & (ys < cy + BAND_DOWN * d) & (np.abs(xs - cx) < BAND_SIDE * d)
 
 
+def brow_guide(brows, px: int = NET_PX, M=None) -> np.ndarray:
+    """눈썹선 [(윗선 5점, 아랫선 5점), ...] -> 칠한 마스크 (float32 px x px, 0~1, 가장자리 살짝 흐림).
+    M: 원본 -> 크롭 2x3 (없으면 이미 크롭 좌표)."""
+    import cv2
+    g = np.zeros((px, px), np.float32)
+    if brows is None:
+        return g
+    for up, lo in brows:
+        poly = np.concatenate([np.asarray(up, np.float32), np.asarray(lo, np.float32)[::-1]], 0)
+        if M is not None:
+            poly = poly @ np.asarray(M, np.float32)[:, :2].T + np.asarray(M, np.float32)[:, 2]
+        cv2.fillPoly(g, [np.round(poly * 4).astype(np.int32)], 1.0, lineType=cv2.LINE_AA, shift=2)
+    return cv2.GaussianBlur(g, (0, 0), px / 256.0)
+
+
+def eye_guide(eyes, px: int = NET_PX, M=None) -> np.ndarray:
+    """눈 윤곽 [고리 16점, 고리 16점] -> 칠한 마스크 (float32 px x px)."""
+    import cv2
+    g = np.zeros((px, px), np.float32)
+    if eyes is None:
+        return g
+    for ring in eyes:
+        poly = np.asarray(ring, np.float32)
+        if M is not None:
+            poly = poly @ np.asarray(M, np.float32)[:, :2].T + np.asarray(M, np.float32)[:, 2]
+        cv2.fillPoly(g, [np.round(poly * 4).astype(np.int32)], 1.0, lineType=cv2.LINE_AA, shift=2)
+    return cv2.GaussianBlur(g, (0, 0), px / 256.0)
+
+
+def guides(n: int, brows=None, eyes=None, px: int = NET_PX, M=None) -> np.ndarray:
+    """안내 채널 n 개 (0/1/2) -> (n, px, px). 순서: 눈썹, 눈."""
+    out = [brow_guide(brows, px, M), eye_guide(eyes, px, M)][:n]
+    return np.stack(out) if out else np.zeros((0, px, px), np.float32)
+
+
 class _Res(nn.Module):
     def __init__(self, c, dil=1):
         super().__init__()
@@ -56,10 +96,11 @@ class _Res(nn.Module):
 class ForeheadNet(nn.Module):
     """U-Net: 입력 (구멍을 0 으로 지운 RGB [-1,1], 마스크) 4ch -> RGB. 병목은 팽창 잔차로 넓은 문맥."""
 
-    def __init__(self, c=48):
+    def __init__(self, c=48, in_ch=4):
         super().__init__()
         ch = [c, c * 2, c * 4, c * 8]
-        self.inc = nn.Sequential(nn.Conv2d(4, ch[0], 5, padding=2), nn.SiLU(), _Res(ch[0]))
+        self.in_ch = in_ch
+        self.inc = nn.Sequential(nn.Conv2d(in_ch, ch[0], 5, padding=2), nn.SiLU(), _Res(ch[0]))
         self.downs = nn.ModuleList()
         for i in range(3):
             self.downs.append(nn.Sequential(nn.Conv2d(ch[i], ch[i + 1], 4, stride=2, padding=1), nn.SiLU(),
@@ -73,8 +114,11 @@ class ForeheadNet(nn.Module):
                 "res": nn.Sequential(nn.Conv2d(ch[i] * 2, ch[i], 3, padding=1), nn.SiLU(), _Res(ch[i]))}))
         self.out = nn.Conv2d(ch[0], 3, 3, padding=1)
 
-    def forward(self, img, mask):
-        x = torch.cat([img * (1 - mask), mask], 1)
+    def forward(self, img, mask, guide=None):
+        x = [img * (1 - mask), mask]
+        if self.in_ch > 4:
+            x.append(guide if guide is not None else torch.zeros_like(mask).repeat(1, self.in_ch - 4, 1, 1))
+        x = torch.cat(x, 1)
         skips = [self.inc(x)]
         h = skips[0]
         for d in self.downs:
@@ -92,12 +136,18 @@ class LearnedForehead:
 
     def __init__(self, device="cuda", path=WEIGHTS):
         self.device = device
-        self.net = ForeheadNet().to(device).eval()
         sd = torch.load(path, map_location=device)
-        self.net.load_state_dict(sd.get("ema", sd.get("net", sd)))
+        sd = sd.get("ema", sd.get("net", sd))
+        self.net = ForeheadNet(in_ch=sd["inc.0.weight"].shape[1]).to(device).eval()
+        self.net.load_state_dict(sd)
+
+    @property
+    def fills_eyes(self) -> bool:
+        """눈 안내(6ch)가 있는 가중치 = 눈 위 머리카락까지 지우도록 학습됨."""
+        return self.net.in_ch >= 6
 
     @torch.inference_mode()
-    def fill(self, frame_bgr: np.ndarray, hole: np.ndarray, eye_l, eye_r) -> np.ndarray:
+    def fill(self, frame_bgr: np.ndarray, hole: np.ndarray, eye_l, eye_r, brows=None, eyes=None) -> np.ndarray:
         import cv2
         h, w = frame_bgr.shape[:2]
         x0, y0, S = crop_box(eye_l, eye_r)
@@ -107,7 +157,10 @@ class LearnedForehead:
         t = torch.from_numpy(cv2.cvtColor(ci, cv2.COLOR_BGR2RGB)).to(self.device).permute(2, 0, 1)[None].float()
         t = t / 127.5 - 1
         m = torch.from_numpy(cm.astype(np.float32)).to(self.device)[None, None]
-        comp, _ = self.net(t, m)
+        g = None
+        if self.net.in_ch > 4:
+            g = torch.from_numpy(guides(self.net.in_ch - 4, brows, eyes, NET_PX, M)).to(self.device)[None]
+        comp, _ = self.net(t, m, g)
         out = ((comp[0].permute(1, 2, 0).clamp(-1, 1) + 1) * 127.5).byte().cpu().numpy()
         out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
         Minv = cv2.invertAffineTransform(M)

@@ -1785,7 +1785,8 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         name = f"forehead-{int(time.time() * 1000) % 1000000}"
         asset, bangs_px, ms = await loop.run_in_executor(
             app.forehead_executor, forehead.build_forehead_asset,
-            app.forehead, frame, cls, lm["eye_l"], lm["eye_r"], name, 7, lm.get("matrix"), lm.get("brows"))
+            app.forehead, frame, cls, lm["eye_l"], lm["eye_r"], name, 7, lm.get("matrix"), lm.get("brows"),
+            lm.get("eyes"))
         if asset is None:
             if not quiet:
                 notify_peer(state, {"type": "forehead", "status": "error", "message": "얼굴 패치를 만들지 못했습니다"})

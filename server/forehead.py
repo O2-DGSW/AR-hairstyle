@@ -201,7 +201,7 @@ def synthesize_forehead(frame_bgr, cls, fill, eye_l, eye_r, brows=None):
 
 
 def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cls: np.ndarray,
-                         eye_l, eye_r, name: str, dilate: int = 7, matrix=None, brows=None):
+                         eye_l, eye_r, name: str, dilate: int = 7, matrix=None, brows=None, eyes=None):
     """프레임 + 파싱 + 눈 2점 -> (얼굴 패치 HairAsset, 앞머리 px, 인페인트 ms).
 
     반환 에셋은 .face 가 자기 자신이다 - gpu_segmenter 의 그룸 분기는 asset.face /
@@ -234,11 +234,14 @@ def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cl
     if learned is not None:
         t0 = time.perf_counter()
         hole = bangs > 0
-        ys_, xs_ = np.mgrid[0:h, 0:w].astype(np.float32)
-        for e in (eye_l, eye_r):        # 눈 자체는 채우지 않는다 (synth 와 같은 기하 타원)
-            hole &= ((xs_ - e[0]) / (0.42 * d)) ** 2 + ((ys_ - e[1]) / (0.26 * d)) ** 2 > 1.0
+        if not (learned.fills_eyes and eyes is not None):
+            ys_, xs_ = np.mgrid[0:h, 0:w].astype(np.float32)
+            for e in (eye_l, eye_r):    # 눈 자체는 채우지 않는다 (synth 와 같은 기하 타원)
+                hole &= ((xs_ - e[0]) / (0.42 * d)) ** 2 + ((ys_ - e[1]) / (0.26 * d)) ** 2 > 1.0
+        # 눈 안내(v5) 가중치면 눈을 찌르는 앞머리도 구멍에 둔다 - 네트워크가 메시 눈 윤곽을 보고 눈을
+        # 다시 그린다. 파서가 앞머리 아래 눈을 '머리'로 찍어도 같은 이유로 눈이 지워지지 않는다.
         with inpainter._lock:
-            bald = learned.fill(frame_bgr, hole, eye_l, eye_r)
+            bald = learned.fill(frame_bgr, hole, eye_l, eye_r, brows, eyes)
         ms = (time.perf_counter() - t0) * 1000
     elif bangs_px > 0 and FILL_METHOD in ("synth", "learned"):
         t0 = time.perf_counter()
