@@ -327,6 +327,29 @@ class SegmentedVideoTrack(VideoStreamTrack):
         self._cur_asset = None     # 히스테리시스: 지금 쓰는 뱅크 칸
         self._last_out = None      # 드롭/에러 시 내보낼 직전 합성 결과
         self._frame_size = None    # 수신 해상도 (h, w). 바뀌면 로그
+        self._next = None          # 미리 합성 중인 다음 프레임 (cfg.pipeline_frames)
+
+    async def recv(self):
+        """aiortc 송신 루프가 부른다: recv() -> 인코딩(VP8, CPU 스레드) -> 패킷 전송 -> 다시 recv().
+
+        그대로 두면 합성과 인코딩이 한 줄로 이어져 세션당 fps 가 1/(합성 + 인코딩)이 된다(720p 인코딩
+        ~8ms). 다음 프레임 합성을 여기서 미리 시작해 두면 송신 루프가 이번 프레임을 인코딩하는 동안
+        GPU 가 다음 프레임을 만든다. 소스는 MediaRelay(buffered=False) 라 늘 최신 프레임만 오므로
+        미리 당겨도 지연이 쌓이지 않는다. 동시에 도는 합성은 세션당 여전히 1개다(상태 경합 없음)."""
+        nxt, self._next = self._next, None
+        frame = await (nxt if nxt is not None else self._produce())
+        if self._state.cfg.pipeline_frames and self.readyState == "live":
+            self._next = asyncio.ensure_future(self._produce())
+            # 연결이 끊기면 아무도 이 태스크를 기다리지 않는다. 소스 종료 예외(MediaStreamError)를
+            # 회수해 둬야 'Task exception was never retrieved' 가 로그에 안 쌓인다.
+            self._next.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return frame
+
+    def stop(self):
+        nxt, self._next = self._next, None
+        if nxt is not None:
+            nxt.cancel()
+        super().stop()
 
     def _pose_rgb(self, img):
         """랜드마커 워커 스레드에서 실행. 색변환도 여기서 해야 메인 루프가 안 막힌다."""
@@ -438,7 +461,8 @@ class SegmentedVideoTrack(VideoStreamTrack):
         except Exception:
             logger.exception("프레임 저장 실패")
 
-    async def recv(self):
+    async def _produce(self):
+        """소스에서 프레임 하나를 받아 합성한 VideoFrame. recv() 가 부른다."""
         st = self._state
         app = st.app
         cfg = st.cfg

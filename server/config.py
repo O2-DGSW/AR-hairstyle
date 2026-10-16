@@ -532,6 +532,9 @@ class Config:
     #: GPU 워커 대기열이 이만큼 밀려 있으면 새 프레임을 버린다(최신 우선).
     #: 버퍼는 지연을 줄이지 못한다 - 밀린 프레임을 계속 처리하면 지연만 누적된다.
     max_inflight_frames: int = 1
+    #: 이번 프레임을 인코딩하는 동안 다음 프레임을 미리 합성한다(server.SegmentedVideoTrack.recv).
+    #: 끄면 예전처럼 받기 -> 합성 -> 인코딩이 한 줄로 이어진다.
+    pipeline_frames: bool = True
 
     # ---------- 디스크 쿼터 ----------
     #: 클라이언트가 DataChannel 명령 하나로 디스크를 무한히 채울 수 있으면 안 된다.
