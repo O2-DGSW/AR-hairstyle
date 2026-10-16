@@ -45,7 +45,8 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from aiohttp import web
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc import (RTCConfiguration, RTCIceServer, RTCPeerConnection,
+                    RTCSessionDescription, VideoStreamTrack)
 from aiortc.contrib.media import MediaRelay
 from aiortc.rtcrtpsender import RTCRtpSender
 from av import VideoFrame
@@ -1942,6 +1943,8 @@ async def metrics_handler(request):
     e.counter("heddy_sessions_rejected_total",
               "동시 접속 상한 때문에 503 으로 거절한 세션 누적 수.",
               m.sessions_rejected_total)
+    e.counter("heddy_sessions_forwarded_total",
+              "꽉 차서 remote_backends 로 넘긴 세션 누적 수.", m.sessions_forwarded_total)
 
     e.counter("heddy_frames_total", "수신해 처리를 시도한 프레임 누적 수.", m.frames_total)
     e.counter("heddy_frames_dropped_total",
@@ -2113,6 +2116,43 @@ def _log_negotiated_codec(sdp: str, sid: str) -> None:
     logger.info("세션 %s 비디오 코덱: %s", sid, ", ".join(names) or "(없음)")
 
 
+#: 다른 서버가 넘겨준 /offer 표시. 이게 붙은 요청은 다시 넘기지 않는다.
+_FORWARDED_HEADER = "X-Heddy-Forwarded"
+
+
+async def _forward_offer(app, body: bytes, user_agent: str):
+    """꽉 찼을 때 cfg.remote_backends 를 순서대로 시도한다.
+
+    받아준 서버의 응답(200 answer, 또는 400 bad_offer)을 그대로 돌려준다. 400 은
+    본문이 잘못된 것이라 다른 서버에 물어도 같으므로 거기서 멈춘다.
+    전부 꽉 찼거나(503) 닿지 않으면 None - 호출자가 평소처럼 503 을 낸다.
+    """
+    import aiohttp
+
+    timeout = aiohttp.ClientTimeout(total=app.cfg.remote_offer_timeout_s)
+    headers = {"Content-Type": "application/json", _FORWARDED_HEADER: "1",
+               "User-Agent": user_agent}
+    for base in app.cfg.remote_backends:
+        url = base.rstrip("/") + "/offer"
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(url, data=body, headers=headers) as r:
+                    data = await r.read()
+                    status = r.status
+                    ctype = r.headers.get("Content-Type", "application/json")
+        except Exception as e:
+            logger.warning("원격 %s 에 넘기기 실패: %s", base, e or type(e).__name__)
+            continue
+        if status in (200, 400):
+            if status == 200:
+                app.metrics.sessions_forwarded_total += 1
+            logger.info("세션을 원격 %s 로 넘김 (응답 %d)", base, status)
+            return web.Response(body=data, status=status,
+                                content_type=ctype.split(";")[0].strip())
+        logger.info("원격 %s 도 받지 못함 (응답 %d)", base, status)
+    return None
+
+
 async def offer(request):
     app = request.app["state"]
     cfg = app.cfg
@@ -2120,7 +2160,21 @@ async def offer(request):
     # GPU 워커가 1개다. 상한을 넘겨 받으면 아무도 못 막아 다 같이 느려지고
     # 30fps 가 무너진다. 조용히 전부 느려지는 것보다 명시적으로 거절하는 편이
     # 낫다 - 거절당한 쪽은 이유를 알고 나중에 다시 오면 된다.
+    can_forward = cfg.remote_backends and not request.headers.get(_FORWARDED_HEADER)
+    # prefer_remote: 원격(학교 서버)부터. 못 받으면 아래로 내려와 이 서버가 받는다.
+    # 400(bad_offer) 도 그대로 돌려준다 - 같은 본문이면 여기서도 400 이다.
+    if can_forward and cfg.prefer_remote and len(app.sessions) < cfg.max_sessions:
+        resp = await _forward_offer(app, await request.read(),
+                                    request.headers.get("User-Agent", ""))
+        if resp is not None:
+            return resp
+        logger.info("원격이 못 받아 이 서버에서 세션을 연다")
     if len(app.sessions) >= cfg.max_sessions:
+        if can_forward:
+            resp = await _forward_offer(app, await request.read(),
+                                        request.headers.get("User-Agent", ""))
+            if resp is not None:
+                return resp
         app.metrics.sessions_rejected_total += 1
         logger.warning("세션 거절: 활성 %d / 상한 %d", len(app.sessions), cfg.max_sessions)
         return web.json_response({
@@ -2159,7 +2213,8 @@ async def offer(request):
 
     offer_desc = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(RTCConfiguration(
+        iceServers=[RTCIceServer(u) for u in cfg.ice_servers]))
     app.pcs.add(pc)
     state = PeerState(app)
     state.pc = pc

@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 import threading
 import time
 
@@ -269,7 +270,14 @@ class GroomRenderer:
             return
         import moderngl
         t0 = time.perf_counter()
-        self._ctx = moderngl.create_standalone_context(require=400)   # gl_SampleMask
+        if sys.platform == "win32":
+            self._ctx = moderngl.create_standalone_context(require=400)   # gl_SampleMask
+        else:
+            # 리눅스 서버(디스플레이 없음, 도커)에는 X 가 없어 기본 GLX 가 못 뜬다. EGL 디바이스로 연다.
+            # CUDA_VISIBLE_DEVICES 와 EGL 디바이스 번호는 따로 논다 - 같은 GPU 를 쓰려면 HEDDY_EGL_DEVICE 로 맞춘다.
+            self._ctx = moderngl.create_standalone_context(
+                require=400, backend="egl",
+                device_index=int(os.environ.get("HEDDY_EGL_DEVICE", "0")))
         self._thread = threading.get_ident()
         self._prog = self._ctx.program(vertex_shader=_VS, fragment_shader=_FS)
         self._head_prog = self._ctx.program(vertex_shader=_HEAD_VS, fragment_shader=_HEAD_FS)

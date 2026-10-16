@@ -188,5 +188,54 @@ class TestFrozen(unittest.TestCase):
         self.assertEqual(cfg.Config().input_size, 512)
 
 
+class TestEnvFile(unittest.TestCase):
+    """server/.env - 배포별 값(원격 서버 주소 등)을 코드 밖에 두는 파일."""
+
+    def _write(self, text):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".env")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_missing_file_is_empty(self):
+        # 왜 중요: .env 는 선택이다. 없다고 서버가 못 뜨면 안 된다.
+        self.assertEqual(cfg.read_env_file(os.path.join(os.path.dirname(__file__), "nope.env")), {})
+
+    def test_parses_comments_export_and_quotes(self):
+        p = self._write('# 주석\n\nexport HEDDY_MAX_SESSIONS=3\n'
+                        'HEDDY_REMOTE_BACKENDS = "http://a:8080,http://b:8080"\n')
+        env = cfg.read_env_file(p)
+        self.assertEqual(env, {"HEDDY_MAX_SESSIONS": "3",
+                               "HEDDY_REMOTE_BACKENDS": "http://a:8080,http://b:8080"})
+        c = cfg.load_config(env=env)
+        self.assertEqual(c.remote_backends, ("http://a:8080", "http://b:8080"))
+
+    def test_malformed_line_fails_loudly(self):
+        # 왜 중요: 오타 난 줄을 건너뛰면 "넣었다고 생각한 설정"이 조용히 빠진다.
+        with self.assertRaises(ValueError):
+            cfg.read_env_file(self._write("HEDDY_MAX_SESSIONS\n"))
+
+    def test_real_environment_beats_the_file(self):
+        # 왜 중요: `HEDDY_X=... python server.py` 로 한 번 바꿔 띄우는 게 파일보다 우선해야 한다.
+        from unittest import mock
+        p = self._write("HEDDY_MAX_SESSIONS=3\nHEDDY_PORT=9001\n")
+        with mock.patch.object(cfg, "ENV_FILE", p), \
+                mock.patch.dict(os.environ, {"HEDDY_MAX_SESSIONS": "5"}):
+            c = cfg.load_config()
+        self.assertEqual(c.max_sessions, 5)
+        self.assertEqual(c.port, 9001)
+
+    def test_no_remote_backend_is_baked_into_the_code(self):
+        # 왜 중요: 서버 주소는 배포마다 다르고 리포는 공개될 수 있다. 기본값은 비어 있어야 한다.
+        self.assertEqual(cfg.Config().remote_backends, ())
+
+    def test_prefer_remote_is_off_by_default(self):
+        # 왜 중요: 원격이 없는 배포에서 매 세션 원격 시도로 지연이 생기면 안 된다.
+        self.assertFalse(cfg.Config().prefer_remote)
+        self.assertTrue(cfg.load_config(env={"HEDDY_PREFER_REMOTE": "1"}).prefer_remote)
+
+
 if __name__ == "__main__":
     unittest.main()

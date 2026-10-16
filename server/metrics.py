@@ -152,6 +152,7 @@ class Metrics:
     def __init__(self):
         self.sessions_total = 0
         self.sessions_rejected_total = 0
+        self.sessions_forwarded_total = 0
         self.frames_total = 0
         self.frames_dropped_total = 0
         self.frame_errors_total = 0

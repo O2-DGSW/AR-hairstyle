@@ -60,6 +60,24 @@ class Config:
     #: 동시에 받을 수 있는 피어 수. GPU 워커가 1개라 초과분은 거절하는 편이
     #: 전부 같이 느려지는 것보다 낫다.
     max_sessions: int = 2
+    #: 이 서버가 꽉 찼을 때 /offer 를 넘겨 볼 다른 heddy 서버들(순서대로 시도). 쉼표 구분.
+    #: 예: HEDDY_REMOTE_BACKENDS=http://<원격 서버 주소>:8080  (server/.env 에 둔다 - .env.example)
+    #: 앱은 이 서버(Funnel 주소) 하나만 알고, 넘겨받은 서버의 answer 가 그대로 돌아가므로
+    #: 영상(WebRTC)은 폰과 그 서버가 직접 주고받는다. 이 서버는 시그널링만 중계한다.
+    #: 넘겨받은 쪽은 다시 넘기지 않는다(X-Heddy-Forwarded 헤더) - 서로를 적어도 루프가 안 생긴다.
+    remote_backends: tuple[str, ...] = ()
+    #: 켜면 꽉 찼을 때가 아니라 **매 세션마다** remote_backends 를 먼저 시도하고, 전부 닿지
+    #: 않거나 꽉 찼을 때만 이 서버가 받는다. 학교 GPU 서버를 주력으로 쓰고 이 PC 는 예비로 둘 때.
+    #: HEDDY_PREFER_REMOTE=1
+    prefer_remote: bool = False
+    #: 원격 /offer 한 번의 제한 시간(초). ICE 수집(STUN)까지 기다리므로 너무 짧으면 안 된다.
+    remote_offer_timeout_s: float = 15.0
+    #: WebRTC ICE 서버(쉼표 구분). 기본은 aiortc 기본값과 같은 구글 STUN - NAT 뒤 서버(학교 도커)는
+    #: 이걸로 공인 주소를 알아내야 폰이 붙는다. 랜카드에 공인 IP 가 직접 붙은 서버는 STUN 결과가
+    #: host 후보와 같아 쓸모가 없는데, 닿지 않는 인터페이스(Tailscale/Hyper-V/IPv6)마다 5초 타임아웃을
+    #: 기다려 /offer 응답이 매번 7초 늦었다(실측, 이름 조회 ~2초 포함). 그런 서버는 .env 에서 비운다:
+    #: HEDDY_ICE_SERVERS=
+    ice_servers: tuple[str, ...] = ("stun:stun.l.google.com:19302",)
     #: 이 시간 동안 프레임이 한 장도 안 들어오면 세션을 정리한다.
     #: 브라우저를 그냥 닫으면 ICE 가 failed 로 갈 때까지 리소스가 남는다.
     session_idle_timeout_s: float = 90.0
@@ -551,13 +569,47 @@ def _coerce(raw: str, ftype):
     return raw
 
 
+#: 배포별 값(다른 서버 주소 등)을 두는 파일. 커밋하지 않는다(.gitignore) - 형식은 .env.example.
+#: supervise.py 는 띄울 때의 환경변수를 자식에게 물려줄 뿐이라, 재부팅 후 환경변수를 빠뜨리면
+#: 조용히 예전 설정으로 돈다. 파일로 두면 서버가 뜰 때마다 스스로 읽는다.
+ENV_FILE = os.environ.get("HEDDY_ENV_FILE", os.path.join(ROOT, ".env"))
+
+
+def read_env_file(path) -> dict:
+    """KEY=VALUE 줄을 읽는다. 빈 줄/# 주석/앞의 'export ' 는 건너뛰고 값의 따옴표는 벗긴다.
+    파일이 없으면 빈 dict."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return out
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, val = line.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"{path}:{n} KEY=VALUE 형식이 아닙니다: {line!r}")
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        out[key.strip()] = val
+    return out
+
+
 def load_config(env=None) -> Config:
     """환경변수(HEDDY_*)로 덮어쓴 설정을 만든다.
+
+    env 를 안 주면 ENV_FILE 위에 실제 환경변수를 덮어쓴 것을 쓴다(환경변수가 이긴다 -
+    한 번만 바꿔 띄워 보는 `HEDDY_X=... python server.py` 가 파일보다 우선해야 한다).
 
     잘못된 값은 조용히 무시하지 않고 예외를 낸다 - 오타 난 튜닝 값으로 몇 시간
     실험하는 것보다 시작할 때 죽는 쪽이 낫다.
     """
-    env = os.environ if env is None else env
+    env = {**read_env_file(ENV_FILE), **os.environ} if env is None else env
     hints = typing.get_type_hints(Config)
     over = {}
     for f in fields(Config):

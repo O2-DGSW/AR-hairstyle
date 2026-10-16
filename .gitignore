@@ -47,6 +47,9 @@ server/captures/
 # (config.generated_dir)
 server/assets_generated/
 
+# 배포별 설정(다른 서버 주소 등). 형식은 server/.env.example. (config.ENV_FILE)
+.env
+
 # ---------- 모델 가중치 ----------
 # 20MB+. 바이너리라 diff 가 무의미하고 리포가 영구적으로 무거워진다.
 # 업스트림(MediaPipe / HF 허브)에서 받는 것이 정본이다. README.md 참고.
