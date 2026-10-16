@@ -773,11 +773,11 @@ async function start() {
   setStatus("웹캠 요청 중...");
 
   try {
-    const [capW, capH] = (el("capres").value || "640x480").split("x").map(Number);
+    const [capW, capH] = (el("capres").value || "1280x720").split("x").map(Number);
     localStream = await navigator.mediaDevices.getUserMedia({
-      // 기본 640x480. 720p 는 GAN 입력 화질(1024 정렬) 때문에 올렸던 값인데 3D 경로엔
-      // 필요 없고, 서버 합성 비용이 픽셀 수에 비례해 720p 에서는 처리 합계가 30ms 를 넘어
-      // 실시간이 깨진다(실측 640x480 20ms, 720p 23~40ms). 화질이 더 필요하면 드롭다운.
+      // 기본 1280x720. 예전엔 640x480 이었다 - 헤어 연장/틈 메우기의 정사각 k x k 필터가
+      // 해상도 제곱으로 비싸져 720p 에서 실시간이 깨졌다. 분리형(gpu_segmenter._maxk)으로 바꾼 뒤
+      // 720p 처리 시간이 640x480 과 같아졌다(학교 3090 실측 137ms -> 46ms). 1080p 는 아직 ~70ms.
       video: { width: capW, height: capH, frameRate: { ideal: 30 } },
       audio: false,
     });

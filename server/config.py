@@ -271,6 +271,8 @@ class Config:
     groom_gapfill_down: float = 0.6
     groom_gapfill_fh_w: float = 0.8
     groom_autofit: bool = True
+    #: 그룸 렌더 결과를 머리 둘레 사각형만 GL 에서 읽는다(groom_renderer._read_rect). 끄면 전체 프레임.
+    groom_read_crop: bool = True
     groom_autofit_max_yaw: float = 15.0
     groom_autofit_max_pitch: float = 15.0
     groom_autofit_range: tuple[float, ...] = (0.75, 1.35)

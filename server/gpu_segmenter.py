@@ -529,6 +529,52 @@ class GpuFaceParser:
         x = F.avg_pool2d(x, (k, 1), stride=1, padding=(k // 2, 0))
         return F.avg_pool2d(x, (1, k), stride=1, padding=(0, k // 2))
 
+    def _upload(self, frame_bgr: np.ndarray) -> torch.Tensor:
+        """프레임 -> GPU uint8 (h,w,3). 고정(pinned) 버퍼를 거친다.
+
+        일반(pageable) 메모리에서 올리면 드라이버가 내부 고정 버퍼로 한 번 더 복사하고 그동안 막힌다
+        (실측 720p 프레임당 2.5ms, 'Memcpy HtoD (Pageable -> Device)'). 버퍼는 해상도별로 하나를
+        재사용한다 - process() 는 gpu_executor 단일 스레드에서 돌고 끝에서 _download 가 동기화하므로
+        다음 프레임이 이 버퍼를 덮어쓸 때 이전 복사는 이미 끝나 있다."""
+        if self.device == "cpu":
+            return torch.from_numpy(frame_bgr)
+        buf = getattr(self, "_pin_in", None)
+        if buf is None or tuple(buf.shape) != frame_bgr.shape:
+            buf = self._pin_in = torch.empty(frame_bgr.shape, dtype=torch.uint8, pin_memory=True)
+        buf.numpy()[...] = frame_bgr
+        return buf.to(self.device, non_blocking=True)
+
+    def _download(self, out_u8: torch.Tensor) -> np.ndarray:
+        """GPU uint8 (h,w,3) -> 새 numpy 배열. 고정 버퍼로 받은 뒤 복사해서 돌려준다.
+
+        돌려준 배열은 인코더/직전 프레임 보관(_last_out)이 계속 쥐고 있으므로 재사용 버퍼를 그대로
+        내주면 다음 프레임이 덮어쓴다. 복사(720p 2.7MB)는 0.3ms 대라 pageable 직접 복사보다 싸다."""
+        if self.device == "cpu":
+            return out_u8.numpy()
+        buf = getattr(self, "_pin_out", None)
+        if buf is None or buf.shape != out_u8.shape:
+            buf = self._pin_out = torch.empty(tuple(out_u8.shape), dtype=torch.uint8, pin_memory=True)
+        buf.copy_(out_u8)                      # 고정 버퍼로의 동기 복사 - 여기서 GPU 작업이 끝난다
+        return buf.numpy().copy()
+
+    @staticmethod
+    def _maxk(x, k):
+        """(1,C,h,w) k x k 최대값 필터(팽창). max_pool2d(x, k, 1, k//2) 와 결과가 비트 단위로 같다.
+
+        정사각 창은 O(k^2) 라 커널이 눈 간격에 비례하는 곳(헤어 연장/틈 메우기)에서 해상도를
+        올리면 제곱으로 비싸졌다(실측 1280x720: 연장 52ms, 틈 메우기 35ms - 640x480 의 10배).
+        최대값은 가로/세로로 나눠도 같으므로 두 번의 1D 로 O(k) 에 끝낸다."""
+        F = torch.nn.functional
+        k = int(k) | 1
+        if k < 3:
+            return x
+        x = F.max_pool2d(x, (k, 1), stride=1, padding=(k // 2, 0))
+        return F.max_pool2d(x, (1, k), stride=1, padding=(0, k // 2))
+
+    # _pushpull 을 CUDA 그래프로 묶으면 호출당 CPU 1.6ms 를 아끼지만 **세션 중에 녹화하면 안 된다**.
+    # 헤어를 바꾸는 순간 맨이마 생성(forehead_executor, 다른 스레드)이 같은 GPU 를 쓰면 녹화가 깨지고,
+    # 깨진 녹화가 CUDA 난수 생성기 상태를 망가뜨려 그 뒤로 SegFormer 그래프 재생이 매 프레임
+    # "Offset increment outside graph capture" 로 죽었다 - 헤어가 아예 안 씌워졌다(운영 실측). 되돌렸다.
     @staticmethod
     def _pushpull(img, m, levels: int = 7):
         """(1,C,h,w) 값을 가중 m (1,1,h,w) 0~1 인 곳에서 빈 곳으로 확산한다(피라미드 push-pull).
@@ -766,7 +812,7 @@ class GpuFaceParser:
 
         # --- 전처리 (GPU) ---
         t_pre = time.perf_counter()
-        frame_t = torch.from_numpy(frame_bgr).to(self.device, non_blocking=True)
+        frame_t = self._upload(frame_bgr)
         rgb = frame_t[:, :, [2, 1, 0]].permute(2, 0, 1).unsqueeze(0).float() / 255.0
         x = torch.nn.functional.interpolate(
             rgb, size=(CONFIG.input_size, CONFIG.input_size),
@@ -1326,7 +1372,7 @@ class GpuFaceParser:
                 if eyes is not None:
                     d = float(np.hypot(eyes[1][0] - eyes[0][0], eyes[1][1] - eyes[0][1]))
                     sk = max(3, int(round(CONFIG.shadow_k * d / 50.0))) | 1
-                blurred = F.avg_pool2d(a2, sk, stride=1, padding=sk // 2)
+                blurred = self._box(a2, sk)          # 정사각 avg_pool 과 같은 값(부동소수 오차), O(k)
                 band = (blurred - a2).clamp(min=0.0).squeeze(0).permute(1, 2, 0)
                 if groom is not None and eyes is not None and CONFIG.groom_drop_shadow > 0:
                     # 3D 그룸: 위에서 오는 빛에 앞머리가 이마로 떨어뜨리는 **아래쪽** 그림자.
@@ -1381,7 +1427,7 @@ class GpuFaceParser:
                 out = self._apply_blender(out, eyes[0], eyes[1], h, w, blend)
                 blended = True
 
-        out_u8 = out.clamp(0, 255).to(torch.uint8).cpu().numpy()
+        out_u8 = self._download(out.clamp(0, 255).to(torch.uint8))
         post_ms = (time.perf_counter() - t_post) * 1000
 
         return out_u8, {
@@ -1551,8 +1597,7 @@ class GpuFaceParser:
         ey = 0.5 * float(eye_l[1] + eye_r[1])
         a = new_a.squeeze(-1)
         k = max(3, int(round(CONFIG.groom_extend_k * d))) | 1
-        near = F.max_pool2d((a > 0.5).float().unsqueeze(0).unsqueeze(0), k, stride=1,
-                            padding=k // 2)
+        near = self._maxk((a > 0.5).float().unsqueeze(0).unsqueeze(0), k)
         near = self._box(near, max(3, k // 3))[0, 0]                    # 띠 끝을 부드럽게
         ys_, xs_ = self._ensure_grid(h, w)
         above = ((ey - CONFIG.groom_extend_eye * d - ys_) / (0.25 * d)).clamp(0.0, 1.0)
@@ -1562,7 +1607,7 @@ class GpuFaceParser:
         if face_front is not None:
             # 눈 간격 가로 띠는 고개를 돌리면 투영으로 좁아져, 옆모습에서 얼굴 앞 원래 앞머리가
             # 헤어 덩어리로 되살아났다(실측 yaw -47°). 두상 오클루더의 얼굴면은 각도와 무관하다.
-            ff = F.max_pool2d(face_front.unsqueeze(0).unsqueeze(0), k, stride=1, padding=k // 2)[0, 0]
+            ff = self._maxk(face_front.unsqueeze(0).unsqueeze(0), k)[0, 0]
             forehead = torch.maximum(forehead, ff)
         # 옆모습에선 원래 앞머리가 이마보다 앞(허공)으로 튀어나와 얼굴면 팽창으로도 안 닿았다(실측
         # yaw -47°: 이마 앞에 세로 헤어 덩어리). 얼굴이 향한 쪽으로 그룸 너머(같은 행에서 뒤쪽엔
@@ -1639,7 +1684,7 @@ class GpuFaceParser:
         face = ((cls >= 1) & (cls <= 12)).float()
         u = torch.maximum((a > 0.5).float(), face).unsqueeze(0).unsqueeze(0)
         k = max(3, int(round(CONFIG.groom_gapfill_k * d))) | 1
-        closed = -F.max_pool2d(-F.max_pool2d(u, k, stride=1, padding=k // 2), k, stride=1, padding=k // 2)
+        closed = -self._maxk(-self._maxk(u, k), k)
         gap = (closed - u).clamp(0.0, 1.0)[0, 0]
         ys_, xs_ = self._ensure_grid(h, w)
         rows = ((ey + CONFIG.groom_gapfill_down * d_img - ys_) / (0.3 * d_img)).clamp(0.0, 1.0)

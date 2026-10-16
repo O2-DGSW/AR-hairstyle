@@ -241,6 +241,7 @@ class Groom:
         self.base = (0.23, 0.14, 0.09)
         self.n_tris = 0
         self.billboard = False   # v1 GLB (_center/_tangent/_side/_halfw 속성) 이면 True
+        self.aabb = None         # (min, max) 정규 cm - 헤어 + 두상 정점
 
 
 class GroomRenderer:
@@ -261,6 +262,7 @@ class GroomRenderer:
         self.last_geom = None    # (pos (h,w,3) cm, nrm (h,w,3)) - render(geom=True) 때만
         self.last_fit = None
         self.last_proj_m = None
+        self._pins = {}          # 읽기용 고정 버퍼 (slot -> uint8 1D). _read_gpu
 
     # ---- 컨텍스트 ----
     def _ensure_ctx(self):
@@ -321,9 +323,11 @@ class GroomRenderer:
         g = Groom(name, path, meta or {})
         occ = None          # (v, faces) - 두상 좌표 맵은 뿌리를 다 모은 뒤에 만든다
         all_roots = []
+        all_v = []
         for gname, geom in scene.geometry.items():
             T = scene.graph.get(gname)[0] if gname in scene.graph.nodes_geometry else np.eye(4)
             v = trimesh.transform_points(geom.vertices, T).astype(np.float32)
+            all_v.append(v)
             faces = np.asarray(geom.faces, dtype=np.int32)
             # vertex_normals 는 100만 정점에서 매우 느리다 - 면 노멀을 정점에 뿌린다
             fn = np.cross(v[faces[:, 1]] - v[faces[:, 0]], v[faces[:, 2]] - v[faces[:, 0]])
@@ -394,6 +398,9 @@ class GroomRenderer:
                                           ctx.buffer(of.tobytes()))
         if g.tex is None:
             g.tex = ctx.texture((1, 1), 4, bytes([255, 255, 255, 255]))
+        # 정규 공간 AABB (헤어 + 두상). render() 가 이걸 투영해 읽어 올 사각형을 정한다.
+        allv = np.concatenate(all_v)
+        g.aabb = (allv.min(0), allv.max(0))
         self._grooms[name] = g
         logger.info("그룸 로드 %s: %d tris, 오클루더 %s (%.0fms)", name, g.n_tris,
                     "있음" if g.occ_vao else "없음", (time.perf_counter() - t0) * 1000)
@@ -540,6 +547,7 @@ class GroomRenderer:
             ctx.disable(moderngl.BLEND)
 
         ctx.copy_framebuffer(self._fbo, fbo)                  # MSAA 리졸브
+        rect = self._read_rect(mvp, groom.aabb, w, h)
         self.last_head = None
         self.last_geom = None
         if head and groom.head_vao is not None:
@@ -549,9 +557,7 @@ class GroomRenderer:
             hp = self._head_prog
             hp["u_mvp"].write(np.ascontiguousarray(mvp.T.astype(np.float32)).tobytes())
             groom.head_vao.render()
-            hraw = fh.read(components=4, dtype="f1")
-            self.last_head = torch.frombuffer(bytearray(hraw), dtype=torch.uint8).view(h, w, 4).to(
-                self.device, non_blocking=True)
+            self.last_head = self._read_gpu(fh, rect, w, h, "head")
             if geom is not None:
                 x0, y0, x1, y1 = (int(v) for v in geom)
                 x0, y0 = max(0, x0), max(0, y0)
@@ -568,15 +574,61 @@ class GroomRenderer:
                     self.last_geom = (pos[:, :, :3], nrm, (x0, y0, x1, y1))
                 self.last_fit = fit
                 self.last_proj_m = proj
-        raw = self._fbo.read(components=4, dtype="f1")         # RGBA8, 0행 = 이미지 0행 (투영 y 반전)
-        t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(h, w, 4).to(
-            self.device, non_blocking=True).float()
+        t = self._read_gpu(self._fbo, rect, w, h, "color").float()   # RGBA8, 0행 = 이미지 0행 (투영 y 반전)
         # 컷아웃/A2C 는 커버리지, 가장자리는 SRC_ALPHA 누적 -> 어느 쪽이든 프리멀티플라이드라 알파로 나눈다
         a = t[:, :, 3:4] / 255.0
         rgb = t[:, :, :3] / a.clamp(min=1e-3)
         rgb = rgb[:, :, [2, 1, 0]].clamp(0.0, 255.0)          # 합성 코드는 BGR
         self.last_ms = (time.perf_counter() - t0) * 1000
         return rgb, a
+
+    @staticmethod
+    def _read_rect(mvp, aabb, w: int, h: int):
+        """헤어/두상이 그려질 수 있는 이미지 사각형 (x0, y0, x1, y1). 모르면 프레임 전체.
+
+        GL 결과를 CPU 로 읽어 다시 GPU 로 올리는 게 렌더 자체보다 비쌌다(720p 전체 프레임 두 장 =
+        프레임당 CPU ~7ms). 실제 그려지는 건 머리 둘레뿐이라 거기만 읽는다. 셰이더가 정점을
+        움직이므로(부피, 2차 운동, 빌보드 폭) AABB 를 각 변 25% 넓혀 잡는다 - 사각형 밖은 0 으로
+        채우므로, 모자라면 헤어 끝이 잘리고 넉넉하면 조금 더 읽을 뿐이다."""
+        if aabb is None or not CONFIG.groom_read_crop:
+            return 0, 0, w, h
+        lo, hi = aabb
+        pad = (hi - lo) * 0.25
+        lo, hi = lo - pad, hi + pad
+        c = np.array([[x, y, z, 1.0] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+                      for z in (lo[2], hi[2])], np.float32)
+        p = c @ np.asarray(mvp, np.float32).T
+        if np.any(p[:, 3] <= 1e-3):           # 카메라 뒤로 넘어간 꼭짓점 - 투영이 뒤집힌다
+            return 0, 0, w, h
+        ndc = p[:, :2] / p[:, 3:4]
+        xs = (ndc[:, 0] + 1.0) * 0.5 * w
+        ys = (ndc[:, 1] + 1.0) * 0.5 * h        # 투영 y 를 뒤집어 둬서 프레임버퍼 행 = 이미지 행
+        x0 = min(max(0, int(np.floor(xs.min())) - 8), w - 4)
+        y0 = min(max(0, int(np.floor(ys.min())) - 8), h - 4)
+        x1 = max(min(w, int(np.ceil(xs.max())) + 8), x0 + 4)
+        y1 = max(min(h, int(np.ceil(ys.max())) + 8), y0 + 4)
+        return x0, y0, x1, y1
+
+    def _read_gpu(self, fbo, rect, w: int, h: int, slot: str):
+        """fbo 의 rect 영역 RGBA8 -> GPU (h,w,4) uint8 (rect 밖은 0).
+
+        bytearray 를 거치면 한 번 더 복사되고, 일반 메모리에서 올리면 드라이버가 또 복사한다.
+        고정(pinned) 버퍼에 바로 읽어 비동기로 올린다. 버퍼는 slot 별로 재사용 - 다음 프레임이
+        덮어쓸 때쯤엔 합성 끝(gpu_segmenter._download)의 동기화로 이전 업로드가 끝나 있다."""
+        x0, y0, x1, y1 = rect
+        gw, gh = x1 - x0, y1 - y0
+        pins = self._pins
+        buf = pins.get(slot)
+        if buf is None or buf.numel() < w * h * 4:
+            buf = pins[slot] = torch.empty(w * h * 4, dtype=torch.uint8,
+                                           pin_memory=str(self.device).startswith("cuda"))
+        view = buf[:gw * gh * 4]
+        fbo.read_into(view.numpy(), viewport=(x0, y0, gw, gh), components=4, dtype="f1")
+        if (x0, y0, x1, y1) == (0, 0, w, h):
+            return view.view(h, w, 4).to(self.device, non_blocking=True)
+        full = torch.zeros(h, w, 4, dtype=torch.uint8, device=self.device)
+        full[y0:y1, x0:x1] = view.view(gh, gw, 4).to(self.device, non_blocking=True)
+        return full
 
     def project_uv(self, matrix_b):
         """직전 render(geom=True) 의 두상 표면을, 다른 순간의 포즈 matrix_b 로 찍었을 때의 이미지 좌표.
