@@ -768,9 +768,24 @@ function diagnoseRemote(r, report) {
   else setStatus("연결됨 — 서버 영상 수신 중 (" + escapeHtml(codec || "?") + ")");
 }
 
+// 연결 단계별 소요 (ms, 시작 버튼 기준). "연결이 10초 넘게 걸린다" 를 어느 단계인지 가르려고 둔다.
+let connT0 = 0, connMarks = null;
+function connMark(k) {
+  if (!connMarks || k in connMarks) return;
+  connMarks[k] = Math.round(performance.now() - connT0);
+  if (k === "first_frame") {
+    console.log("[heddy] 연결 단계(ms):", JSON.stringify(connMarks));
+    const m = connMarks, d = (a, b) => ((m[b] ?? 0) - (m[a] ?? 0)) / 1000;
+    setStatus(`연결됨 ${(m.first_frame / 1000).toFixed(1)}초 — 카메라 ${(m.camera / 1000).toFixed(1)} / ` +
+              `ICE 수집 ${d("offer_created", "ice_gathered").toFixed(1)} / 서버 응답 ${d("ice_gathered", "offer_response").toFixed(1)} / ` +
+              `ICE 연결 ${d("offer_response", "pc_connected").toFixed(1)} / 첫 프레임 ${d("pc_connected", "first_frame").toFixed(1)}`);
+  }
+}
+
 async function start() {
   startBtn.disabled = true;
   setStatus("웹캠 요청 중...");
+  connT0 = performance.now(); connMarks = {};
 
   try {
     const [capW, capH] = (el("capres").value || "1280x720").split("x").map(Number);
@@ -789,6 +804,7 @@ async function start() {
     startBtn.disabled = false;
     return;
   }
+  connMark("camera");
   localVideo.srcObject = localStream;
   await localVideo.play().catch(() => {});
   capturePreview();
@@ -804,9 +820,11 @@ async function start() {
     remoteVideo.srcObject = event.streams && event.streams[0]
       ? event.streams[0] : new MediaStream([event.track]);
     remoteVideo.play().catch(() => {});
+    remoteVideo.requestVideoFrameCallback?.(() => connMark("first_frame"));
   });
   pc.addEventListener("connectionstatechange", () => {
     if (pc.connectionState === "connected" && !connectedAt) connectedAt = performance.now();
+    connMark("pc_" + pc.connectionState);
     if (pc.connectionState !== "connected") setStatus("연결 상태: " + pc.connectionState);
   });
 
@@ -824,7 +842,9 @@ async function start() {
 
   const offerDesc = await pc.createOffer();
   await pc.setLocalDescription(offerDesc);
+  connMark("offer_created");
   await waitForIceGatheringComplete(pc);
+  connMark("ice_gathered");
 
   setStatus("서버로 offer 전송 중... (첫 연결은 GPU 모델 로딩 때문에 몇 초 걸립니다)");
 
@@ -854,6 +874,7 @@ async function start() {
                       (detail ? ` — ${detail}` : ""));
     }
 
+    connMark("offer_response");
     await pc.setRemoteDescription(await res.json());
   } catch (err) {
     console.error("[heddy] 연결 실패:", err);

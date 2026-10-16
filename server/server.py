@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fractions
 import json
 import logging
 import math
@@ -326,6 +327,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
         self._yaw_ema = None       # yaw 흔들림이 각도 전환을 튀게 하므로 완만하게
         self._cur_asset = None     # 히스테리시스: 지금 쓰는 뱅크 칸
         self._last_out = None      # 드롭/에러 시 내보낼 직전 합성 결과
+        self._last_i420 = None     # _last_out 과 같은 프레임의 yuv420p (GPU 에서 변환됨) 또는 None
         self._frame_size = None    # 수신 해상도 (h, w). 바뀌면 로그
         self._next = None          # 미리 합성 중인 다음 프레임 (cfg.pipeline_frames)
 
@@ -536,10 +538,10 @@ class SegmentedVideoTrack(VideoStreamTrack):
             prev = self._last_out
             out = prev if (prev is not None and prev.shape == img.shape) else img
 
-        return self._wrap(out, frame)
+        return self._wrap(out, frame, self._last_i420 if out is self._last_out else None)
 
     @staticmethod
-    def _wrap(arr, src_frame):
+    def _wrap(arr, src_frame, i420=None):
         """내보낼 ndarray -> VideoFrame. recv() 의 **모든** 반환은 이걸 거친다.
 
         포장을 한 곳에 모아 둔 이유: recv() 안에서 ndarray 를 그대로 반환하면
@@ -547,7 +549,9 @@ class SegmentedVideoTrack(VideoStreamTrack):
         세션째 정리된다. 실제로 그렇게 만들어서 라이브 뱅크가 첫 칸만 생성하고
         멈췄다. _compose() 는 ndarray 를 반환해도 되므로 헷갈리기 쉽다.
         """
-        new_frame = VideoFrame.from_ndarray(arr, format="bgr24")
+        # i420: 같은 프레임을 GPU 에서 yuv420p 로 바꿔 둔 것. 주면 인코더의 CPU 색 변환(1080p ~3.5ms)이 빠진다.
+        new_frame = (VideoFrame.from_ndarray(i420, format="yuv420p") if i420 is not None
+                     else VideoFrame.from_ndarray(arr, format="bgr24"))
         # pts/time_base 는 반드시 원본 것을 유지한다. 새로 만들면 수신 측
         # 지터 버퍼가 타임라인을 다시 맞추느라 영상이 튄다.
         new_frame.pts = src_frame.pts
@@ -709,6 +713,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
             st.inflight -= 1
             app.gpu_inflight -= 1
         exec_ms = (time.perf_counter() - t_exec0) * 1000
+        i420 = timings.pop("i420", None)     # ndarray 라 stats JSON 에 못 넣는다 - 먼저 뺀다
         if timings.get("pose") is not None:
             pose = timings["pose"]
             self._last_pose = pose
@@ -782,6 +787,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
                         st.dropped, st.errors)
 
         self._last_out = processed
+        self._last_i420 = i420
         return processed
 
 
@@ -2097,8 +2103,50 @@ def _apply_video_bitrate(cfg) -> None:
     lo = min(lo, hi)
     _vpx.MAX_BITRATE = hi
     _vpx.DEFAULT_BITRATE = lo
+    # H.264 도 같은 방식의 전역(h264.py: 상한 3Mbps, 시작 1Mbps)이라 같이 연다 - 안 열면 코덱만 바꿔도
+    # 화질이 떨어진다.
+    from aiortc.codecs import h264 as _h264
+    _h264.MAX_BITRATE = hi
+    _h264.DEFAULT_BITRATE = lo
     logger.info("영상 비트레이트: 시작 %.1f Mbps / 상한 %.1f Mbps "
                 "(aiortc 기본 0.5 / 1.5)", lo / 1e6, hi / 1e6)
+
+
+def _apply_x264_preset(cfg) -> None:
+    """aiortc 의 libx264 인코더에 preset 을 넣는다.
+
+    aiortc(h264.create_encoder_context)는 profile/level/tune 만 주고 preset 은 x264 기본(medium)이라,
+    1080p 에서 인코드만 프레임당 9.7ms(p95 14.6)였다. veryfast 는 같은 비트레이트에서 PSNR 이
+    medium 과 거의 같고(실측 42.94 vs 42.98dB) 몇 배 빠르다. 함수를 감싸 옵션만 더한다 -
+    h264_omx(라즈베리파이 하드웨어) 쪽은 건드리지 않는다.
+    level 31 도 뺀다: 720p 상한 레벨이라 1080p 에서 x264 가 레벨을 어기는 스트림을 낸다.
+    """
+    preset = (cfg.video_x264_preset or "").strip()
+    if not preset:
+        return
+    import av as _av
+    from aiortc.codecs import h264 as _h264
+    if getattr(_h264.create_encoder_context, "_heddy", False):
+        return
+    orig = _h264.create_encoder_context
+
+    def create_encoder_context(codec_name, width, height, bitrate):
+        if codec_name != "libx264":
+            return orig(codec_name, width, height, bitrate)
+        codec = _av.CodecContext.create(codec_name, "w")
+        codec.width = width
+        codec.height = height
+        codec.bit_rate = bitrate
+        codec.pix_fmt = "yuv420p"
+        codec.framerate = fractions.Fraction(_h264.MAX_FRAME_RATE, 1)
+        codec.time_base = fractions.Fraction(1, _h264.MAX_FRAME_RATE)
+        codec.options = {"profile": "baseline", "tune": "zerolatency", "preset": preset}
+        codec.open()
+        return codec, False
+
+    create_encoder_context._heddy = True
+    _h264.create_encoder_context = create_encoder_context
+    logger.info("x264 preset: %s (aiortc 기본 medium)", preset)
 
 
 def _prefer_codec(pc, want: str) -> None:
@@ -2125,6 +2173,21 @@ def _prefer_codec(pc, want: str) -> None:
                 t.setCodecPreferences(prefs)
             except Exception:
                 logger.exception("코덱 고정 실패 - 브라우저 선택으로 진행합니다")
+                continue
+            # setCodecPreferences 만으로는 안 먹는다: 원격 offer 의 코덱 합의는 setRemoteDescription 안에서
+            # 이미 끝나 t._codecs 에 들어 있고 createAnswer 는 그걸 그대로 쓴다. 그래서 이 함수는 오랫동안
+            # 아무 일도 안 했다 - VP8 이 쓰인 건 Chrome offer 가 VP8 을 앞에 둬서였다(2026-10-16 확인).
+            # 합의된 목록을 직접 거른다. rtx 는 남긴 코덱을 가리키는(apt) 것만.
+            codecs = getattr(t, "_codecs", None)
+            if not codecs:
+                continue
+            keep = [c for c in codecs if c.mimeType.lower() == mime.lower()]
+            if not keep:
+                logger.warning("브라우저 offer 에 %s 가 없어 브라우저 선택으로 진행합니다", mime)
+                continue
+            pts = {c.payloadType for c in keep}
+            t._codecs = [c for c in codecs if c in keep or (
+                c.mimeType.lower() == "video/rtx" and int(c.parameters.get("apt", -1)) in pts)]
 
 
 def _log_negotiated_codec(sdp: str, sid: str) -> None:
@@ -2499,6 +2562,7 @@ def create_app(cfg=CONFIG, preload=False, preload_gan=False) -> web.Application:
         # 세션이 이미 돌고 있으면 그 세션에는 안 먹는다.
         _apply_rtp_packet_size(cfg)
         _apply_video_bitrate(cfg)
+        _apply_x264_preset(cfg)
 
         # 정적 에셋은 여기서 **한 번만** 읽어 전 세션이 공유한다(읽기 전용).
         # 끄면 아예 안 읽는다 - 목록에서 감추는 게 아니라 존재하지 않게 된다.

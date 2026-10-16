@@ -559,6 +559,28 @@ class GpuFaceParser:
         buf.copy_(out_u8)                      # 고정 버퍼로의 동기 복사 - 여기서 GPU 작업이 끝난다
         return buf.numpy().copy()
 
+    def _download_i420(self, out_f: torch.Tensor):
+        """GPU BGR float (h,w,3) 0~255 -> numpy yuv420p (h*3/2, w) uint8, 또는 None (CPU / 홀수 크기).
+
+        인코더(VP8/H.264)는 yuv420p 만 먹어서 BGR 을 주면 CPU 에서 swscale 로 바꾼다 - 1080p 3.3~3.8ms,
+        720p 1.6ms(실측). 합성 결과는 이미 GPU 에 있으니 여기서 바꾸면 ~0.3ms 에 다운로드도 절반(1.5B/px).
+        변환식은 swscale 기본과 같은 BT.601 limited range, 색차는 2x2 평균."""
+        h, w = out_f.shape[:2]
+        if self.device == "cpu" or h % 2 or w % 2:
+            return None
+        b, g, r = out_f[..., 0], out_f[..., 1], out_f[..., 2]
+        y = 0.257 * r + 0.504 * g + 0.098 * b + 16.0
+        c = torch.nn.functional.avg_pool2d(out_f.permute(2, 0, 1).unsqueeze(0), 2)[0]   # (3,h/2,w/2) BGR
+        cb, cg, cr = c[0], c[1], c[2]
+        u = -0.148 * cr - 0.291 * cg + 0.439 * cb + 128.0
+        v = 0.439 * cr - 0.368 * cg - 0.071 * cb + 128.0
+        planes = torch.cat([y.reshape(-1), u.reshape(-1), v.reshape(-1)]).round_().clamp_(0, 255).to(torch.uint8)
+        buf = getattr(self, "_pin_i420", None)
+        if buf is None or buf.numel() != planes.numel():
+            buf = self._pin_i420 = torch.empty(planes.numel(), dtype=torch.uint8, pin_memory=True)
+        buf.copy_(planes)
+        return buf.numpy().reshape(h * 3 // 2, w).copy()
+
     @staticmethod
     def _maxk(x, k):
         """(1,C,h,w) k x k 최대값 필터(팽창). max_pool2d(x, k, 1, k//2) 와 결과가 비트 단위로 같다.
@@ -1435,7 +1457,9 @@ class GpuFaceParser:
                 out = self._apply_blender(out, eyes[0], eyes[1], h, w, blend)
                 blended = True
 
-        out_u8 = self._download(out.clamp(0, 255).to(torch.uint8))
+        out = out.clamp(0, 255)
+        out_u8 = self._download(out.to(torch.uint8))
+        i420 = self._download_i420(out) if CONFIG.video_gpu_i420 else None
         post_ms = (time.perf_counter() - t_post) * 1000
 
         return out_u8, {
@@ -1454,6 +1478,9 @@ class GpuFaceParser:
             "pose": pose,
             "groom_rgb": self._groom_rgb,
             "groom_rgb_src": self._groom_rgb_src,
+            # 같은 프레임의 yuv420p (h*3/2, w) - 인코더에 그대로 넘긴다(server._wrap). 세그멘터는 세션끼리
+            # 공유하므로 속성이 아니라 호출 결과로 돌려준다.
+            "i420": i420,
         }
 
     # ---- 3D 그룸 ----

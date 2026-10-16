@@ -120,13 +120,20 @@ class Config:
 
     #: 서버가 내보낼 비디오 코덱. "vp8" | "h264" | "auto"
     #:
-    #: aiortc 가 지원하는 건 VP8 과 H.264 둘뿐이고, 코덱은 **브라우저 offer 의
-    #: 순서**대로 정해진다. Chrome 이 H.264 를 앞에 두면 그쪽으로 붙는데, 그러면
-    #: 패킷은 도착하는데 framesDecoded 가 0 인 채로 검은 화면이 된다(실측).
-    #: aiortc 의 H.264 출력에서 Chrome 이 디코딩 가능한 키프레임을 못 얻는
-    #: 것으로 보인다. VP8 로 고정하면 정상 재생된다.
-    #: "auto" 는 예전 동작(브라우저가 고르는 대로)이다.
-    video_codec: str = "vp8"
+    #: aiortc 가 지원하는 건 VP8 과 H.264 둘뿐이다. 예전엔 "H.264 로 붙으면 Chrome 이 framesDecoded 0
+    #: 인 채 검은 화면" 이라 VP8 로 고정했다고 적혀 있었는데, 2026-10-16 에 보니 고정(_prefer_codec)이
+    #: 애초에 안 먹고 있었다 - 코덱은 브라우저 offer 순서(Chrome 은 VP8 먼저)로 정해졌을 뿐이다.
+    #: 고정을 고친 뒤 H.264(x264 veryfast, level 지정 없음)는 Chrome 에서 정상 디코드됐다.
+    #: H.264 가 기본인 이유: 1080p 인코드가 VP8 7.2ms -> x264 veryfast ~2ms 이고, 수신 디코드도 싸며,
+    #: 나중에 NVENC(h264_nvenc)로 갈 때 코덱이 같다. 문제가 생기면 HEDDY_VIDEO_CODEC=vp8 로 되돌린다.
+    #: "auto" 는 브라우저가 고르는 대로.
+    video_codec: str = "h264"
+    #: H.264 로 보낼 때 libx264 preset. aiortc 는 지정하지 않아 x264 기본 medium 이었다(1080p 인코드 9.7ms).
+    #: veryfast 1080p ~2ms, 화질 차이는 PSNR 0.04dB. 비우면 aiortc 기본 그대로.
+    video_x264_preset: str = "veryfast"
+    #: 합성 결과를 GPU 에서 yuv420p 로 바꿔 인코더에 넘긴다(gpu_segmenter._download_i420). 끄면 BGR 을 넘겨
+    #: 인코더가 CPU 에서 바꾼다(1080p ~3.5ms). VRAM 은 프레임 한 장 분량의 임시 텐서뿐.
+    video_gpu_i420: bool = True
 
     # ---------- 세그멘테이션 ----------
     model_id: str = "jonathandinu/face-parsing"
