@@ -302,13 +302,19 @@ class GpuFaceParser:
         return self._fmask
 
     def _ensure_grid(self, h, w):
-        if self._grid is None or self._grid[0].shape != (h, w):
+        """(ys, xs) 픽셀 좌표 격자 (h, w). 가장 큰 격자 하나를 두고 왼쪽 위에서 잘라 준다 - 그룸 ROI 는
+        프레임마다 크기가 달라서, 크기별로 새로 만들면 전체 프레임(이마 패치)과 ROI 를 오가며 매번 만들었다."""
+        g = self._grid
+        if g is None or g[0].shape[0] < h or g[0].shape[1] < w:
+            hh, ww = max(h, g[0].shape[0] if g else 0), max(w, g[0].shape[1] if g else 0)
             ys, xs = torch.meshgrid(
-                torch.arange(h, device=self.device, dtype=torch.float32),
-                torch.arange(w, device=self.device, dtype=torch.float32),
+                torch.arange(hh, device=self.device, dtype=torch.float32),
+                torch.arange(ww, device=self.device, dtype=torch.float32),
                 indexing="ij")
-            self._grid = (ys, xs)
-        return self._grid
+            self._grid = g = (ys, xs)
+        if g[0].shape == (h, w):
+            return g
+        return g[0][:h, :w], g[1][:h, :w]
 
     #: 밉맵 단계 수 상한. 1024 스케일 에셋을 1/16 까지 (눈 간격 14px 상당).
     _PYRAMID_LEVELS = 5
@@ -523,11 +529,24 @@ class GpuFaceParser:
 
     @staticmethod
     def _box(x, k):
-        """(1,C,h,w) 분리형 박스 블러. 큰 커널도 O(k) 라 저주파 추출에 쓴다."""
+        """(1,C,h,w) 분리형 박스 블러. 큰 커널도 O(k) 라 저주파 추출에 쓴다.
+
+        커널이 크면(CONFIG.box_ds_k 의 2배 이상) 줄인 해상도에서 흐린 뒤 bilinear 로 되돌린다. 커널이 눈 간격에
+        비례해서 1080p 에선 전체 프레임을 수십 탭으로 16번 훑어 프레임당 ~10ms 였다(실측). 박스 블러 결과는
+        저주파뿐이라 k/s 배 줄여도 거의 같다 - 비용은 ~s^2 배 준다."""
         F = torch.nn.functional
         k = int(k) | 1
         if k < 3:
             return x
+        ds = CONFIG.box_ds_k
+        s = k // ds if ds > 0 else 1
+        if s >= 2:
+            h, w = x.shape[-2:]
+            y = F.avg_pool2d(x, s, ceil_mode=True)
+            kk = max(3, int(round(k / s)) | 1)
+            y = F.avg_pool2d(y, (kk, 1), stride=1, padding=(kk // 2, 0))
+            y = F.avg_pool2d(y, (1, kk), stride=1, padding=(0, kk // 2))
+            return F.interpolate(y, size=(h, w), mode="bilinear", align_corners=False)
         x = F.avg_pool2d(x, (k, 1), stride=1, padding=(k // 2, 0))
         return F.avg_pool2d(x, (1, k), stride=1, padding=(0, k // 2))
 
@@ -558,6 +577,33 @@ class GpuFaceParser:
             buf = self._pin_out = torch.empty(tuple(out_u8.shape), dtype=torch.uint8, pin_memory=True)
         buf.copy_(out_u8)                      # 고정 버퍼로의 동기 복사 - 여기서 GPU 작업이 끝난다
         return buf.numpy().copy()
+
+    def _groom_roi(self, new_a, hair_a, head_a, eyes, h: int, w: int):
+        """3D 그룸 후처리를 돌릴 사각형 (x0, y0, x1, y1), 또는 None(거의 전체 프레임이면 자를 이득 없음).
+
+        = 그룸 알파 ∪ 원래 머리(소프트 알파) ∪ 두상 오클루더 ∪ 얼굴 zone(_face_zone: 눈 위 2.35d, 옆 1.45d)
+        의 외접 사각형 + 여유(groom_roi_pad x 눈 간격 d). 여유는 후처리 필터 반경(최대 ~0.25d)보다 넉넉해야
+        잘린 가장자리의 0 패딩이 안쪽 결과에 안 닿는다. 행/열 마스크(h+w 바이트)만 CPU 로 읽는다(동기화 1회)."""
+        (lx, ly), (rx, ry) = eyes
+        d = float(np.hypot(rx - lx, ry - ly))
+        m = (new_a[..., 0] > 0.01) | (hair_a > CONFIG.groom_roi_hair)
+        if head_a is not None:
+            m = m | (head_a > 0.01)
+        rc = torch.cat([m.any(1), m.any(0)]).cpu().numpy()
+        r, c = np.flatnonzero(rc[:h]), np.flatnonzero(rc[h:])
+        cx, cy = 0.5 * (lx + rx), 0.5 * (ly + ry)
+        x0, x1 = cx - 1.6 * d, cx + 1.6 * d
+        y0, y1 = cy - 2.6 * d, cy + 1.5 * d
+        if c.size:
+            x0, x1 = min(x0, float(c[0])), max(x1, float(c[-1]) + 1)
+        if r.size:
+            y0, y1 = min(y0, float(r[0])), max(y1, float(r[-1]) + 1)
+        pad = max(16.0, CONFIG.groom_roi_pad * d)
+        x0, y0 = max(0, int(x0 - pad)), max(0, int(y0 - pad))
+        x1, y1 = min(w, int(np.ceil(x1 + pad))), min(h, int(np.ceil(y1 + pad)))
+        if x1 - x0 < 32 or y1 - y0 < 32 or (x1 - x0) * (y1 - y0) > 0.85 * h * w:
+            return None
+        return x0, y0, x1, y1
 
     def _download_i420(self, out_f: torch.Tensor):
         """GPU BGR float (h,w,3) 0~255 -> numpy yuv420p (h*3/2, w) uint8, 또는 None (CPU / 홀수 크기).
@@ -943,6 +989,8 @@ class GpuFaceParser:
         face_front = None          # 오클루더 중 얼굴면(앞이마/얼굴, z 큼) - _groom_extend 가 뺀다
         head_low = None            # 오클루더 중 얼굴 높이(정수리 쪽 두피 제외) - 피부로 채워도 되는 곳
         sigma_f = None             # 프레임 노이즈 σ (그레인 정합용, tryon 에서만)
+        roi = None                 # 3D 그룸 후처리를 돌린 머리 둘레 (x0, y0, x1, y1) - 끝에서 붙여 넣는다
+        roi_full = None            # (원본 frame_f, h, w)
 
         if mode in ("remove", "tryon"):
             # 앵커는 랜드마크를 우선한다.
@@ -1075,10 +1123,32 @@ class GpuFaceParser:
                         self._stat_cache = self._frame_stats(frame_f, cls, eyes)
                         self._stat_frame = fidx
                     sigma_f = self._stat_cache[1]
+                spec_t = self._groom.last_spec if (self._groom is not None and new_rgb is not None) else None
+                # 머리 둘레(ROI)로 자른다. 이 아래 후처리(색/연장/틈/속 채우기, 지우기/채우기, 그림자, 라이트 랩)는
+                # 전부 그룸·원래 머리·얼굴 주변에서만 값이 바뀌는데 전체 프레임을 돌아 1080p 에서 ~30ms 였다.
+                # 텐서를 자르고 눈 좌표를 그 원점으로 옮기면 아래 코드는 그대로 돈다(h, w 도 ROI 크기).
+                # 맨 끝에서 원본 프레임에 붙여 넣는다.
+                if (new_rgb is not None and eyes is not None and CONFIG.groom_roi
+                        and not self.keep_debug):
+                    roi = self._groom_roi(new_a, hair_a, head_a, eyes, h, w)
+                if roi is not None:
+                    rx0, ry0, rx1, ry1 = roi
+                    roi_full = (frame_f, h, w)
+                    sl = (slice(ry0, ry1), slice(rx0, rx1))
+                    frame_f, cls, hair_a = frame_f[sl], cls[sl], hair_a[sl]
+                    new_rgb, new_a = new_rgb[sl], new_a[sl]
+                    head_a, scalp_a, face_front, head_low, spec_t = (
+                        None if t is None else t[sl] for t in (head_a, scalp_a, face_front, head_low, spec_t))
+                    if face_rgb is not None:
+                        face_rgb, face_a = face_rgb[sl], face_a[sl]
+                    eye_l = (float(eye_l[0]) - rx0, float(eye_l[1]) - ry0)
+                    eye_r = (float(eye_r[0]) - rx0, float(eye_r[1]) - ry0)
+                    eyes = (eye_l, eye_r)
+                    h, w = ry1 - ry0, rx1 - rx0
                 if new_rgb is not None:
                     new_rgb = self._match_hair_color(new_rgb, new_a, frame_f, hair_a,
                                                      want_stats, groom_color, pose=pose, eyes=eyes,
-                                                     spec=self._groom.last_spec if self._groom is not None else None)
+                                                     spec=spec_t)
                     if eyes is not None:
                         new_rgb, new_a = self._groom_post(new_rgb, new_a, scalp_a, eye_l, eye_r)
                         new_a_core = new_a
@@ -1234,8 +1304,11 @@ class GpuFaceParser:
                 # 살색 조각만 남았다(실측: 고개 숙인 프레임). 원래 머리를 그대로 둔다.
                 erase = torch.zeros_like(hair_a)
 
-            fill = plate.plate
-            src_ok = plate.seen.float()
+            pl_img, pl_seen = plate.plate, plate.seen
+            if roi is not None:
+                pl_img, pl_seen = pl_img[sl], pl_seen[sl]
+            fill = pl_img
+            src_ok = pl_seen.float()
             if eyes is not None and CONFIG.bg_diffuse_down > 0:
                 # 플레이트가 아직 못 본 자리(가만히 앉은 채 바로 씌움 = 머리 뒤 배경이 한 번도 안 드러남)
                 # 를 주변 관측 배경의 확산으로 채운다. 이게 없으면 그 자리는 원래 머리가 그대로 남았다.
@@ -1244,12 +1317,13 @@ class GpuFaceParser:
                 ey = 0.5 * float(eyes[0][1] + eyes[1][1])
                 ys_, _ = self._ensure_grid(h, w)
                 rows = ((ey + CONFIG.bg_diffuse_down * d - ys_) / max(1.0, 0.3 * d)).clamp(0.0, 1.0)
-                seen = plate.seen.float()
-                # 플레이트는 천천히 변한다 - 확산은 stats_every 프레임에 한 번(매 프레임 ~1.5ms)
-                if self._bg_pp is None or self._bg_pp.shape[:2] != (h, w) or want_stats:
+                seen = pl_seen.float()
+                # 플레이트는 천천히 변한다 - 확산은 stats_every 프레임에 한 번(매 프레임 ~1.5ms).
+                # 전체 플레이트로 한다(ROI 로 자르면 매 프레임 사각형이 달라 캐시가 안 되고 외삽 문맥도 준다).
+                if (self._bg_pp is None or self._bg_pp.shape[:2] != plate.plate.shape[:2] or want_stats):
                     self._bg_pp = self._pushpull(plate.plate.permute(2, 0, 1).unsqueeze(0),
-                                                 seen.unsqueeze(0).unsqueeze(0))[0].permute(1, 2, 0)
-                pp = self._bg_pp
+                                                 plate.seen.float().unsqueeze(0).unsqueeze(0))[0].permute(1, 2, 0)
+                pp = self._bg_pp if roi is None else self._bg_pp[sl]
                 okd = (seen.sum() > 0).float()          # 배경을 한 픽셀도 못 봤으면 확산할 게 없다
                 fill = fill * seen.unsqueeze(-1) + pp * (1.0 - seen).unsqueeze(-1)
                 src_ok = torch.maximum(src_ok, rows * okd)
@@ -1457,6 +1531,11 @@ class GpuFaceParser:
                 out = self._apply_blender(out, eyes[0], eyes[1], h, w, blend)
                 blended = True
 
+        if roi is not None:
+            frame_f, h, w = roi_full
+            full = frame_f.clone()
+            full[sl] = out
+            out = full
         out = out.clamp(0, 255)
         out_u8 = self._download(out.to(torch.uint8))
         i420 = self._download_i420(out) if CONFIG.video_gpu_i420 else None

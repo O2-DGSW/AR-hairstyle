@@ -36,11 +36,16 @@ class TestSeparablePooling(unittest.TestCase):
         self.assertTrue(torch.equal(got, ref))
 
     def test_box_matches_square_avg_pool(self):
-        # 그림자 띠. 합 순서만 달라 부동소수 오차 수준으로 같다.
+        # 그림자 띠. 작은 커널은 합 순서만 달라 부동소수 오차 수준으로 같다.
+        # 큰 커널(box_ds_k 의 2배 이상)은 줄인 해상도에서 흐리므로 근사 - 무작위 이진 마스크처럼
+        # 고주파가 최대인 입력에서도 값(0~1)의 몇 % 안쪽이다.
+        from config import CONFIG
         for x in self.inputs:
             for k in (3, 9, 31):
                 ref = F.avg_pool2d(x, k, stride=1, padding=k // 2)
-                torch.testing.assert_close(GpuFaceParser._box(x, k), ref, rtol=1e-5, atol=1e-6)
+                approx = CONFIG.box_ds_k > 0 and k // CONFIG.box_ds_k >= 2
+                tol = dict(rtol=0, atol=0.03) if approx else dict(rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(GpuFaceParser._box(x, k), ref, **tol)
 
     def test_even_and_tiny_kernels_follow_the_odd_rule(self):
         x = self.inputs[1]

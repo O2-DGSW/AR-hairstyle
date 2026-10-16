@@ -134,6 +134,15 @@ class Config:
     #: 합성 결과를 GPU 에서 yuv420p 로 바꿔 인코더에 넘긴다(gpu_segmenter._download_i420). 끄면 BGR 을 넘겨
     #: 인코더가 CPU 에서 바꾼다(1080p ~3.5ms). VRAM 은 프레임 한 장 분량의 임시 텐서뿐.
     video_gpu_i420: bool = True
+    #: 박스 블러(gpu_segmenter._box) 커널이 이 값의 2배 이상이면 k//box_ds_k 배 줄인 해상도에서 흐린다.
+    #: 0 이면 항상 원래 해상도. 결과는 저주파라 거의 같고 1080p 에서 _box 비용이 크게 준다.
+    box_ds_k: int = 8
+    #: 3D 그룸 후처리를 머리 둘레 사각형(ROI)에서만 돌린다(gpu_segmenter._groom_roi). 끄면 전체 프레임.
+    #: pad: 사각형 여유(눈 간격 배수) - 후처리 필터 반경보다 커야 가장자리 패딩이 결과에 안 닿는다.
+    #: hair: 원래 머리 소프트 알파가 이 값을 넘는 곳까지 포함(그 밖은 지우지 않게 된다).
+    groom_roi: bool = True
+    groom_roi_pad: float = 0.75
+    groom_roi_hair: float = 0.02
 
     # ---------- 세그멘테이션 ----------
     model_id: str = "jonathandinu/face-parsing"
