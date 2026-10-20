@@ -253,6 +253,8 @@ class FacePose:
             "calibrated": self._k is not None,
             # 3D 그룸 자동 맞춤 대응점 (관자놀이 54/284, 광대 옆 234/454, 이마 151, 턱 152) - 이미지 px
             "fit_lm": {i: px(i) for i in FIT_LM},
+            # 얼굴 윤곽 (px) - 긴 머리 밑 인페인터(torso_net)가 구멍에서 얼굴을 뺀다
+            "oval": np.array([px(i) for i in FACE_OVAL], np.float32),
         }
 
     def close(self):

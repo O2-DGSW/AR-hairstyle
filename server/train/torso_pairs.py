@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from torso_net import STORE_PX, CROP_D, INVALID, POSE_IDS   # noqa: E402
+from torso_net import STORE_PX, CROP_D, INVALID, BONES, S_BG, S_BODY, S_FACE, S_CLOTH   # noqa: E402,F401
 
 #: 정답: 턱+0.3d 아래 셀피 머리 넓이(d^2) 상한, 턱 아래가 원본 안에 든 비율 하한
 GT_MAX, GT_VALID = 0.05, 0.5
@@ -29,11 +29,6 @@ GT_MAX, GT_VALID = 0.05, 0.5
 DONOR_MIN = 1.0
 #: 기억 흉내 (v2): 기억이 아예 없는 비율, 틀린(낡은) 기억을 섞는 비율
 MEM_NONE, MEM_STALE = 0.4, 0.3
-#: 셀피 분류 (segmenter.CATEGORY_*)
-S_BG, S_HAIR, S_BODY, S_FACE, S_CLOTH, S_OTHER = range(6)
-#: 포즈 뼈대 (POSE_IDS 안 순번): 어깨-어깨, 어깨-팔꿈치, 어깨-엉덩이
-_P = {k: i for i, k in enumerate(POSE_IDS)}
-BONES = ((_P[11], _P[12]), (_P[11], _P[13]), (_P[12], _P[14]), (_P[11], _P[23]), (_P[12], _P[24]))
 
 
 def load_meta(root):

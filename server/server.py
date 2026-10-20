@@ -133,6 +133,8 @@ class AppState:
 
         self.segmenter = None          # 첫 연결 때 지연 초기화 (모델 로딩이 몇 초)
         self.forehead = None           # forehead.ForeheadInpainter (LaMa). 3D 그룸 첫 선택 때 적재.
+        self.torso = None              # torso_net.LearnedTorso. 긴 머리 분할 작업(hairseg 스레드)이 처음 쓸 때 적재.
+        self.torso_failed = False
         self.seg_error = None          # 적재 실패 사유. /readyz 가 이걸 돌려준다.
         self._seg_lock = asyncio.Lock()
 
@@ -272,6 +274,7 @@ class PeerState:
         self.hair_low = None
         self.hair_low_at = 0.0         # 그 마스크의 프레임 시각 (monotonic)
         self.hair_low_future = None
+        self.torso = None              # 그 프레임의 torso_net 결과 (LearnedTorso.run)
         self.livebank = None      # LiveBank: 세션 중 GAN 으로 각도별 헤어를 생성
         self.recording = False    # 학습 데이터용 원본 프레임 수집
         self.rec_dir = None
@@ -329,6 +332,10 @@ class PeerState:
         self.plate = None
         self.smoother = None
         self.last_raw = None
+        self.torso = None
+        if self.app.torso is not None:
+            # hairseg 스레드가 같은 dict 를 쓸 수 있다 - pop 하나는 GIL 안에서 원자적이다
+            self.app.torso.forget(self.sid)
         # 트랙 <-> 상태 순환참조를 끊는다. 남겨두면 GC 가 늦어져서 다음 세션이
         # 시작될 때까지 이전 세션의 프레임 버퍼가 살아 있다.
         self.track = None
@@ -462,29 +469,63 @@ class SegmentedVideoTrack(VideoStreamTrack):
         return self._state.pose.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
                                         int(time.monotonic() * 1000))
 
-    def _long_hair_mask(self, st, img, cfg):
-        """옷 위 긴 머리 마스크(셀피 분할)를 백그라운드로 갱신하고, 쓸 만큼 최근 것을 돌려준다(없으면 None).
+    def _long_hair_mask(self, st, img, cfg, pose=None):
+        """옷 위 긴 머리 마스크(셀피 분할)를 백그라운드로 갱신하고, 쓸 만큼 최근 것을 돌려준다.
+        -> (머리 확률 또는 None, 같은 프레임의 torso_net 결과 또는 None)
 
         CPU 로 ~100ms 라 매 프레임 못 돌린다. long_hair_seg_hz 간격으로 hairseg_executor 에 던지고,
         끝난 결과는 그 프레임 시각과 함께 둔다. long_hair_seg_max_age 보다 오래된 건 안 쓴다(움직였으면
-        엉뚱한 옷을 지운다)."""
+        엉뚱한 옷을 지운다). 같은 작업에서 그 지운 자리를 채울 torso_net 도 돈다 - 마스크와 채움이 같은
+        프레임이라 서로 어긋나지 않는다."""
         now = time.monotonic()
         fut = st.hair_low_future
         if fut is not None and fut.done():
             st.hair_low_future = None
             try:
-                st.hair_low, st.hair_low_at = fut.result()
+                st.hair_low, st.hair_low_at, st.torso = fut.result()
             except Exception:
                 logger.exception("긴 머리 분할 실패")
-                st.hair_low, st.hair_low_at = None, now      # 실패 직후 매 프레임 재시도하지 않게
+                st.hair_low, st.hair_low_at, st.torso = None, now, None   # 실패 직후 매 프레임 재시도하지 않게
         if st.hair_low_future is None and now - st.hair_low_at >= 1.0 / cfg.long_hair_seg_hz:
-            import segmenter
             frame = img.copy()
-            st.hair_low_future = st.app.hairseg_executor.submit(
-                lambda: (segmenter.hair_confidence(frame), now))
+            eyes = None
+            if pose is not None and pose.get("eye_l") is not None:
+                eyes = (pose["eye_l"], pose["eye_r"], pose.get("oval"))
+            st.hair_low_future = st.app.hairseg_executor.submit(self._long_hair_job, st, frame, now, eyes, cfg)
         if st.hair_low is None or now - st.hair_low_at > cfg.long_hair_seg_max_age:
-            return None
-        return st.hair_low
+            return None, None
+        return st.hair_low, st.torso
+
+    @staticmethod
+    def _long_hair_job(st, frame, now, eyes, cfg):
+        """hairseg 스레드: 셀피 분할 + (눈이 있으면) torso_net. -> (머리 확률, 프레임 시각, torso 결과)"""
+        import segmenter
+        conf6 = segmenter.selfie_confidences(frame)
+        torso = None
+        app = st.app
+        if cfg.torso_net and eyes is not None and not app.torso_failed:
+            try:
+                if app.torso is None:
+                    import torso_net
+                    if not os.path.isfile(torso_net.WEIGHTS):
+                        app.torso_failed = True
+                        logger.info("torso_net 가중치 없음 (%s) - 긴 머리 밑은 확산으로 채운다", torso_net.WEIGHTS)
+                        return conf6[segmenter.CATEGORY_HAIR], now, None
+                    t0 = time.perf_counter()
+                    app.torso = torso_net.LearnedTorso("cuda", mem_tau=cfg.torso_mem_tau,
+                                                       mem_reset=cfg.torso_mem_reset, use_mem=cfg.torso_mem)
+                    logger.info("torso_net 적재 %.1fs (입력 %dch)", time.perf_counter() - t0, app.torso.net.in_ch)
+                torso = app.torso.run(frame, conf6, eyes[0], eyes[1], eyes[2], now, key=st.sid)
+                if torso is not None:
+                    n = getattr(st, "_torso_n", 0) + 1
+                    st._torso_n = n
+                    if n in (1, 30) or n % 600 == 0:
+                        logger.info("torso_net %s: %.0fms, 구멍 중 기억 %.0f%% (%d번째)",
+                                    st.sid, torso["ms"], 100 * torso["mem"], n)
+            except Exception:
+                logger.exception("torso_net 실패 - 이 세션은 확산으로 채운다")
+                app.torso_failed = True
+        return conf6[segmenter.CATEGORY_HAIR], now, torso
 
     def _note_pose(self, p_new):
         """랜드마커 결과 하나(얼굴 없으면 None)를 _last_pose 에 반영한다.
@@ -846,15 +887,16 @@ class SegmentedVideoTrack(VideoStreamTrack):
                         and abs(float(pose["yaw"]) - self._yaw_ema) < 5.0
                         and now_m - st.forehead_built_at > cfg.forehead_refresh_s):
                     asyncio.ensure_future(build_forehead(st, quiet=True))
-            hair_low = None
+            hair_low = torso = None
             if st.groom_obj is not None and st.mode == "tryon" and cfg.long_hair_seg_hz > 0:
-                hair_low = self._long_hair_mask(st, img, cfg)
+                hair_low, torso = self._long_hair_mask(st, img, cfg, pose)
             processed, timings = await loop.run_in_executor(
                 app.gpu_executor, seg.process, img, st.plate, st.mode,
                 asset, st.scale_mul, st.offset_up, pose, st.harmonize, st.shadow,
                 st.blend, asset2, mix, st.smoother,
                 st.groom_obj, groom_fit, st.groom_color, groom_dyn,
-                pose_cf, (st.hair_dyn, st.dyn_amount, dyn_dt) if dyn_dt is not None else None, hair_low)
+                pose_cf, (st.hair_dyn, st.dyn_amount, dyn_dt) if dyn_dt is not None else None, hair_low,
+                torso)
         finally:
             st.inflight -= 1
             app.gpu_inflight -= 1

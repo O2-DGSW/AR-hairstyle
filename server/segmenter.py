@@ -44,6 +44,12 @@ def hair_confidence(frame_bgr: np.ndarray, width: int = 256) -> np.ndarray:
     '옷'으로 찍는다(실측). 이 셀피 모델은 상반신 기준이라 그 머리까지 잡는다. CPU 로 ~100ms 라
     (Windows 는 GPU delegate 없음) 서버는 백그라운드로 드문드문 돌려 마스크만 넘긴다.
     IMAGE 모드라 상태가 없고, 인스턴스 하나를 락으로 공유한다."""
+    return selfie_confidences(frame_bgr, width)[CATEGORY_HAIR]
+
+
+def selfie_confidences(frame_bgr: np.ndarray, width: int = 256) -> np.ndarray:
+    """hair_confidence 와 같은 분할의 6 분류 확률 전부 (6, h', w') float32 (CATEGORY_* 순서).
+    긴 머리 밑 인페인터(torso_net)가 머리 밖 배경/옷/피부 안내로 쓴다."""
     global _HAIR_IMAGE_SEG, _HAIR_LOCK
     import threading
     if _HAIR_IMAGE_SEG is None:
@@ -59,7 +65,7 @@ def hair_confidence(frame_bgr: np.ndarray, width: int = 256) -> np.ndarray:
     rgb = np.ascontiguousarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
     with _HAIR_LOCK:
         res = _HAIR_IMAGE_SEG.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-    return np.array(res.confidence_masks[CATEGORY_HAIR].numpy_view(), np.float32)
+    return np.stack([np.array(c.numpy_view(), np.float32) for c in res.confidence_masks])
 
 
 def _bbox(mask: np.ndarray):

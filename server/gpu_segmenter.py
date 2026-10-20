@@ -145,6 +145,7 @@ class GpuFaceParser:
         self.last_cls = None    # 마지막 프레임의 클래스맵 (GPU uint8) - 이마 갱신이 재사용
         self.last_cls_frame = None
         self._bg_pp = None       # 플레이트 빈 자리 확산 캐시 (bg_diffuse_down)
+        self._torso_cache = None  # (torso 결과, (H, W), 프레임 좌표 채움, 알파) - 결과가 바뀔 때만 붙인다
         self.keep_debug = False  # True 면 process 가 합성 마스크를 debug_maps 에 남긴다(오프라인 진단)
         self.debug_maps = None
         self._groom = None      # GroomRenderer (3D 헤어카드). 처음 쓸 때 gpu_executor 스레드에서 생성.
@@ -990,7 +991,7 @@ class GpuFaceParser:
                 harmonize: bool = True, shadow: float = 0.35,
                 blend: float = 1.0, asset2=None, mix: float = 0.0,
                 smoother=None, groom=None, groom_fit=None, groom_color=None, groom_dyn=None,
-                pose_future=None, dyn=None, hair_low=None):
+                pose_future=None, dyn=None, hair_low=None, torso=None):
         """BGR 프레임 -> (합성된 BGR 프레임, 타이밍/상태 dict).
 
         groom: {"name","path","meta"} 3D 헤어카드 GLB. 주어지면 tryon 에서 2D 에셋
@@ -1003,6 +1004,7 @@ class GpuFaceParser:
                제때 안 끝나면 넘어온 pose(직전 프레임)로 간다. 이걸 안 하면 헤어가 항상
                한 프레임(33ms) 전 위치에 그려져 빠르게 움직일 때 뒤따라온다.
         dyn: (hair_dynamics, amount) - pose_future 를 쓸 때 스프링도 여기서 그 포즈로 굴린다.
+        torso: torso_net.LearnedTorso.run 결과 (hair_low 와 같은 프레임). 플레이트가 못 본 머리 구멍을 채운다.
 
         mode:
           raw    - 원본 그대로 (기본). 플레이트는 계속 쌓는다.
@@ -1546,6 +1548,30 @@ class GpuFaceParser:
                     src_ok = torch.maximum(src_ok, (1.0 - rows) * okb)
                 fill = fill * seen.unsqueeze(-1) + pp * (1.0 - seen).unsqueeze(-1)
                 src_ok = torch.maximum(src_ok, rows * okd)
+            if torso is not None and CONFIG.torso_net:
+                # 학습 인페인터(torso_net, 긴 머리 분할과 같은 프레임으로 백그라운드에서 돈 결과): 플레이트가 못 본
+                # 머리 구멍을 확산 대신 채운다. 확산은 옷 무늬/어깨선/목선을 몰라 덩어리였다. 플레이트가 본 자리
+                # (실제 관측 배경)는 그대로 둔다. 결과마다 프레임 좌표로 한 번 붙여 두고 재사용(늦은 마스크와 같은 프레임).
+                H_, W_ = (roi_full[1], roi_full[2]) if roi is not None else (h, w)
+                tc = self._torso_cache
+                if tc is None or tc[0] is not torso or tc[1] != (H_, W_):
+                    import torso_net
+                    self._torso_cache = tc = (torso, (H_, W_), *torso_net.paste(torso, H_, W_))
+                tf, ta = tc[2], tc[3]
+                if roi is not None:
+                    tf, ta = tf[sl], ta[sl]
+                # 플레이트 관측은 얼굴 높이(bg_diffuse_down 위)에서만 넷보다 우선. 그 아래 긴 머리 자리의 '관측'은
+                # 파서가 밝은 머리를 배경으로 찍어 쌓인 머리색 얼룩이 많았다(실측, 금발 - 목 옆 흰 연기). 넷은
+                # 기억 채널로 실제로 보였던 픽셀을 따로 받는다.
+                keep = pl_seen.float()
+                if eyes is not None and CONFIG.bg_diffuse_down > 0:
+                    keep = keep * rows
+                ta = ta * (1.0 - keep)
+                if sigma_f is not None and CONFIG.grain_match > 0:
+                    # 384 넷 출력을 키운 것이라 카메라 노이즈가 없다 - 확산 채움과 같이 그레인을 얹는다
+                    tf = tf + torch.randn(h, w, 1, device=self.device) * (sigma_f * CONFIG.grain_match)
+                fill = fill * (1.0 - ta).unsqueeze(-1) + tf * ta.unsqueeze(-1)
+                src_ok = torch.maximum(src_ok, ta)
 
             if protect is not None:
                 # 보이는 눈/눈썹 위에 피부톤을 칠하지 않는다.

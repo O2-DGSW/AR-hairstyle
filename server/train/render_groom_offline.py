@@ -44,6 +44,8 @@ def main():
                     help="2차 운동 세기(1=기본). 프레임 순서대로 30fps 로 스프링을 굴린다")
     ap.add_argument("--long-hair", type=int, default=1,
                     help="1: 셀피 분할 머리 마스크를 넘긴다(서버의 long_hair_seg - 옷 위 긴 머리 지우기)")
+    ap.add_argument("--torso", type=int, default=1,
+                    help="1: 그 지운 자리를 torso_net 으로 채운다(서버와 같은 프레임 결과, 0 이면 확산)")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -80,6 +82,7 @@ def main():
     hd = HairDynamics()
 
     hold = {"pose": None, "miss": 0}
+    lt = {"m": None}
 
     def run(idx, mode):
         img = cv2.imread(os.path.join(a.frames, files[idx]))
@@ -95,12 +98,20 @@ def main():
         if a.dyn > 0 and pose is not None and pose.get("matrix") is not None:
             dyn = hd.step(pose["matrix"], 1 / 30)
             dyn["tip"] = a.dyn
-        hair_low = None
+        hair_low = torso = None
         if a.long_hair and mode == "tryon":
             import segmenter
-            hair_low = segmenter.hair_confidence(img)
+            conf6 = segmenter.selfie_confidences(img)
+            hair_low = conf6[segmenter.CATEGORY_HAIR]
+            if a.torso and pose is not None:
+                if lt["m"] is None:
+                    import torso_net
+                    lt["m"] = torso_net.LearnedTorso(seg.device, mem_tau=CONFIG.torso_mem_tau,
+                                                     mem_reset=CONFIG.torso_mem_reset, use_mem=CONFIG.torso_mem)
+                torso = lt["m"].run(img, conf6, pose["eye_l"], pose["eye_r"], pose.get("oval"), idx / 30)
         out, t = seg.process(img, plate, mode, fh_asset, 1.0, 0.0, pose, True, 0.35, 0.0,
-                             None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color, dyn, hair_low=hair_low)
+                             None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color, dyn, hair_low=hair_low,
+                             torso=torso)
         return img, out, t, pose
 
     for i in range(min(a.warm, len(files))):
