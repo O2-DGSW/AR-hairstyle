@@ -68,6 +68,37 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
 
 
+def _skip_relay_to_private_pairs():
+    """aioice 가 '내 TURN 릴레이 후보 -> 상대 내부 주소' 쌍을 만들지 않게 한다.
+
+    브라우저는 공인(srflx) 후보와 함께 내부 주소(192.168/Tailscale 100.64/10/169.254, mDNS .local)도
+    보낸다. 학교 서버는 그 전부를 TURN 릴레이로 찔러 보는데, 우리 TURN(server/turn)은 내부망으로 새는
+    통로가 되지 않게 그런 퍼미션을 거절한다 -> 쌍마다 ChannelBind 401 Traceback 이 로그에 쌓였다(실측,
+    연결은 공인 후보로 정상). 릴레이로 내부 주소에 닿을 길은 원래 없으니 쌍을 처음부터 뺀다. host
+    후보끼리의 직접 쌍(같은 망)은 그대로 둔다. sort_check_list 는 쌍을 더하는 세 곳 모두가 부른다.
+    """
+    import ipaddress
+    from aioice import ice as aioice_ice
+
+    def reachable(host):
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:          # mDNS 이름(.local) - TURN 퍼미션은 IP 에만 걸린다
+            return False
+
+    orig = aioice_ice.Connection.sort_check_list
+
+    def sort_check_list(self):
+        self._check_list[:] = [p for p in self._check_list
+                               if p.local_candidate.type != "relay" or reachable(p.remote_candidate.host)]
+        orig(self)
+
+    aioice_ice.Connection.sort_check_list = sort_check_list
+
+
+_skip_relay_to_private_pairs()
+
+
 # ---------------------------------------------------------------------------
 # 앱 상태
 # ---------------------------------------------------------------------------
