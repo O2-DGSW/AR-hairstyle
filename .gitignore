@@ -153,3 +153,6 @@ server/grooms/*.glb
 
 # Git Bash 크래시 덤프
 *.stackdump
+
+# Go TURN 서버 빌드 산출물 (server/turn 에서 go build 로 재생성)
+server/turn/turn.exe
