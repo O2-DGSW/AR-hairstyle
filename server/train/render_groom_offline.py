@@ -46,6 +46,8 @@ def main():
                     help="1: 셀피 분할 머리 마스크를 넘긴다(서버의 long_hair_seg - 옷 위 긴 머리 지우기)")
     ap.add_argument("--torso", type=int, default=1,
                     help="1: 그 지운 자리를 torso_net 으로 채운다(서버와 같은 프레임 결과, 0 이면 확산)")
+    ap.add_argument("--hands", type=int, default=1,
+                    help="1: 손 가림(hand_occl) - 서버처럼 한 프레임 전 손 추적 결과를 쓴다")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -82,7 +84,7 @@ def main():
     hd = HairDynamics()
 
     hold = {"pose": None, "miss": 0}
-    lt = {"m": None}
+    lt = {"m": None, "hands": None, "hand": None}
 
     def run(idx, mode):
         img = cv2.imread(os.path.join(a.frames, files[idx]))
@@ -109,9 +111,19 @@ def main():
                     lt["m"] = torso_net.LearnedTorso(seg.device, mem_tau=CONFIG.torso_mem_tau,
                                                      mem_reset=CONFIG.torso_mem_reset, use_mem=CONFIG.torso_mem)
                 torso = lt["m"].run(img, conf6, pose["eye_l"], pose["eye_r"], pose.get("oval"), idx / 30)
+        hand = None
+        if a.hands:
+            # 추적은 raw 프레임에서도 매 프레임 (그래야 '한 프레임 전' 이 진짜 바로 전 프레임이다)
+            import hand_occl
+            if lt["hands"] is None:
+                lt["hands"] = hand_occl.HandTracker(seg.device)
+            hand = lt["hand"] if mode == "tryon" else None      # 한 프레임 전 결과 (서버의 지연 흉내)
+            lt["hand"] = lt["hands"].track(img, idx / 30)
+            if hand is not None and hand["mask"] is None:
+                hand = None
         out, t = seg.process(img, plate, mode, fh_asset, 1.0, 0.0, pose, True, 0.35, 0.0,
                              None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color, dyn, hair_low=hair_low,
-                             torso=torso)
+                             torso=torso, hand=hand)
         return img, out, t, pose
 
     for i in range(min(a.warm, len(files))):

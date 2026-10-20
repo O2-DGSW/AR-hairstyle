@@ -146,6 +146,7 @@ class GpuFaceParser:
         self.last_cls_frame = None
         self._bg_pp = None       # 플레이트 빈 자리 확산 캐시 (bg_diffuse_down)
         self._torso_cache = None  # (torso 결과, (H, W), 프레임 좌표 채움, 알파) - 결과가 바뀔 때만 붙인다
+        self._hand_cache = None   # (손 결과, (H, W), 프레임 해상도 손 알파)
         self.keep_debug = False  # True 면 process 가 합성 마스크를 debug_maps 에 남긴다(오프라인 진단)
         self.debug_maps = None
         self._groom = None      # GroomRenderer (3D 헤어카드). 처음 쓸 때 gpu_executor 스레드에서 생성.
@@ -307,6 +308,17 @@ class GpuFaceParser:
         t = t * t * (3 - 2 * t)                 # smoothstep
         self._fmask = t.unsqueeze(0).unsqueeze(0)
         return self._fmask
+
+    def _hand_alpha(self, hand, h, w, roi, sl, roi_full):
+        """손 가림 알파 (h, w) - 결과마다 한 번 프레임 해상도로 키워 두고(그룸 ROI 면 잘라) 재사용."""
+        H_, W_ = (roi_full[1], roi_full[2]) if roi is not None else (h, w)
+        c = self._hand_cache
+        if c is None or c[0] is not hand or c[1] != (H_, W_):
+            m = hand["mask"]
+            m.record_stream(torch.cuda.current_stream(self.device))     # 손 스레드 스트림에서 만든 텐서
+            m = torch.nn.functional.interpolate(m, size=(H_, W_), mode="bilinear", align_corners=False)[0, 0]
+            self._hand_cache = c = (hand, (H_, W_), m)
+        return c[2][sl] if roi is not None else c[2]
 
     def _ensure_grid(self, h, w):
         """(ys, xs) 픽셀 좌표 격자 (h, w). 가장 큰 격자 하나를 두고 왼쪽 위에서 잘라 준다 - 그룸 ROI 는
@@ -991,7 +1003,8 @@ class GpuFaceParser:
                 harmonize: bool = True, shadow: float = 0.35,
                 blend: float = 1.0, asset2=None, mix: float = 0.0,
                 smoother=None, groom=None, groom_fit=None, groom_color=None, groom_dyn=None,
-                pose_future=None, dyn=None, hair_low=None, torso=None):
+                pose_future=None, dyn=None, hair_low=None, torso=None,
+                hand=None):
         """BGR 프레임 -> (합성된 BGR 프레임, 타이밍/상태 dict).
 
         groom: {"name","path","meta"} 3D 헤어카드 GLB. 주어지면 tryon 에서 2D 에셋
@@ -1005,6 +1018,7 @@ class GpuFaceParser:
                한 프레임(33ms) 전 위치에 그려져 빠르게 움직일 때 뒤따라온다.
         dyn: (hair_dynamics, amount) - pose_future 를 쓸 때 스프링도 여기서 그 포즈로 굴린다.
         torso: torso_net.LearnedTorso.run 결과 (hair_low 와 같은 프레임). 플레이트가 못 본 머리 구멍을 채운다.
+        hand: hand_occl.HandTracker.track 최신 결과. 손 자리는 새 헤어를 얹지도, 원래 머리를 지우지도 않는다(손이 위).
 
         mode:
           raw    - 원본 그대로 (기본). 플레이트는 계속 쌓는다.
@@ -1556,6 +1570,9 @@ class GpuFaceParser:
                 tc = self._torso_cache
                 if tc is None or tc[0] is not torso or tc[1] != (H_, W_):
                     import torso_net
+                    # 결과 텐서는 torso 스레드 스트림에서 만들었다 - 이 스트림이 쓰는 동안 재사용되지 않게
+                    torso["rgb"].record_stream(torch.cuda.current_stream(self.device))
+                    torso["alpha"].record_stream(torch.cuda.current_stream(self.device))
                     self._torso_cache = tc = (torso, (H_, W_), *torso_net.paste(torso, H_, W_))
                 tf, ta = tc[2], tc[3]
                 if roi is not None:
@@ -1699,6 +1716,12 @@ class GpuFaceParser:
                 # 얼굴 영역은 플레이트 관측 여부와 무관하게 채울 수 있다
                 src_ok = torch.clamp(src_ok + zone, 0.0, 1.0)
 
+            if hand is not None and hand.get("mask") is not None and CONFIG.hand_occlude:
+                # 손이 위: 손 자리의 원래 머리 지우기/채움을 뺀다 (늦은 긴 머리 마스크·torso 채움이 손을 덮었다)
+                # 이 프레임 파서가 머리라고 한 자리는 빼지 않는다 - 손 마스크가 손보다 넓거나 늦어도 원래 머리가
+                # 비치지 않게 (손은 머리가 아니다)
+                erase = erase * (1.0 - self._hand_alpha(hand, h, w, roi, sl if roi is not None else None,
+                                                        roi_full if roi is not None else None) * (1.0 - hair_cur))
             a = (erase * src_ok).unsqueeze(-1)
             out = frame_f * (1 - a) + fill * a
             if self.keep_debug:
@@ -1726,6 +1749,12 @@ class GpuFaceParser:
 
         # --- 새 헤어 합성 (앞에서 워핑해 둔 것을 여기서 얹는다) ---
         if new_a is not None:
+            if hand is not None and hand.get("mask") is not None and CONFIG.hand_occlude:
+                # 손이 헤어 앞: 셀카에서 머리 근처 손은 거의 항상 카메라 쪽이다. 손 자리의 헤어 알파를 뺀다
+                # (그림자/라이트 랩도 이 알파를 따르므로 먼저).
+                ha = self._hand_alpha(hand, h, w, roi, sl if roi is not None else None,
+                                      roi_full if roi is not None else None) * (1.0 - hair_cur)
+                new_a = new_a * (1.0 - ha).unsqueeze(-1)
             if shadow > 0:
                 # 헤어라인 그림자.
                 # 실제 머리카락은 이마에 그늘을 드리운다. 그게 없으면 아무리 경계를
