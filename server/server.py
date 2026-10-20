@@ -130,8 +130,6 @@ class AppState:
         self.pose_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pose")
         # 긴 머리용 셀피 분할(CPU ~100ms) 전용 - 영상 경로와 랜드마커를 막지 않게 따로.
         self.hairseg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hairseg")
-        # 손 가림(hand_occl, 손 랜드마커 CPU ~18ms) 전용 - 영상 경로를 막지 않게 따로.
-        self.hand_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hand")
 
         self.segmenter = None          # 첫 연결 때 지연 초기화 (모델 로딩이 몇 초)
         self.forehead = None           # forehead.ForeheadInpainter (LaMa). 3D 그룸 첫 선택 때 적재.
@@ -221,7 +219,6 @@ class AppState:
         self.forehead_executor.shutdown(wait=False)
         self.gan_executor.shutdown(wait=False)
         self.pose_executor.shutdown(wait=False)
-        self.hand_executor.shutdown(wait=False)
 
 
 class PeerState:
@@ -295,10 +292,6 @@ class PeerState:
         self.pose = None          # FacePose (MediaPipe 네이티브 그래프)
         self.smoother = None
         self.pose_future = None
-        self.hands = None         # hand_occl.HandTracker (손 가림, VIDEO 추적이라 세션마다)
-        self.hand_future = None
-        self.hand = None          # 최신 손 결과 (track)
-        self.hand_at = 0.0        # 마지막으로 던진 시각 (monotonic)
         self.last_raw = None      # 촬영용: 오버레이 없는 원본 프레임
 
         self.created_at = time.monotonic()
@@ -333,15 +326,6 @@ class PeerState:
                 fut.add_done_callback(lambda _f, p=pose: _close_quietly(p))
             else:
                 _close_quietly(pose)
-        # 손 추적기도 같은 이유로 돌고 있으면 끝난 뒤에 닫는다
-        hfut, self.hand_future = self.hand_future, None
-        hands, self.hands = self.hands, None
-        self.hand = None
-        if hands is not None:
-            if hfut is not None and not hfut.done() and not hfut.cancel():
-                hfut.add_done_callback(lambda _f, p=hands: _close_quietly(p))
-            else:
-                _close_quietly(hands)
 
         # 플레이트는 GPU 텐서를 들고 있다. 참조를 끊어야 캐싱 얼로케이터가
         # 블록을 재사용할 수 있다.
@@ -511,51 +495,6 @@ class SegmentedVideoTrack(VideoStreamTrack):
         if st.hair_low is None or now - st.hair_low_at > cfg.long_hair_seg_max_age:
             return None, None
         return st.hair_low, st.torso
-
-    def _hand_mask(self, st, img, cfg):
-        """손 가림: 끝나 있는 최신 손 추적 결과를 돌려주고(오래됐으면 None), 앞 작업이 끝났으면 이 프레임을 던진다.
-        기다리지 않는다 - 결과는 1~2 프레임 늦고 hand_occl 이 움직인 만큼 팽창한다."""
-        now = time.monotonic()
-        fut = st.hand_future
-        if fut is not None and fut.done():
-            st.hand_future = None
-            try:
-                st.hand = fut.result()
-                if st.hand is not None:
-                    n = getattr(st, "_hand_n", 0) + 1
-                    st._hand_n = n
-                    if n in (1, 300) or n % 3000 == 0:
-                        logger.info("손 추적 %s: %.0fms, 손 %d (%d번째)", st.sid, st.hand["ms"], st.hand["n"], n)
-            except Exception:
-                logger.exception("손 추적 실패 - 이 세션은 손 가림을 끈다")
-                st.hand, st.hands = None, False
-        if (st.hand_future is None and st.hands is not False and cfg.hand_track_hz > 0
-                and now - st.hand_at >= 1.0 / cfg.hand_track_hz):
-            st.hand_at = now
-            # 랜드마커처럼 프레임을 복사하지 않고 넘긴다 (seg.process 도 입력을 고치지 않는다)
-            st.hand_future = st.app.hand_executor.submit(self._hand_job, st, img, now)
-        h = st.hand
-        if h is None or h["mask"] is None or now - h["t"] > cfg.hand_max_age:
-            return None
-        return h
-
-    @staticmethod
-    def _hand_job(st, frame, now):
-        """hand 스레드: (처음이면 추적기 생성 - 모델 적재를 이벤트 루프에서 안 하게) 손 추적."""
-        import hand_occl
-        if st.hands is None:
-            if st._closed:                  # 세션이 이미 정리됐다 - 새 추적기를 만들면 아무도 안 닫는다
-                return None
-            if not os.path.isfile(hand_occl.TASK):
-                st.hands = False
-                logger.info("손 랜드마커 없음 (%s) - 손 가림 끔", hand_occl.TASK)
-                return None
-            st.hands = hand_occl.HandTracker("cuda")
-            logger.info("손 가림 추적기 생성 (%s)", st.sid)
-        hands = st.hands
-        if not hands:
-            return None
-        return hands.track(frame, now)
 
     @staticmethod
     def _long_hair_job(st, frame, now, eyes, cfg):
@@ -951,16 +890,13 @@ class SegmentedVideoTrack(VideoStreamTrack):
             hair_low = torso = None
             if st.groom_obj is not None and st.mode == "tryon" and cfg.long_hair_seg_hz > 0:
                 hair_low, torso = self._long_hair_mask(st, img, cfg, pose)
-            hand = None
-            if st.groom_obj is not None and st.mode == "tryon" and cfg.hand_occlude:
-                hand = self._hand_mask(st, img, cfg)
             processed, timings = await loop.run_in_executor(
                 app.gpu_executor, seg.process, img, st.plate, st.mode,
                 asset, st.scale_mul, st.offset_up, pose, st.harmonize, st.shadow,
                 st.blend, asset2, mix, st.smoother,
                 st.groom_obj, groom_fit, st.groom_color, groom_dyn,
                 pose_cf, (st.hair_dyn, st.dyn_amount, dyn_dt) if dyn_dt is not None else None, hair_low,
-                torso, hand)
+                torso)
         finally:
             st.inflight -= 1
             app.gpu_inflight -= 1

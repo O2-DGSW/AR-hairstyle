@@ -411,12 +411,6 @@ class Config:
     #: torso_net 기억(머리가 비켜 보였던 픽셀)의 신선도 시간 상수(초)와, 이보다 오래 끊기면 버리는 시간(초).
     torso_mem_tau: float = 3.0
     torso_mem_reset: float = 5.0
-    #: 손 가림: 손이 3D 헤어 앞에 오면 헤어를 손 뒤로 (hand_occl.py, 손 랜드마커 VIDEO 추적, CPU ~18ms 를 별도
-    #: 스레드에서). 3D 그룸 tryon 중에만 돈다. hand_track_hz 는 추적 상한(앞 작업이 끝나야 새로 던진다).
-    #: hand_max_age 보다 오래된 결과는 안 쓴다(손이 빠졌는데 구멍이 남지 않게).
-    hand_occlude: bool = True
-    hand_track_hz: float = 15.0
-    hand_max_age: float = 0.25
     #: 3D 그룸 앞머리가 이마에 떨어뜨리는 아래쪽 그림자 세기(0=끔)와 이동/흐림 폭(눈 간격 배수).
     #: 원래 머리가 3D 헤어 실루엣 밖으로 삐져나온 자리를 헤어로 메우는 세기(0=끔, 예전처럼 배경으로
     #: 지움). 지우면 헤어 둘레에 뿌연 후광이 떴다(gpu_segmenter._groom_extend). k 는 그룸에서 이만큼
