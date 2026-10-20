@@ -63,14 +63,33 @@ uniform int u_billboard;    // 1: _center/_tangent/_side/_halfw 로 카메라를
 uniform float u_scale;      // 두상 스케일(폭에 곱함)
 uniform float u_volume;     // 머리숱 부피(1=원본): 두피에서 바깥으로 뜬 거리를 줄인다. 오클루더 패스는 1
 uniform float u_vol_y0;     // 이 높이(정규 cm, +위) 아래로 늘어진 머리는 그대로 (3cm 램프)
+// 두상 충돌: 흔들린 가닥이 두상 속으로 들어가지 않게 (Groom.prof - 높이·방위별 두상 표면 반지름)
+uniform int u_collide;
+uniform sampler2D u_prof;   // R: 반지름(cm). x = 방위 0~1(반복), y = 높이 0~1
+uniform vec4 u_prof_p;      // (중심 x, 중심 z, y0, y1)
+uniform float u_prof_m;     // 표면에서 띄울 여유(cm)
+uniform vec3 u_hug;         // (이 거리 cm 안은 붙은 가닥, 이 거리 밖은 자유, 붙은 가닥의 흔들림 비율)
 in vec3 in_pos; in vec2 in_uv; in vec3 in_nrm; in vec3 in_root;
 in vec3 in_center; in vec3 in_tangent; in float in_side; in float in_rand; in float in_halfw;
 out vec2 v_uv; out vec3 v_nrm; out vec3 v_tan; out vec3 v_pos; flat out float v_rand;
+out vec3 v_g;               // 두상 공간 위치(cm, 변형 후) - FS 의 몸 뒤 판정
 void main() {
     float s = in_uv.y;                      // 0 = 뿌리, 1 = 끝 (strands_to_cards 의 v 를 로더가 뒤집음)
     vec3 base = (u_billboard == 1) ? in_center : in_pos;
     vec3 rel = base - in_root;
     float w = clamp(u_tip * s * s, 0.0, 1.0);
+    if (u_collide == 1 && w > 0.0) {
+        // 얼굴/두상에 붙어 있는 가닥(정지 자세에서 표면 가까이)은 덜 흔든다. 볼을 감싼 옆머리가 통째로
+        // 2cm 넘게 바깥으로 떨어져 턱선이 그대로 드러났다(사용자 피드백). 실제로는 피부에 걸려 붙어 있다.
+        vec3 pr = in_root + rel;
+        vec2 q0 = pr.xz - u_prof_p.xy;
+        float tv0 = (pr.y - u_prof_p.z) / (u_prof_p.w - u_prof_p.z);
+        if (tv0 > 0.0 && tv0 < 1.0) {
+            float R0 = texture(u_prof, vec2(atan(q0.y, q0.x) * 0.15915494 + 0.5, tv0)).r;
+            float hug = 1.0 - smoothstep(u_hug.x, u_hug.y, length(q0) - R0);
+            w *= mix(1.0, u_hug.z, hug);
+        }
+    }
     vec3 rel2 = u_lag * rel + u_shift * s;
     vec3 d = mix(rel, rel2, w);
     float ph = dot(in_root, vec3(12.9898, 78.233, 37.719));
@@ -79,6 +98,22 @@ void main() {
     float Ld = length(d);
     if (L > 1e-4 && Ld > 1e-4) d *= L / Ld;
     vec3 p = in_root + d;                   // 두상 공간
+    if (u_collide == 1 && w > 0.0) {
+        // 흔들림은 가닥을 뿌리 기준으로 돌리고 옮길 뿐이라, 얼굴 쪽으로 쏠린 가닥은 깊이만 쓰는 강체
+        // 오클루더 뒤로 들어가 사라졌다 - 헤어 안쪽 경계가 오클루더 볼/턱 윤곽 그대로 잘려 턱선이
+        // 드러났다(사용자 피드백). 수직축 기준 반지름이 정지 자세보다, 그리고 두상 표면보다 안쪽으로
+        // 못 들어가게 밀어낸다 - 가닥이 얼굴 표면을 타고 미끄러진다.
+        vec2 q = p.xz - u_prof_p.xy;
+        float r = length(q);
+        float tv = (p.y - u_prof_p.z) / (u_prof_p.w - u_prof_p.z);
+        if (r > 1e-3 && tv > 0.0 && tv < 1.0) {
+            float th = atan(q.y, q.x) * 0.15915494 + 0.5;
+            float R = texture(u_prof, vec2(th, tv)).r + u_prof_m;
+            float r0 = length((in_root + rel).xz - u_prof_p.xy);
+            float lim = min(r0, R);
+            if (r < lim) p.xz = u_prof_p.xy + q * (lim / r);
+        }
+    }
     if (u_volume < 0.999) {
         // Im2Haircut 재구성은 머리숱이 두피에서 3~4cm 떠 있어 실제 머리에 얹으면 헬멧처럼 붕 떴다(실측:
         // 정수리에서 그룸 외곽-두상 34px, 눈 간격 60px 기준). 두상 중심 기준 반지름이 뿌리보다 큰 만큼만
@@ -106,6 +141,7 @@ void main() {
     v_tan = tc;
     v_pos = pc.xyz;
     v_rand = in_rand;
+    v_g = p;
 }
 """
 
@@ -117,8 +153,12 @@ uniform int u_pass;         // 0: 컷아웃(a>=0.5), 1: 반투명 가장자리(a
 uniform vec3 u_light;       // 카메라 공간 광원 방향
 uniform int u_billboard;
 uniform int u_samples;      // MSAA 샘플 수 (패스 3)
-uniform int u_split;        // 1: R=확산 x0.5, G=윤기 x2, B=확산 x0.5 로 나눠 낸다 (흰 베이스 + 회색 텍스처 전제)
+uniform int u_split;        // 1: R=확산 x0.5, G=윤기 x2, B=몸 뒤 가중 0~1 로 나눠 낸다 (흰 베이스 + 회색 텍스처 전제)
+uniform vec4 u_body_y;     // (턱 y, 타원 중심 z, 목 끝 y, 가슴 시작 y) - CONFIG.groom_body_y
+uniform vec4 u_body_ab;    // (목 a, 목 b, 가슴 a, 가슴 b) - CONFIG.groom_body_ab
+uniform float u_body_m;    // 앞면 여유(cm). 음수면 판정 끔
 in vec2 v_uv; in vec3 v_nrm; in vec3 v_tan; in vec3 v_pos; flat in float v_rand;
+in vec3 v_g;
 out vec4 f_color;
 float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 void main() {
@@ -163,8 +203,21 @@ void main() {
     }
     // 윤기를 따로 내면 합성 쪽에서 머리색을 곱한 뒤 흰빛으로 더할 수 있다. 섞어 내면 윤기까지 머리색이
     // 곱해져 검은 머리에서 하이라이트가 사라지고 점토처럼 보였다(사용자 피드백, 실측 명암 폭 13/255).
+    // 몸 뒤 가중: 어깨선 아래로 늘어진 가닥이 상체 단면 타원의 앞면보다 뒤(=몸 속이나 등 뒤)면 1.
+    // 합성 쪽이 사용자 몸 영역에서만 이 가중만큼 지운다 - 옆으로 삐져나온 뒷머리는 그대로 보인다.
+    float bk = 0.0;
+    if (u_body_m >= 0.0) {
+        float tb = clamp((u_body_y.z - v_g.y) / max(1e-3, u_body_y.z - u_body_y.w), 0.0, 1.0);
+        float A = mix(u_body_ab.x, u_body_ab.z, tb);
+        float B = mix(u_body_ab.y, u_body_ab.w, tb);
+        float qx = v_g.x / A;
+        // 타원 밖(어깨보다 바깥)은 중심면 기준 - 등 뒤로 넓게 퍼진 머리도 원근으로 몸 실루엣 안에 들어온다.
+        // 옆으로 정말 삐져나온 건 합성 쪽 몸 마스크가 살린다.
+        float zf = u_body_y.y + B * sqrt(max(0.0, 1.0 - qx * qx));
+        bk = clamp((zf - u_body_m - v_g.z) / 1.5, 0.0, 1.0) * clamp((u_body_y.x - v_g.y) / 2.0, 0.0, 1.0);
+    }
     vec3 c = (u_split == 1)
-        ? vec3(t.r * shade * 0.5, t.r * spec_s * 2.0, t.r * shade * 0.5)
+        ? vec3(t.r * shade * 0.5, t.r * spec_s * 2.0, bk)
         : u_base * t.rgb * (shade + spec_s);
     // 패스 0 은 컷아웃이라 완전 불투명으로 쓴다(블렌드 없음). 패스 1 은 SRC_ALPHA 블렌드가
     // 프리멀티플라이드로 누적하므로 스트레이트 색을 낸다. 패스 3(A2C)은 커버리지가 알파를 나른다.
@@ -217,6 +270,36 @@ def _scalp_weight(occ_v: np.ndarray, roots: np.ndarray) -> np.ndarray:
     return np.clip((SCALP_FAR_CM - d) / (SCALP_FAR_CM - SCALP_NEAR_CM), 0.0, 1.0).astype(np.float32)
 
 
+PROF_NTH, PROF_NY = 96, 64
+
+
+def _head_profile(v: np.ndarray, faces: np.ndarray):
+    """오클루더 -> (반지름 (PROF_NY, PROF_NTH) float32, (중심 x, 중심 z, y0, y1)).
+
+    높이 y 와 수직축 둘레 방위마다 두상 표면이 축에서 얼마나 떨어져 있는지(최대값). 정점만으로는
+    칸이 비어 삼각형마다 몇 점씩 뿌려 채우고, 그래도 빈 칸은 이웃으로 메운다."""
+    cx = 0.5 * float(v[:, 0].min() + v[:, 0].max())
+    cz = 0.5 * float(v[:, 2].min() + v[:, 2].max())
+    y0, y1 = float(v[:, 1].min()), float(v[:, 1].max())
+    tri = v[faces]                                                      # (F,3,3)
+    rng = np.random.default_rng(0)
+    b = rng.dirichlet((1.0, 1.0, 1.0), size=(len(faces), 8)).astype(np.float32)   # (F,8,3)
+    pts = np.concatenate([v, np.einsum("fkj,fjc->fkc", b, tri).reshape(-1, 3)])
+    qx, qz = pts[:, 0] - cx, pts[:, 2] - cz
+    r = np.hypot(qx, qz)
+    ti = np.clip(((np.arctan2(qz, qx) / (2 * np.pi) + 0.5) * PROF_NTH).astype(int), 0, PROF_NTH - 1)
+    yi = np.clip(((pts[:, 1] - y0) / max(1e-3, y1 - y0) * PROF_NY).astype(int), 0, PROF_NY - 1)
+    R = np.zeros((PROF_NY, PROF_NTH), np.float32)
+    np.maximum.at(R, (yi, ti), r.astype(np.float32))
+    for _ in range(8):
+        if (R > 0).all():
+            break
+        nb = np.maximum.reduce([np.roll(R, 1, 1), np.roll(R, -1, 1),
+                                np.vstack([R[:1], R[:-1]]), np.vstack([R[1:], R[-1:]])])
+        R = np.where(R > 0, R, nb)
+    return R, (cx, cz, y0, y1)
+
+
 def _perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
     t = 1.0 / math.tan(math.radians(fov_y_deg) / 2.0)
     m = np.zeros((4, 4), np.float32)
@@ -249,6 +332,8 @@ class Groom:
         self.n_tris = 0
         self.billboard = False   # v1 GLB (_center/_tangent/_side/_halfw 속성) 이면 True
         self.aabb = None         # (min, max) 정규 cm - 헤어 + 두상 정점
+        self.prof = None         # 두상 표면 반지름 텍스처 (_head_profile) - 흔들림 충돌용. 오클루더 없으면 None
+        self.prof_p = (0.0, 0.0, 0.0, 1.0)
 
 
 class GroomRenderer:
@@ -404,6 +489,9 @@ class GroomRenderer:
             hb = ctx.buffer(np.hstack([ov, sw[:, None]]).astype(np.float32).tobytes())
             g.head_vao = ctx.vertex_array(self._head_prog, [(hb, "3f 1f", "in_pos", "in_scalp")],
                                           ctx.buffer(of.tobytes()))
+            pr, g.prof_p = _head_profile(ov, of)
+            g.prof = ctx.texture((PROF_NTH, PROF_NY), 1, pr.tobytes(), dtype="f4")
+            g.prof.repeat_x, g.prof.repeat_y = True, False
         if g.tex is None:
             g.tex = ctx.texture((1, 1), 4, bytes([255, 255, 255, 255]))
         # 정규 공간 AABB (헤어 + 두상). render() 가 이걸 투영해 읽어 올 사각형을 정한다.
@@ -418,7 +506,7 @@ class GroomRenderer:
         g = self._grooms.pop(name, None)
         if g is None:
             return
-        for r in (g.hair_vao, g.occ_vao, g.head_vao, g.tex):
+        for r in (g.hair_vao, g.occ_vao, g.head_vao, g.tex, g.prof):
             if r is not None:
                 r.release()
 
@@ -512,10 +600,21 @@ class GroomRenderer:
             prog["u_tip"].value = 0.0
             prog["u_idle"].value = 0.0
             prog["u_time"].value = 0.0
+        collide = dyn is not None and groom.prof is not None and CONFIG.groom_dyn_collide
+        prog["u_collide"].value = 1 if collide else 0
+        if groom.prof is not None:
+            groom.prof.use(1)
+            prog["u_prof"].value = 1
+            prog["u_prof_p"].value = tuple(float(x) for x in groom.prof_p)
+            prog["u_prof_m"].value = float(CONFIG.groom_dyn_collide_margin_cm)
+            prog["u_hug"].value = tuple(float(x) for x in CONFIG.groom_dyn_hug)
         base = groom.base if base_rgb is None else tuple(float(c) for c in base_rgb)
         prog["u_base"].value = base
         prog["u_tex"].value = 0
         prog["u_split"].value = 1 if split_spec else 0
+        prog["u_body_y"].value = tuple(float(x) for x in CONFIG.groom_body_y)
+        prog["u_body_ab"].value = tuple(float(x) for x in CONFIG.groom_body_ab[:4])
+        prog["u_body_m"].value = float(CONFIG.groom_body_ab[4]) if CONFIG.groom_body_occlude > 0 else -1.0
         groom.tex.use(0)
 
         fbo = self._fbo_ms
@@ -593,9 +692,11 @@ class GroomRenderer:
         if split_spec:
             # 8비트에 담으려고 확산은 절반, 윤기는 2배로 냈다 - 되돌린다. 확산은 255 를 넘을 수 있다(예전엔 잘렸음).
             self.last_spec = (rgb[:, :, 1:2] * 0.5).clamp(0.0, 255.0)
+            self.last_back = (rgb[:, :, 2:3] / 255.0).clamp(0.0, 1.0)   # 몸 뒤 가중 (셰이더 bk)
             rgb = (rgb[:, :, 0:1] * 2.0).expand(-1, -1, 3).clamp(0.0, 510.0)
         else:
             self.last_spec = None
+            self.last_back = None
             rgb = rgb[:, :, [2, 1, 0]].clamp(0.0, 255.0)      # 합성 코드는 BGR
         self.last_ms = (time.perf_counter() - t0) * 1000
         return rgb, a

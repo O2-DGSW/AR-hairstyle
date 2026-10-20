@@ -13,8 +13,8 @@
   .main { display: flex; flex-direction: column; gap: 8px; }
   .cap { font-size: 12px; color: #777; }
   video { background: #000; border-radius: 8px; display: block; }
-  #remote { width: 640px; height: 480px; transform: scaleX(-1); }
-  #local { width: 200px; height: 150px; transform: scaleX(-1); opacity: .75; }
+  #remote { width: 400px; height: 649px; object-fit: cover; transform: scaleX(-1); }
+  #local { width: 120px; height: 195px; transform: scaleX(-1); opacity: .75; }
 
   .side { display: flex; flex-direction: column; gap: 14px; min-width: 250px; }
   .panel { background: #1b1b1b; border-radius: 8px; padding: 14px 16px; font-size: 13px; }
@@ -56,9 +56,8 @@
     <option value="plate" data-debug>누적 플레이트 보기</option>
   </select>
   <select id="capres" style="background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:0 10px;font-size:13px">
-    <option value="640x480">캡처 640×480</option>
-    <option value="1280x720" selected>캡처 1280×720</option>
-    <option value="1920x1080">캡처 1920×1080</option>
+    <option value="800x1298" selected>세로 800×1298 (고해상도)</option>
+    <option value="400x648">세로 400×648 (화면과 동일)</option>
   </select>
   <button id="shoot" disabled style="background:#22c55e" data-gan>📷 사진 찍기 (GAN)</button>
   <button id="livebank" disabled style="background:#8b5cf6">🎞 라이브 뱅크 만들기</button>
@@ -69,7 +68,7 @@
 <div class="layout">
   <div class="main">
     <div class="cap">서버가 합성해서 보낸 영상 (머리=마젠타, 얼굴피부=시안)</div>
-    <div style="position:relative;width:640px;height:480px">
+    <div style="position:relative;width:400px;height:649px">
       <video id="remote" autoplay playsinline></video>
       <div id="lb-overlay" style="display:none;position:absolute;inset:0;border-radius:8px;
            background:rgba(8,8,10,.94);color:#eee;flex-direction:column;
@@ -89,11 +88,11 @@
       <label style="color:#999"><input type="checkbox" id="sync-preview" checked> 합성본에 지연 맞춤</label>
       <span id="delay-label" style="color:#666"></span>
     </div>
-    <div style="position:relative;width:200px;height:150px">
+    <div style="position:relative;width:120px;height:195px">
       <video id="local" autoplay muted playsinline
              style="position:absolute;top:0;left:0;opacity:0;pointer-events:none"></video>
-      <canvas id="local-canvas" width="200" height="150"
-              style="position:absolute;top:0;left:0;width:200px;height:150px;
+      <canvas id="local-canvas" width="120" height="195"
+              style="position:absolute;top:0;left:0;width:120px;height:195px;
                      background:#000;border-radius:8px;transform:scaleX(-1)"></canvas>
     </div>
     <div id="status">대기 중.</div>

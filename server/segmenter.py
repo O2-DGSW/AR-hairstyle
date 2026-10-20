@@ -33,6 +33,35 @@ CATEGORY_CLOTHES = 4
 CATEGORY_OTHERS = 5
 
 
+_HAIR_IMAGE_SEG = None
+_HAIR_LOCK = None
+
+
+def hair_confidence(frame_bgr: np.ndarray, width: int = 256) -> np.ndarray:
+    """정지 이미지 1장 -> 머리 확률 (h', w') float32 0~1 (가로 width 로 줄인 크기).
+
+    얼굴 파서(gpu_segmenter, CelebAMask-HQ)는 얼굴 크롭으로 학습돼 어깨 아래 옷 위로 내려온 긴 머리를
+    '옷'으로 찍는다(실측). 이 셀피 모델은 상반신 기준이라 그 머리까지 잡는다. CPU 로 ~100ms 라
+    (Windows 는 GPU delegate 없음) 서버는 백그라운드로 드문드문 돌려 마스크만 넘긴다.
+    IMAGE 모드라 상태가 없고, 인스턴스 하나를 락으로 공유한다."""
+    global _HAIR_IMAGE_SEG, _HAIR_LOCK
+    import threading
+    if _HAIR_IMAGE_SEG is None:
+        _HAIR_LOCK = threading.Lock()
+        _HAIR_IMAGE_SEG = vision.ImageSegmenter.create_from_options(vision.ImageSegmenterOptions(
+            base_options=BaseOptions(model_asset_path=MODEL_PATH),
+            running_mode=vision.RunningMode.IMAGE,
+            output_category_mask=False,
+            output_confidence_masks=True,
+        ))
+    h, w = frame_bgr.shape[:2]
+    small = cv2.resize(frame_bgr, (width, max(1, int(round(width * h / w)))), interpolation=cv2.INTER_AREA)
+    rgb = np.ascontiguousarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+    with _HAIR_LOCK:
+        res = _HAIR_IMAGE_SEG.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    return np.array(res.confidence_masks[CATEGORY_HAIR].numpy_view(), np.float32)
+
+
 def _bbox(mask: np.ndarray):
     if not np.any(mask):
         return None

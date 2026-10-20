@@ -460,7 +460,7 @@ let pc = null, channel = null, localStream = null, pingTimer = null, statsTimer 
  * 버퍼로 '빠른 쪽'을 늦춰서 맞춘다 - 버퍼는 늦은 쪽을 당길 수 없고, 이게
  * 버퍼가 동기화에 기여할 수 있는 유일한 방향이다.
  */
-const PV_W = 200, PV_H = 150, PV_POOL = 24;
+const PV_W = 120, PV_H = 195, PV_POOL = 24;   // 송출과 같은 세로 비율 (400x649)
 const pvCanvas = el("local-canvas"), pvCtx = pvCanvas.getContext("2d");
 const syncPreview = el("sync-preview");
 const pvPool = [];      // {canvas, ctx}
@@ -488,7 +488,10 @@ function capturePreview() {
     if (!localStream) return;
     const slot = pvPool[pvNext % PV_POOL];
     pvNext++;
-    slot.ctx.drawImage(v, 0, 0, PV_W, PV_H);
+    // 서버(fit_frame)처럼 가운데를 미리보기 비율로 잘라 그린다 - 늘이면 얼굴이 합성본과 달라 보인다.
+    const vw = v.videoWidth || PV_W, vh = v.videoHeight || PV_H;
+    const s = Math.min(vw / PV_W, vh / PV_H), sw = PV_W * s, sh = PV_H * s;
+    slot.ctx.drawImage(v, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, PV_W, PV_H);
     pvQueue.push({ slot, t: performance.now() });
     // 풀보다 하나 적게 유지한다. 꽉 채우면 방금 덮어쓴 슬롯이 큐의 가장
     // 오래된 항목과 같은 슬롯이 되어 그 프레임이 오염된다.
@@ -750,7 +753,7 @@ function diagnoseRemote(r, report) {
     verdict = ["no-assembly",
       `패킷 ${pkts}개(${(bytes / 1024).toFixed(0)}KB)가 도착했지만 한 프레임도 ` +
       `조립되지 않았습니다 (손실 ${lost}) — 코덱이 아니라 패킷 손실/MTU 문제입니다. ` +
-      `캡처 해상도를 640x480 으로 낮춰 보세요`];
+      `캡처 해상도를 400x648 로 낮춰 보세요`];
   } else if (decoded === 0) {
     verdict = ["no-decode",
       `프레임 ${received}개가 조립됐지만 디코딩이 0입니다` +
@@ -782,18 +785,21 @@ function connMark(k) {
   }
 }
 
+// 캡처 요청이자 서버 송출 해상도 ("가로x세로"). 서버는 config.out_sizes 안의 값만 받는다.
+const outSize = () => el("capres").value || "800x1298";
+
 async function start() {
   startBtn.disabled = true;
   setStatus("웹캠 요청 중...");
   connT0 = performance.now(); connMarks = {};
 
   try {
-    const [capW, capH] = (el("capres").value || "1280x720").split("x").map(Number);
+    const [capW, capH] = outSize().split("x").map(Number);
     localStream = await navigator.mediaDevices.getUserMedia({
-      // 기본 1280x720. 예전엔 640x480 이었다 - 헤어 연장/틈 메우기의 정사각 k x k 필터가
-      // 해상도 제곱으로 비싸져 720p 에서 실시간이 깨졌다. 분리형(gpu_segmenter._maxk)으로 바꾼 뒤
-      // 720p 처리 시간이 640x480 과 같아졌다(학교 3090 실측 137ms -> 46ms). 1080p 는 아직 ~70ms.
-      video: { width: capW, height: capH, frameRate: { ideal: 30 } },
+      // 세로 기준: 플랫폼이 폰 세로 화면이고 영상 칸이 400x649 다. 기본은 그 2배 800x1298
+      // (649 는 홀수라 H.264 가 못 받아 648/1298). 폰이 정확히 이 크기를 안 줘도 서버(fit_frame)가
+      // 가운데를 잘라 맞추므로 여기 값은 '이 근처로' 라는 요청일 뿐이다.
+      video: { width: capW, height: capH, facingMode: "user", frameRate: { ideal: 30 } },
       audio: false,
     });
     const t = localStream.getVideoTracks()[0].getSettings();
@@ -856,7 +862,8 @@ async function start() {
     const res = await fetch("/offer", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type,
+                             out_size: outSize() }),
     });
 
     // 상태 코드를 확인하지 않고 곧장 json 을 answer 로 넘기면, 서버가 보낸

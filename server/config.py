@@ -78,6 +78,27 @@ class Config:
     #: 기다려 /offer 응답이 매번 7초 늦었다(실측, 이름 조회 ~2초 포함). 그런 서버는 .env 에서 비운다:
     #: HEDDY_ICE_SERVERS=
     ice_servers: tuple[str, ...] = ("stun:stun.l.google.com:19302",)
+    #: ice_servers 의 turn:/turns: 항목에 붙일 자격(장기 자격). STUN 만으로는 학교 도커 + 학교 NAT
+    #: 뒤 서버에 외부 브라우저가 못 붙어서(ICE failed), 이 PC 의 TURN(server/turn) 릴레이를 쓴다.
+    #: aiortc 는 STUN/TURN 을 각각 **첫 번째 것만** 쓴다. 값은 server/.env 에(turn.exe 도 같은 키를 읽는다):
+    #: HEDDY_ICE_SERVERS=stun:stun.l.google.com:19302,turn:<이 PC 공인 IP>:3478
+    #: HEDDY_TURN_USERNAME=heddy  HEDDY_TURN_CREDENTIAL=<비밀번호>
+    turn_username: str = ""
+    turn_credential: str = ""
+    #: 처리/송출 해상도 "가로x세로". 받은 프레임을 이 비율로 가운데를 잘라 이 크기로 맞춘 뒤 모든 처리를 한다.
+    #: 플랫폼이 세로 화면(폰 카메라)이고 영상 칸이 400x649 라 기준이 세로다 - 기본은 그 2배(고해상도).
+    #: 649 는 홀수라 못 쓴다(H.264 yuv420 은 짝수만): 648 / 1298. 폰이 정확히 이 크기를 안 줘도
+    #: (iOS 는 720x1280 같은 고정 모드만 준다, 업링크가 나쁘면 브라우저가 낮춰 보낸다) 출력은 늘 이 크기다.
+    #: 클라이언트가 /offer 본문에 out_size 를 실으면 out_sizes 안의 값일 때만 그걸 쓴다. 비우면 받은 그대로.
+    out_size: str = "800x1298"
+    out_sizes: tuple[str, ...] = ("400x648", "800x1298")
+    #: 받은 프레임 비율이 out_size 와 다를 때 맞추는 방법.
+    #: "contain": 원본 전체를 out_size 안에 들어가게 줄여서 처리하고, 송출 때 남는 칸을 같은 영상을 흐리고
+    #:            어둡게 깐 배경으로 채운다 - 화각 손실 없음.
+    #: "crop": 가운데를 잘라 채운다. 가로 웹캠(1298x800)이면 가운데 493px 만 남아 얼굴이 2.6배로 커진다(실측 로그).
+    #: 비율 차이가 10% 이내면 어느 쪽이든 그냥 잘라 맞춘다 - iPhone 720x1280 은 9% 라 위아래 조금만 잘림(1.1배),
+    #: contain 이면 좌우에 35px 짜리 흐린 띠가 생겨 더 어색하다.
+    fit_mode: str = "contain"
     #: 이 시간 동안 프레임이 한 장도 안 들어오면 세션을 정리한다.
     #: 브라우저를 그냥 닫으면 ICE 가 failed 로 갈 때까지 리소스가 남는다.
     session_idle_timeout_s: float = 90.0
@@ -177,8 +198,12 @@ class Config:
     #: (train/frames 실측). 그러면 눈이 지워지고 GAN 얼굴 패치가 그 자리를
     #: 덮어 눈이 남의 것이 된다. MediaPipe 눈 위치는 그런 프레임에서도 잡히므로
     #: 기하학적 타원을 파싱 마스크에 합친다. 0 이면 끈다.
-    protect_eye_rx: float = 0.42
-    protect_eye_ry: float = 0.30
+    #:
+    #: 기본 0(끔): 3D 그룸 경로에선 지우기 단계에서 이 원 안의 원래 앞머리가 그대로 남아 눈에 동그란
+    #: 보호막이 씌워진 것처럼 보였다(사용자 피드백). 이마 인페인터 v5 가 눈 윤곽을 보고 눈 위 앞머리를
+    #: 지우고 눈을 다시 그리므로 필요 없다. 파싱이 '눈'으로 찍은 픽셀 보호(protect_eyes)는 그대로다.
+    protect_eye_rx: float = 0.0
+    protect_eye_ry: float = 0.0
 
     # ---------- 합성 정합 (이질감) ----------
     #: 워핑된 헤어 알파 경계를 프레임 스케일에서 부드럽게 하는 폭(눈 간격 배수).
@@ -210,8 +235,22 @@ class Config:
     #: 테두리가 남는다. 이 구간을 0~1 로 다시 펴서 확실히 지운다.
     erase_hard_lo: float = 0.25
     erase_hard_hi: float = 0.60
+    #: 그 단단한 erase 의 팽창 폭 (눈 간격 배수, 최소 3px). 640x480 의 3px ≈ 0.06d.
+    erase_hard_grow: float = 0.06
+    #: 배경 플레이트 기록에서 사람(배경 아닌 것) 둘레를 빼는 폭(프레임 높이 배수). 빠르게 움직이면 번진 머리
+    #: 끝을 파서가 배경으로 찍어 플레이트에 머리색이 쌓였고, 지운 자리를 채울 때 원래 머리 잔상으로 나왔다.
+    plate_margin: float = 0.012
+    #: 랜드마크 얼굴 타원 중 이 비율 넘게 '배경'으로 찍힌 프레임은 플레이트를 갱신하지 않는다(파서 실패 -
+    #: 고개를 젖히면 얼굴/목이 통째로 배경으로 찍혀 얼굴 잔상이 됐다). 1 이면 끈다.
+    plate_face_bg_max: float = 0.2
+    #: 사람(배경 아닌 것) 면적이 최근 평균보다 이 비율 넘게 갑자기 줄어든 프레임은 플레이트를 갱신하지 않는다
+    #: (파서가 얼굴/목 일부를 배경으로 찍은 프레임). 0 이면 끈다.
+    plate_person_drop: float = 0.1
     #: 얼굴 zone 안에서 눈 위 이 높이(눈 간격 배수)보다 아래는 이마 패치가 덮는 만큼만 지운다(0=끔).
     erase_eye_keep: float = 0.35
+    #: 이마 패치 둘레를 얼굴(지우는 자리)로 넓히는 폭 (눈 간격 배수, 0=끔). 패치가 오클루더 실루엣에서
+    #: 끊긴 관자놀이의 앞머리 옆 끝을 피부톤 평면으로 이어 지운다.
+    face_patch_grow: float = 0.25
     #: 지운 머리 자리를 채울 때 상수 살색 대신 **휘도 평면**(L=a+bx+cy)을 피팅해
     #: 그라디언트를 살린다. 실제 이마는 중앙이 밝고 관자놀이로 어두워지는데
     #: 상수로 덮으면 스티커처럼 보인다. 0 이면 예전 상수 살색.
@@ -244,6 +283,9 @@ class Config:
     pose_wait_s: float = 0.025
     #: 랜드마커가 얼굴을 놓쳐도 직전 포즈를 이 프레임 수까지 유지한다(고개 숙임/젖힘의 짧은 끊김).
     pose_hold_frames: int = 6
+    #: 이 프레임 포즈가 없을 때(타임아웃/얼굴 놓침) 직전 포즈를 그대로 쓰지 않고, 분할 얼굴 위치가 그 포즈를
+    #: 잰 프레임에서 지금까지 움직인 만큼 옮겨 쓴다(gpu_segmenter._reanchor_pose). 끄면 예전처럼 그대로.
+    pose_reanchor: bool = True
     #: 진단용으로 되살리려면 HEDDY_SERVE_STATIC_ASSETS=1.
     serve_static_assets: bool = False
 
@@ -305,6 +347,15 @@ class Config:
     #: 두상 정규 좌표 y(cm, 두상 중심 기준 +위) 가 이보다 위면 두피 - 얼굴면/피부 채움에서 뺀다.
     groom_face_top_cm: float = 5.0
     groom_volume_y0: float = -1.0
+    #: 긴 머리: 몸 뒤로 넘어간 뒷머리(어깨선 아래 + 상체 앞면보다 뒤)를 사용자 몸 영역(분할의 머리카락/배경
+    #: 아닌 곳) 안에서 지운다(0=끔). 몸 오클루더가 없어 등 뒤 머리가 몸을 뚫고 가슴 위에 커튼처럼 떴다
+    #: (사용자 피드백 glossy-straight). 깊이 판정은 그룸 정규 좌표(cm, 두상 중심 기준 +y 위 +z 앞)의 상체
+    #: 근사: 목·가슴 단면 타원(중심 z=cz, 반폭 a, 앞쪽 반깊이 b) - 앞면보다 margin 넘게 뒤면 '몸 뒤'.
+    groom_body_occlude: float = 1.0
+    #: (턱 y - 이보다 위는 판정 안 함, 타원 중심 z, 목 단면이 끝나는 y, 가슴 단면이 시작되는 y)
+    groom_body_y: tuple[float, ...] = (-9.0, -4.0, -15.0, -21.0)
+    #: (목 반폭 a, 목 앞 반깊이 b, 가슴 반폭 a, 가슴 앞 반깊이 b, 앞면 여유 margin) cm
+    groom_body_ab: tuple[float, ...] = (6.5, 6.0, 20.0, 8.0, 1.0)
     #: 두피 베이스 레이어 불투명도(0=끔). 그룸의 오클루더(FLAME 두상) 중 이 스타일 뿌리가 나는 자리를
     #: 헤어 아래에 헤어색(주변 가닥 색을 확산)으로 깐다. 없으면 가닥 사이/귀 위·뒤가 배경으로 뚫려
     #: 두상이 파여 보였다(실측: 원래 머리를 지운 자리에 플레이트 배경이 나옴). 실제 헤어카드 게임도
@@ -337,16 +388,32 @@ class Config:
     #: 없으면 그 자리는 원래 머리가 그대로 남는다. 눈 아래 이 높이(눈 간격 배수)까지만 - 어깨/옷 위는
     #: 근거 없는 배경으로 칠하지 않는다.
     bg_diffuse_down: float = 1.2
+    #: 그 아래(어깨/가슴까지 내려온 긴 머리)는 지금 프레임의 옷/목/배경을 확산해 채워 지운다(0=끔, 예전처럼
+    #: 남김). 플레이트는 머리 밑의 옷을 영영 못 본다.
+    body_fill: float = 1.0
+    #: 옷 위로 내려온 긴 머리용 셀피 분할(MediaPipe, CPU ~100ms)을 백그라운드로 돌리는 빈도(Hz, 0=끔).
+    #: 얼굴 파서는 그 머리를 '옷'으로 찍어 못 지운다. 3D 그룸 tryon 중에만 돈다.
+    long_hair_seg_hz: float = 3.0
+    #: 그 마스크가 이 시간(초)보다 오래되면 안 쓴다.
+    long_hair_seg_max_age: float = 1.0
+    #: 늦게 온 마스크를 움직임만큼 팽창하는 폭 (프레임 높이 배수).
+    long_hair_grow: float = 0.015
     #: 3D 그룸 앞머리가 이마에 떨어뜨리는 아래쪽 그림자 세기(0=끔)와 이동/흐림 폭(눈 간격 배수).
     #: 원래 머리가 3D 헤어 실루엣 밖으로 삐져나온 자리를 헤어로 메우는 세기(0=끔, 예전처럼 배경으로
     #: 지움). 지우면 헤어 둘레에 뿌연 후광이 떴다(gpu_segmenter._groom_extend). k 는 그룸에서 이만큼
     #: (눈 간격 배수) 떨어진 곳까지만, eye 는 눈 위 이 높이부터(귀/옆얼굴 제외), fh_w 는 이마로 빼는
     #: 가로 반폭, detail 은 원래 머리 휘도 결을 빌리는 세기.
+    #: k 는 0.45 였다 - 그룸이 원래 머리보다 작으면 그 띠(~3cm)만큼 원래 머리 결이 그룸 밖에 그대로 남아
+    #: '실제 머리가 보인다'(사용자 피드백). 후광의 큰 원인이던 배경 위 그림자 고리는 groom_shadow_skin_only 로
+    #: 뺐으므로 경계 틈만 메우는 폭으로 줄였다.
     groom_extend: float = 0.95
-    groom_extend_k: float = 0.45
+    groom_extend_k: float = 0.15
     groom_extend_eye: float = 0.2
     groom_extend_fh_w: float = 0.95
     groom_extend_detail: float = 0.8
+    #: 3D 그룸 헤어라인/아래 그림자를 피부·얼굴(파서 1~12, 얼굴 zone, 두상 오클루더) 위에만 얹는다.
+    #: 끄면 예전처럼 헤어 둘레 전체(배경 벽 포함) - 원래 머리보다 작은 그룸에서 뿌연 어두운 고리가 떴다.
+    groom_shadow_skin_only: bool = True
     groom_drop_shadow: float = 0.45
     groom_drop_shadow_dy: float = 0.10
     groom_drop_shadow_k: float = 0.30
@@ -376,6 +443,14 @@ class Config:
     groom_dyn_max_shift_cm: float = 2.5
     #: 정지해 있을 때의 미세 흔들림 진폭(cm, 끝 기준). 0 이면 완전 정지.
     groom_dyn_idle_cm: float = 0.12
+    #: 흔들린 가닥이 두상(오클루더) 속으로 못 들어가게 표면으로 밀어낸다(groom_renderer 셰이더 u_collide).
+    #: 끄면 얼굴 쪽으로 쏠린 가닥이 오클루더 뒤로 숨어 헤어 안쪽이 볼/턱 윤곽대로 잘려 보였다.
+    #: margin: 표면에서 띄우는 거리(cm).
+    groom_dyn_collide: bool = True
+    groom_dyn_collide_margin_cm: float = 0.3
+    #: 두상에 붙은 가닥은 덜 흔든다: (표면에서 이 cm 안이면 붙음, 이 cm 밖이면 자유, 붙은 가닥의 흔들림 비율).
+    #: 볼을 감싼 옆머리가 통째로 바깥으로 떨어져 턱선이 드러났다(사용자 피드백). groom_dyn_collide 와 같이 켜진다.
+    groom_dyn_hug: tuple[float, ...] = (0.8, 3.0, 0.3)
     #: 사용자 머리가 안 보일 때(모자/삭발) 쓰는 기본 머리색 (BGR).
     groom_default_bgr: tuple[float, ...] = (28.0, 32.0, 40.0)
     #: GPU 에 올려둘 에셋 텐서 상한(개). 512^2 RGBA float32 = 약 4MB/개.

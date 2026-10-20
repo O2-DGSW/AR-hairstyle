@@ -42,6 +42,8 @@ def main():
                     help="groom_dbg_*.png: 빨강=안 지워진 원래 머리, 파랑=지웠는데 새 헤어가 안 덮는 자리")
     ap.add_argument("--dyn", type=float, default=0.0,
                     help="2차 운동 세기(1=기본). 프레임 순서대로 30fps 로 스프링을 굴린다")
+    ap.add_argument("--long-hair", type=int, default=1,
+                    help="1: 셀피 분할 머리 마스크를 넘긴다(서버의 long_hair_seg - 옷 위 긴 머리 지우기)")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -69,7 +71,7 @@ def main():
         lm = landmarks_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         fh_asset, bangs_px, ms = forehead.build_forehead_asset(
             forehead.ForeheadInpainter(seg.device), img, cls, lm["eye_l"], lm["eye_r"], "forehead",
-            7, lm.get("matrix") if a.fh3d else None, lm.get("brows"))
+            7, lm.get("matrix") if a.fh3d else None, lm.get("brows"), lm.get("eyes"), lm.get("oval"))
         seg.warm_asset(fh_asset)
         cv2.imwrite(os.path.join(a.out, "forehead_bald.png"), fh_asset.bald_bgr)
         print(f"forehead: 앞머리 {bangs_px}px, 인페인트 {ms:.0f}ms")
@@ -93,8 +95,12 @@ def main():
         if a.dyn > 0 and pose is not None and pose.get("matrix") is not None:
             dyn = hd.step(pose["matrix"], 1 / 30)
             dyn["tip"] = a.dyn
+        hair_low = None
+        if a.long_hair and mode == "tryon":
+            import segmenter
+            hair_low = segmenter.hair_confidence(img)
         out, t = seg.process(img, plate, mode, fh_asset, 1.0, 0.0, pose, True, 0.35, 0.0,
-                             None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color, dyn)
+                             None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color, dyn, hair_low=hair_low)
         return img, out, t, pose
 
     for i in range(min(a.warm, len(files))):

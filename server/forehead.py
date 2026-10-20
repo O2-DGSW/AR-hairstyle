@@ -52,6 +52,8 @@ HIDE_HAIR_CONTEXT = True
 FILL_METHOD = "learned"
 #: 앞머리를 지우는 띠의 아래 끝 (눈 아래, 눈 간격 배수).
 BANGS_DOWN = 0.35
+#: 앞머리 구멍 팽창 (눈 간격 배수). 파싱 경계 밖 가는 머리끝까지 덮는다.
+BANGS_DILATE = 0.13
 #: 인페인터 입력 크롭: 눈 간격의 몇 배를 한 변으로 (얼굴 전체가 문맥으로 들어가야 색/음영이 맞는다).
 CROP_EYES = 7.0
 CROP_PX = 512
@@ -201,7 +203,8 @@ def synthesize_forehead(frame_bgr, cls, fill, eye_l, eye_r, brows=None):
 
 
 def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cls: np.ndarray,
-                         eye_l, eye_r, name: str, dilate: int = 7, matrix=None, brows=None, eyes=None):
+                         eye_l, eye_r, name: str, dilate: int = 7, matrix=None, brows=None, eyes=None,
+                         oval=None):
     """프레임 + 파싱 + 눈 2점 -> (얼굴 패치 HairAsset, 앞머리 px, 인페인트 ms).
 
     반환 에셋은 .face 가 자기 자신이다 - gpu_segmenter 의 그룸 분기는 asset.face /
@@ -223,7 +226,16 @@ def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cl
     # 앞머리 지우기 띠는 눈 아래까지 내린다: 눈썹·안경테를 덮고 내려온 앞머리가 남아 있었다(사용자
     # 피드백). 눈/안경 자체는 파싱상 머리가 아니므로 안 걸린다.
     bangs_band = (ys > c[1] - BAND_UP * d) & (ys < c[1] + BANGS_DOWN * d)
+    if oval is not None:
+        # 관자놀이로 내려온 앞머리 옆 끝은 zone 타원(옆 1.5d) 밖이라 안 채워져 세로 경계로 남았다(실측).
+        # 메시 얼굴 윤곽 안이면 얼굴 위 머리라 지운다 - 윤곽 밖(배경 쪽 옆머리)은 그대로.
+        om = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(om, [np.round(oval).astype(np.int32)], 1)
+        zone = zone | (om > 0)
     bangs = ((cls == CLS_HAIR) & zone & bangs_band).astype(np.uint8) * 255
+    # 팽창은 눈 간격 비례(dilate 는 최소값). 고정 7px 는 640x480(d≈52)에선 0.13d 였지만 폰 세로
+    # 800x1298(d≈130)에선 0.05d 라, 파서가 피부로 찍는 가는 앞머리 끝이 구멍 밖에 남았다(실측).
+    dilate = max(dilate, int(round(BANGS_DILATE * d)) | 1)
     if dilate > 1:
         bangs = cv2.dilate(bangs, np.ones((dilate, dilate), np.uint8))
     bangs_px = int((bangs > 0).sum())
@@ -233,13 +245,13 @@ def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cl
     learned = inpainter.learned() if (bangs_px > 0 and FILL_METHOD == "learned" and inpainter is not None) else None
     if learned is not None:
         t0 = time.perf_counter()
-        hole = bangs > 0
-        if not (learned.fills_eyes and eyes is not None):
-            ys_, xs_ = np.mgrid[0:h, 0:w].astype(np.float32)
-            for e in (eye_l, eye_r):    # 눈 자체는 채우지 않는다 (synth 와 같은 기하 타원)
-                hole &= ((xs_ - e[0]) / (0.42 * d)) ** 2 + ((ys_ - e[1]) / (0.26 * d)) ** 2 > 1.0
-        # 눈 안내(v5) 가중치면 눈을 찌르는 앞머리도 구멍에 둔다 - 네트워크가 메시 눈 윤곽을 보고 눈을
-        # 다시 그린다. 파서가 앞머리 아래 눈을 '머리'로 찍어도 같은 이유로 눈이 지워지지 않는다.
+        # 네트워크 구멍은 띠 안의 머리 전부(zone/윤곽 밖 옆머리 포함). 옆머리를 문맥으로 남기면 앞머리
+        # 옆 끝을 회색 머리결(헤어라인 연장)로 채워 관자놀이에 세로 줄이 남았다(실측). 쓰는 건 여전히
+        # face_mask(bangs) 안뿐이라 윤곽 밖은 피부가 돼도 안 보인다.
+        hole = (bangs > 0) | (cv2.dilate(((cls == CLS_HAIR) & bangs_band).astype(np.uint8),
+                                         np.ones((dilate, dilate), np.uint8)) > 0)
+        # 눈 둘레 타원을 구멍에서 빼지 않는다: 눈을 찌르는 앞머리도 지우고 네트워크(v5 눈 안내)가 메시 눈
+        # 윤곽을 보고 눈을 다시 그린다. 타원을 빼면 눈 위 머리카락이 원 모양으로 남았다(사용자 피드백).
         with inpainter._lock:
             bald = learned.fill(frame_bgr, hole, eye_l, eye_r, brows, eyes)
         ms = (time.perf_counter() - t0) * 1000
@@ -296,6 +308,9 @@ def build_forehead_asset(inpainter: ForeheadInpainter, frame_bgr: np.ndarray, cl
     asset.bald_bgr = bald            # 프레임 크기. 3D 투영 경로의 텍스처이기도 하다
     asset.build_matrix = None if matrix is None else np.asarray(matrix, np.float32).reshape(4, 4)
     # 투영 경로의 알파: 패치 마스크를 눈 간격 비례로 부드럽게 (닮음변환 경로의 에셋 알파와 같은 역할)
+    # 안쪽으로만 흐린다: 그냥 흐리면 알파가 마스크 밖(안 지운 머리 - 관자놀이 옆머리)까지 반쯤 번져
+    # 그 머리가 패치에 섞여 세로 줄로 보였다(실측).
     k = max(3, int(round(0.12 * d)) | 1)
-    asset.face_mask_full = cv2.GaussianBlur(face_mask.astype(np.float32), (k, k), 0)
+    inner = cv2.erode(face_mask, np.ones((k // 2 * 2 + 1,) * 2, np.uint8))
+    asset.face_mask_full = cv2.GaussianBlur(inner.astype(np.float32), (k, k), 0)
     return asset, bangs_px, ms

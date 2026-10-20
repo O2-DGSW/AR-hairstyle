@@ -97,6 +97,8 @@ class AppState:
         self.forehead_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forehead")
         self.gan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gan")
         self.pose_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pose")
+        # 긴 머리용 셀피 분할(CPU ~100ms) 전용 - 영상 경로와 랜드마커를 막지 않게 따로.
+        self.hairseg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hairseg")
 
         self.segmenter = None          # 첫 연결 때 지연 초기화 (모델 로딩이 몇 초)
         self.forehead = None           # forehead.ForeheadInpainter (LaMa). 3D 그룸 첫 선택 때 적재.
@@ -235,10 +237,16 @@ class PeerState:
         self.forehead_built_at = 0.0   # 주기 갱신 기준 시각 (monotonic)
         self.forehead_prev = None      # 교체 직후 크로스페이드용 이전 패치 이름
         self.forehead_fade_at = 0.0
+        # 옷 위로 내려온 긴 머리 마스크(segmenter.hair_confidence, 백그라운드로 몇 프레임 전 것)
+        self.hair_low = None
+        self.hair_low_at = 0.0         # 그 마스크의 프레임 시각 (monotonic)
+        self.hair_low_future = None
         self.livebank = None      # LiveBank: 세션 중 GAN 으로 각도별 헤어를 생성
         self.recording = False    # 학습 데이터용 원본 프레임 수집
         self.rec_dir = None
         self.rec_count = 0
+        # 처리/송출 해상도 (w, h) 또는 None(받은 그대로). /offer 의 out_size 가 덮어쓴다.
+        self.out_size = parse_size(self.cfg.out_size)
 
         # 세션 스코프 에셋. 정적 에셋은 공유(읽기 전용)하고 생성분만 여기 가둔다.
         # 축출 훅이 세그멘터 GPU 캐시까지 비워야 VRAM 이 실제로 돌아온다.
@@ -309,6 +317,70 @@ def _close_quietly(obj) -> None:
         logger.exception("close() 실패")
 
 
+def parse_size(s):
+    """"800x1298" -> (800, 1298). 빈 값이면 None. H.264(yuv420)가 홀수 크기를 못 받으므로 홀수는
+    짝수로 내린다 - 플랫폼 화면 크기 그대로 "400x649" 를 보내도 400x648 로 받는다."""
+    if not s:
+        return None
+    w, sep, h = str(s).lower().partition("x")
+    w, h = int(w) & ~1, (int(h) & ~1) if sep else -1
+    if w <= 0 or h <= 0:
+        raise ValueError(f"해상도는 '가로x세로' 여야 합니다: {s!r}")
+    return w, h
+
+
+def fit_frame(img, size, mode="crop"):
+    """받은 프레임 -> 처리할 프레임. size 가 None 이거나 이미 그 크기면 그대로.
+
+    폰은 요청한 크기를 정확히 주지 않는다(iOS 는 720x1280 같은 고정 모드, 가로로 들면 가로 영상,
+    업링크가 나쁘면 브라우저가 낮춰 보낸다).
+      crop   : 가운데를 size 비율로 잘라 size 로 맞춘다.
+      contain: 원본 전체를 size 안에 들어가게 줄인다(처리 크기 <= size). 송출 직전 letterbox() 가 size 로 채운다.
+               처리 크기는 비율과 size 로만 정해져서 업링크가 해상도를 바꿔도 같다.
+    """
+    if size is None:
+        return img
+    w, h = size
+    ih, iw = img.shape[:2]
+    if (iw, ih) == (w, h):
+        return img
+    if mode == "contain" and abs(iw * h - ih * w) > 0.10 * ih * w:
+        s = min(w / iw, h / ih)
+        cw, ch = min(w, max(2, round(iw * s))), min(h, max(2, round(ih * s)))
+        interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
+        return cv2.resize(img, (cw, ch), interpolation=interp)
+    if iw * h > ih * w:                       # 목표보다 넓다 -> 좌우를 자른다
+        cw = round(ih * w / h)
+        x0 = (iw - cw) // 2
+        img = img[:, x0:x0 + cw]
+    else:                                      # 목표보다 길다 -> 위아래를 자른다
+        ch = round(iw * h / w)
+        y0 = (ih - ch) // 2
+        img = img[y0:y0 + ch]
+    interp = cv2.INTER_AREA if img.shape[1] > w else cv2.INTER_LINEAR
+    return cv2.resize(img, (w, h), interpolation=interp)
+
+
+def letterbox(img, size):
+    """contain 모드로 처리한 프레임 -> 송출 크기 size. 가운데에 그대로 두고 남는 칸은 같은 영상을
+    cover 로 키워 흐리고 어둡게 한 배경(인스타 스토리 방식). 블러는 1/8 크기에서 해서 ~1ms."""
+    if size is None:
+        return img
+    w, h = size
+    ih, iw = img.shape[:2]
+    if (iw, ih) == (w, h):
+        return img
+    sw, sh = max(1, w // 8), max(1, h // 8)
+    s = max(sw / iw, sh / ih)
+    small = cv2.resize(img, (max(sw, round(iw * s)), max(sh, round(ih * s))), interpolation=cv2.INTER_AREA)
+    y0, x0 = (small.shape[0] - sh) // 2, (small.shape[1] - sw) // 2
+    small = cv2.convertScaleAbs(cv2.GaussianBlur(small[y0:y0 + sh, x0:x0 + sw], (0, 0), 2.5), alpha=0.55)
+    out = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    y0, x0 = (h - ih) // 2, (w - iw) // 2
+    out[y0:y0 + ih, x0:x0 + iw] = img
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 프레임 루프
 # ---------------------------------------------------------------------------
@@ -324,6 +396,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
         self._recv_times = deque(maxlen=max(2, state.cfg.log_every))
         self._last_recv_at = None
         self._last_pose = None
+        self._pose_miss = 0        # 랜드마커가 연달아 얼굴을 놓친 프레임 수 (_note_pose)
         self._yaw_ema = None       # yaw 흔들림이 각도 전환을 튀게 하므로 완만하게
         self._cur_asset = None     # 히스테리시스: 지금 쓰는 뱅크 칸
         self._last_out = None      # 드롭/에러 시 내보낼 직전 합성 결과
@@ -357,6 +430,45 @@ class SegmentedVideoTrack(VideoStreamTrack):
         """랜드마커 워커 스레드에서 실행. 색변환도 여기서 해야 메인 루프가 안 막힌다."""
         return self._state.pose.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
                                         int(time.monotonic() * 1000))
+
+    def _long_hair_mask(self, st, img, cfg):
+        """옷 위 긴 머리 마스크(셀피 분할)를 백그라운드로 갱신하고, 쓸 만큼 최근 것을 돌려준다(없으면 None).
+
+        CPU 로 ~100ms 라 매 프레임 못 돌린다. long_hair_seg_hz 간격으로 hairseg_executor 에 던지고,
+        끝난 결과는 그 프레임 시각과 함께 둔다. long_hair_seg_max_age 보다 오래된 건 안 쓴다(움직였으면
+        엉뚱한 옷을 지운다)."""
+        now = time.monotonic()
+        fut = st.hair_low_future
+        if fut is not None and fut.done():
+            st.hair_low_future = None
+            try:
+                st.hair_low, st.hair_low_at = fut.result()
+            except Exception:
+                logger.exception("긴 머리 분할 실패")
+                st.hair_low, st.hair_low_at = None, now      # 실패 직후 매 프레임 재시도하지 않게
+        if st.hair_low_future is None and now - st.hair_low_at >= 1.0 / cfg.long_hair_seg_hz:
+            import segmenter
+            frame = img.copy()
+            st.hair_low_future = st.app.hairseg_executor.submit(
+                lambda: (segmenter.hair_confidence(frame), now))
+        if st.hair_low is None or now - st.hair_low_at > cfg.long_hair_seg_max_age:
+            return None
+        return st.hair_low
+
+    def _note_pose(self, p_new):
+        """랜드마커 결과 하나(얼굴 없으면 None)를 _last_pose 에 반영한다.
+
+        고개를 크게 숙이거나 젖히면 랜드마커가 한두 프레임씩 얼굴을 놓친다. 그때 None 으로 덮으면
+        그 프레임은 헤어 없이 원래 머리만 지워져 빈 공간이 보였다(실측). 짧은 끊김은 직전 포즈 유지,
+        pose_hold_frames 를 넘기면 버린다 - 그 뒤로는 헤어를 안 그리고 원본을 그대로 낸다.
+        """
+        if p_new is not None:
+            self._last_pose = p_new
+            self._pose_miss = 0
+        else:
+            self._pose_miss += 1
+            if self._pose_miss > CONFIG.pose_hold_frames:
+                self._last_pose = None
 
     @staticmethod
     def _sharpness(img, pose):
@@ -482,9 +594,14 @@ class SegmentedVideoTrack(VideoStreamTrack):
         # 수신 해상도. 클라이언트가 720p 를 요청해도 브라우저는 업링크 대역폭에
         # 따라 조용히 낮춰 보낸다. 그러면 GAN 입력부터 흐려지는데 로그에
         # 안 남으면 원인을 찾을 수 없다. 처음과 바뀔 때만 남긴다.
-        if img.shape[:2] != self._frame_size:
-            self._frame_size = img.shape[:2]
-            logger.info("수신 해상도 %dx%d (%s)", img.shape[1], img.shape[0], st.sid)
+        src_hw = img.shape[:2]
+        img = fit_frame(img, st.out_size, cfg.fit_mode)
+        if src_hw != self._frame_size:
+            self._frame_size = src_hw
+            out = st.out_size or (img.shape[1], img.shape[0])
+            logger.info("수신 해상도 %dx%d -> 처리 %dx%d -> 송출 %dx%d (%s, %s)",
+                        src_hw[1], src_hw[0], img.shape[1], img.shape[0], out[0], out[1],
+                        cfg.fit_mode, st.sid)
         # 촬영은 오버레이가 얹히기 전 원본을 써야 한다 (GAN 입력에 마젠타 색칠이
         # 들어가면 안 됨). 매 프레임 최신본만 보관.
         st.last_raw = img
@@ -514,7 +631,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
         # 뱅크도 "세션 종료로 중단" 되어 첫 칸만 만들어지고 멈춘다.
         if (not cfg.stream_during_gan and st.livebank is not None
                 and st.livebank.phase == "generate"):
-            return self._wrap(np.zeros_like(img), frame)
+            return self._wrap(letterbox(np.zeros_like(img), st.out_size), frame)
 
         self._record_frame(img)
 
@@ -538,7 +655,11 @@ class SegmentedVideoTrack(VideoStreamTrack):
             prev = self._last_out
             out = prev if (prev is not None and prev.shape == img.shape) else img
 
-        return self._wrap(out, frame, self._last_i420 if out is self._last_out else None)
+        i420 = self._last_i420 if out is self._last_out else None
+        if st.out_size is not None and out.shape[1::-1] != tuple(st.out_size):
+            # contain 모드: 처리는 원본 비율 그대로 했고 송출 크기는 고정. GPU i420 은 처리 크기라 못 쓴다.
+            out, i420 = letterbox(out, st.out_size), None
+        return self._wrap(out, frame, i420)
 
     @staticmethod
     def _wrap(arr, src_frame, i420=None):
@@ -598,16 +719,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
         # 백프레셔가 막고 있어 실시간 경로를 늦추지 않는다.
         if st.pose_future is not None and st.pose_future.done():
             try:
-                p_new = st.pose_future.result()
-                # 고개를 크게 숙이거나 젖히면 랜드마커가 한두 프레임씩 얼굴을 놓친다. 그때 None 으로 덮으면
-                # 그 프레임은 헤어 없이 원래 머리만 지워져 빈 공간이 보였다(실측). 짧은 끊김은 직전 포즈 유지.
-                if p_new is not None:
-                    self._last_pose = p_new
-                    self._pose_miss = 0
-                else:
-                    self._pose_miss = getattr(self, "_pose_miss", 0) + 1
-                    if self._pose_miss > CONFIG.pose_hold_frames:
-                        self._last_pose = None
+                self._note_pose(st.pose_future.result())
             except Exception:
                 logger.exception("랜드마커 실패")
             st.pose_future = None
@@ -703,20 +815,26 @@ class SegmentedVideoTrack(VideoStreamTrack):
                         and abs(float(pose["yaw"]) - self._yaw_ema) < 5.0
                         and now_m - st.forehead_built_at > cfg.forehead_refresh_s):
                     asyncio.ensure_future(build_forehead(st, quiet=True))
+            hair_low = None
+            if st.groom_obj is not None and st.mode == "tryon" and cfg.long_hair_seg_hz > 0:
+                hair_low = self._long_hair_mask(st, img, cfg)
             processed, timings = await loop.run_in_executor(
                 app.gpu_executor, seg.process, img, st.plate, st.mode,
                 asset, st.scale_mul, st.offset_up, pose, st.harmonize, st.shadow,
                 st.blend, asset2, mix, st.smoother,
                 st.groom_obj, groom_fit, st.groom_color, groom_dyn,
-                pose_cf, (st.hair_dyn, st.dyn_amount, dyn_dt) if dyn_dt is not None else None)
+                pose_cf, (st.hair_dyn, st.dyn_amount, dyn_dt) if dyn_dt is not None else None, hair_low)
         finally:
             st.inflight -= 1
             app.gpu_inflight -= 1
         exec_ms = (time.perf_counter() - t_exec0) * 1000
         i420 = timings.pop("i420", None)     # ndarray 라 stats JSON 에 못 넣는다 - 먼저 뺀다
-        if timings.get("pose") is not None:
-            pose = timings["pose"]
-            self._last_pose = pose
+        if timings.get("pose_seen"):
+            # 이 프레임의 랜드마커 결과를 seg.process 가 받아 썼다. 얼굴을 놓쳤으면(None) 놓친 프레임으로
+            # 센다 - 대신 그린 직전 포즈를 되쓰면 pose_hold_frames 가 영영 안 끝나 손으로 카메라를 가려도
+            # 헤어가 허공에 남았다(사용자 피드백).
+            self._note_pose(timings.get("pose_fresh"))
+            pose = self._last_pose
             if st.pose_future is not None and st.pose_future.done():
                 st.pose_future = None
 
@@ -760,6 +878,9 @@ class SegmentedVideoTrack(VideoStreamTrack):
                     "groom_rgb_src": timings.get("groom_rgb_src") if st.groom_obj else None,
                     "groom_ms": round(timings.get("groom_ms", 0.0), 2),
                     "pose_ms": round(timings.get("pose_ms", 0.0), 1),
+                    # 이 프레임 포즈가 없어 직전 포즈를 분할 얼굴 이동만큼 옮겨 그렸으면 그 이동 (px), 아니면 null
+                    "pose_shift": (None if timings.get("pose_shift") is None
+                                   else [round(v, 1) for v in timings["pose_shift"]]),
                     "yaw_ema": round(self._yaw_ema, 1) if self._yaw_ema is not None else None,
                     "references": list(app.references.keys()),
                     "gan_loaded": app.gan.loaded if app.gan else False,
@@ -1820,7 +1941,7 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         asset, bangs_px, ms = await loop.run_in_executor(
             app.forehead_executor, forehead.build_forehead_asset,
             app.forehead, frame, cls, lm["eye_l"], lm["eye_r"], name, 7, lm.get("matrix"), lm.get("brows"),
-            lm.get("eyes"))
+            lm.get("eyes"), lm.get("oval"))
         if asset is None:
             if not quiet:
                 notify_peer(state, {"type": "forehead", "status": "error", "message": "얼굴 패치를 만들지 못했습니다"})
@@ -2306,10 +2427,24 @@ async def offer(request):
     offer_desc = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection(RTCConfiguration(
-        iceServers=[RTCIceServer(u) for u in cfg.ice_servers]))
+        iceServers=[RTCIceServer(u, username=cfg.turn_username or None,
+                                 credential=cfg.turn_credential or None)
+                    if u.startswith(("turn:", "turns:")) else RTCIceServer(u)
+                    for u in cfg.ice_servers]))
     app.pcs.add(pc)
     state = PeerState(app)
     state.pc = pc
+    # 클라이언트가 고른 송출 해상도. 허용 목록 밖이면(안 실으면 포함) 서버 기본값.
+    # 안 실으면 x1(400x648)로 보내도 800x1298 로 키워 돌려준다 - 실제로 "x1 인데 확대됐다" 가 이것이었다.
+    try:
+        want = parse_size(params.get("out_size"))
+    except (TypeError, ValueError):
+        want = None
+    if want in {parse_size(s) for s in cfg.out_sizes}:
+        state.out_size = want
+    logger.info("송출 해상도 %s (요청 out_size=%r, %s)",
+                "%dx%d" % state.out_size if state.out_size else "받은 그대로",
+                params.get("out_size"), state.sid)
     app.sessions.add(state)
     app.metrics.sessions_total += 1
     logger.info("세션 시작 %s (활성 %d/%d)", state.sid, len(app.sessions), cfg.max_sessions)
