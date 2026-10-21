@@ -63,65 +63,7 @@ EYE_L_RING = (263, 466, 388, 387, 386, 385, 384, 398, 362, 382, 381, 380, 374, 3
 FIT_LM = (54, 284, 234, 454, 151, 152)
 
 
-def face_box(pts, w: int, h: int):
-    """랜드마크 한 사람분 -> 얼굴 윤곽 외접 사각형의 (중심 x, 중심 y, 크기 = 긴 변) px.
-
-    눈 간격과 달리 고개를 돌려도 크게 줄지 않아 여러 얼굴 중 '가장 큰(가까운)' 을 고르고, 머리를 사람별로
-    나눌 때(gpu_segmenter._owner_mask) 거리 정규화에 쓴다."""
-    xs = [pts[i].x * w for i in FACE_OVAL]
-    ys = [pts[i].y * h for i in FACE_OVAL]
-    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-    return (0.5 * (x0 + x1), 0.5 * (y0 + y1), max(x1 - x0, y1 - y0))
-
-
-def pick_wearer(boxes, track, ts_ms, hold_ms, max_jump, frame_w=None, center_w=0.0,
-                switch_ratio=1.3, switch_ms=700.0, size_mem_ms=5000.0):
-    """화면의 얼굴들(face_box) 중 헤어를 씌울 사람. -> (인덱스 또는 None, 새 track, 새 사람인지)
-
-    track = (x, y, 크기, 마지막으로 본 ts_ms, 도전자가 나타난 ts_ms 또는 None, 기억 크기) 또는 None.
-    랜드마커는 얼굴 순서를 보장하지 않고 num_faces=1 이면 아무나 하나를 잡는다 - 2인 프레임에서 옆 사람(사진)을
-    잡아 그쪽에 헤어를 씌우고 정작 사용자 머리는 지웠다(실측).
-      - 처음엔 점수(크기, 크기가 비슷하면 가운데 쪽 - center_w: 화면 끝이면 크기를 이만큼 깎는다)가 가장 높은 얼굴.
-      - 그 뒤로는 직전 착용자와 가까운 얼굴을 따라간다. 놓쳐도(손으로 가림, 옆모습) hold_ms 동안은 다른 사람에게
-        넘기지 않는다(None) - 넘겼다 돌아오면 헤어가 두 사람 사이를 오간다.
-      - 점수가 착용자의 switch_ratio 배를 넘는 얼굴이 switch_ms 동안 계속 보이면 그 사람으로 넘긴다. 착용자가 오래
-        옆을 보는 사이 옆 사람에게 넘어간 뒤, 돌아온 착용자를 되찾는 길이다(실측: 이게 없으면 끝까지 옆 사람).
-        착용자 점수는 지금 크기가 아니라 최근 최대 크기(size_mem_ms 로 서서히 잊는다)로 잰다 - 고개를 젖히거나
-        숙이면 얼굴 상자가 반토막 나 그 사이 옆 사람에게 빼앗겼다(실측, 서버 경로).
-    """
-    if track is not None and ts_ms - track[3] > hold_ms:
-        track = None
-    if not boxes:
-        return None, track, False
-
-    def score(b, size=None):
-        s = b[2] if size is None else size
-        if not frame_w:
-            return s
-        off = min(1.0, abs(b[0] - 0.5 * frame_w) / (0.5 * frame_w))
-        return s * (1.0 - center_w * off)
-
-    best = max(range(len(boxes)), key=lambda i: score(boxes[i]))
-    chal = None
-    if track is None:
-        k, new = best, True
-    else:
-        dist = [math.hypot(b[0] - track[0], b[1] - track[1]) for b in boxes]
-        k = min(range(len(boxes)), key=dist.__getitem__)
-        if dist[k] > max_jump * track[2]:
-            return None, track, False
-        new = False
-        ref = max(boxes[k][2], track[5] * math.exp(-(ts_ms - track[3]) / max(size_mem_ms, 1.0)))
-        if best != k and score(boxes[best]) > switch_ratio * score(boxes[k], ref):
-            chal = track[4] if track[4] is not None else ts_ms
-            if ts_ms - chal >= switch_ms:
-                k, new, chal = best, True, None
-    b = boxes[k]
-    ref = b[2] if new else ref
-    return k, (b[0], b[1], b[2], ts_ms, chal, ref), new
-
-
-def landmarks_image(frame_rgb: np.ndarray, near=None):
+def landmarks_image(frame_rgb: np.ndarray):
     """정지 이미지 1장의 눈/입꼬리. -> dict 또는 None.
 
     **FacePose 를 쓰면 안 되는 자리다.** 그건 VIDEO 모드라 프레임 간 추적을
@@ -131,9 +73,6 @@ def landmarks_image(frame_rgb: np.ndarray, near=None):
 
     랜드마커는 한 번만 만들어 재사용한다(생성 비용이 크다). 프로세스당 하나이고
     IMAGE 모드는 상태가 없어 호출 순서에 영향받지 않는다.
-
-    near: (x, y) px - 여러 얼굴이면 얼굴 중심이 여기에 가장 가까운 사람(실시간 착용자). 없으면 pick_wearer 의
-    첫 선택과 같은 사람(크기 x 가운데) - 그냥 가장 큰 얼굴이면 첫 이마 패치를 옆 사람 얼굴로 만들 수 있다.
     """
     global _IMAGE_LM
     if _IMAGE_LM is None:
@@ -141,7 +80,7 @@ def landmarks_image(frame_rgb: np.ndarray, near=None):
             vision.FaceLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=MODEL_PATH),
                 running_mode=vision.RunningMode.IMAGE,
-                num_faces=max(1, CONFIG.max_faces),
+                num_faces=1,
                 output_facial_transformation_matrixes=True,
             ))
     res = _IMAGE_LM.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
@@ -149,12 +88,7 @@ def landmarks_image(frame_rgb: np.ndarray, near=None):
     if not res.face_landmarks:
         return None
     h, w = frame_rgb.shape[:2]
-    boxes = [face_box(f, w, h) for f in res.face_landmarks]
-    if near is not None:
-        k = min(range(len(boxes)), key=lambda i: math.hypot(boxes[i][0] - near[0], boxes[i][1] - near[1]))
-    else:
-        k, _, _ = pick_wearer(boxes, None, 0, 0.0, 0.0, w, CONFIG.wearer_center_weight)
-    pts = res.face_landmarks[k]
+    pts = res.face_landmarks[0]
 
     def px(i):
         return np.array([pts[i].x * w, pts[i].y * h], dtype=np.float32)
@@ -166,7 +100,7 @@ def landmarks_image(frame_rgb: np.ndarray, near=None):
     if res.facial_transformation_matrixes:
         # FacePose.process 와 같은 row-major 4x4 (정규 얼굴 cm -> 카메라). 맨이마 패치를 3D 두상에
         # 투영해 붙일 때 "만든 순간의 포즈" 로 쓴다(forehead.py).
-        matrix = np.asarray(res.facial_transformation_matrixes[k].data, np.float32).reshape(4, 4).copy()
+        matrix = np.asarray(res.facial_transformation_matrixes[0].data, np.float32).reshape(4, 4).copy()
     # 눈썹 윗선/아랫선 (안쪽 -> 바깥, 각 5점). 앞머리에 가려진 눈썹도 메시가 추정해 준다 -
     # 맨이마를 합성할 때 눈썹을 그려 넣는 데 쓴다(forehead.py).
     brows = [(np.array([px(i) for i in up], np.float32), np.array([px(i) for i in lo], np.float32))
@@ -189,17 +123,13 @@ class FacePose:
         opts = vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=vision.RunningMode.VIDEO,
-            # 2 이상이어야 화면에 사람이 여럿일 때 누구에게 씌울지 고를 수 있다(pick_wearer). 1인 화면에서
-            # 1 -> 2 는 +1ms(검출기를 매 프레임 돈다), 2인 화면은 +5ms (실측 640x480, 별도 스레드).
-            num_faces=max(1, CONFIG.max_faces),
+            num_faces=1,
             output_facial_transformation_matrixes=True,
         )
         self._lm = vision.FaceLandmarker.create_from_options(opts)
         self._k = None          # 캘리브레이션 상수 (D_measured * tz)
         self._last_ts = -1      # VIDEO 모드는 타임스탬프가 단조증가해야 한다
         self._closed = False
-        self._track = None      # 착용자 (x, y, 크기, 마지막 ts) - pick_wearer
-        self._face_id = 0       # 착용자가 (새로) 정해질 때마다 +1. 서버가 이마 패치를 그 사람 것으로 다시 만든다
 
     def __enter__(self):
         return self
@@ -256,18 +186,11 @@ class FacePose:
 
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         res = self._lm.detect_for_video(image, ts_ms)
-        h, w = frame_rgb.shape[:2]
-        boxes = [face_box(f, w, h) for f in res.face_landmarks]
-        k, self._track, new = pick_wearer(boxes, self._track, ts_ms, CONFIG.wearer_hold_ms,
-                                          CONFIG.wearer_max_jump, w, CONFIG.wearer_center_weight,
-                                          CONFIG.wearer_switch_ratio, CONFIG.wearer_switch_ms,
-                                          CONFIG.wearer_size_mem_ms)
-        if k is None:
+        if not res.face_landmarks:
             return None
-        if new:
-            self._face_id += 1
-            self._k = None      # 거리 캘리브레이션 상수는 두상 크기라 사람마다 다르다
-        lm = res.face_landmarks[k]
+
+        h, w = frame_rgb.shape[:2]
+        lm = res.face_landmarks[0]
 
         def px(i):
             return np.array([lm[i].x * w, lm[i].y * h], dtype=np.float32)
@@ -286,7 +209,7 @@ class FacePose:
         tz = None
         matrix = None
         if res.facial_transformation_matrixes:
-            m = np.asarray(res.facial_transformation_matrixes[k].data,
+            m = np.asarray(res.facial_transformation_matrixes[0].data,
                            dtype=np.float32).reshape(-1)
             yaw, pitch, roll = self._euler(m)
             # MediaPipe 의 4x4 는 **row-major** 다. 평행이동이 마지막 '열'
@@ -332,10 +255,6 @@ class FacePose:
             "fit_lm": {i: px(i) for i in FIT_LM},
             # 얼굴 윤곽 (px) - 긴 머리 밑 인페인터(torso_net)가 구멍에서 얼굴을 뺀다
             "oval": np.array([px(i) for i in FACE_OVAL], np.float32),
-            # 착용자 얼굴 상자와 화면의 다른 얼굴들 (x, y, 크기) px - 옆 사람 머리는 안 지운다(_owner_mask)
-            "face_box": boxes[k],
-            "others": [b for i, b in enumerate(boxes) if i != k],
-            "face_id": self._face_id,
         }
 
     def close(self):

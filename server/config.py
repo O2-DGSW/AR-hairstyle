@@ -309,28 +309,6 @@ class Config:
     #: 이 프레임 포즈가 없을 때(타임아웃/얼굴 놓침) 직전 포즈를 그대로 쓰지 않고, 분할 얼굴 위치가 그 포즈를
     #: 잰 프레임에서 지금까지 움직인 만큼 옮겨 쓴다(gpu_segmenter._reanchor_pose). 끄면 예전처럼 그대로.
     pose_reanchor: bool = True
-    #: 랜드마커가 찾을 최대 얼굴 수. 2 이상이면 화면에 여럿일 때 가장 큰 얼굴을 착용자로 잡아 계속 따라간다
-    #: (face_pose.pick_wearer). 1 이면 예전처럼 랜드마커가 잡은 아무 얼굴 하나 - 옆 사람에게 씌울 수 있다.
-    max_faces: int = 2
-    #: 착용자를 이 시간(ms) 넘게 못 보면 그때 보이는 가장 큰 얼굴로 넘긴다. 그 전엔 옆 사람에게 안 넘긴다.
-    #: 1.5초였을 때 착용자가 옆모습으로 잠깐 안 잡히는 사이 옆 사람에게 넘어가, 돌아와도 점수 차가 작아
-    #: 되찾지 못했다(실측, 서버 경로). 정말 자리를 떠났을 때만 넘어가게 길게.
-    wearer_hold_ms: float = 5000.0
-    #: 직전 착용자 얼굴 중심에서 (얼굴 크기 x 이 값) 안의 얼굴만 같은 사람으로 본다.
-    wearer_max_jump: float = 0.6
-    #: 처음 착용자를 고를 때 화면 가운데를 얼마나 우대할지. 얼굴 크기에 (1 - 이 값 x 가운데에서 벗어난 정도 0~1)
-    #: 를 곱해 비교한다 - 크기가 비슷한 두 사람이면 가운데 사람.
-    wearer_center_weight: float = 0.5
-    #: 그 점수가 착용자의 이 배수를 넘는 얼굴이 wearer_switch_ms 동안 계속 보이면 착용자를 넘긴다.
-    wearer_switch_ratio: float = 1.3
-    wearer_switch_ms: float = 700.0
-    #: 그 비교에서 착용자 크기는 최근 최대값을 이 시간(ms) 상수로 서서히 잊으며 쓴다 - 고개를 젖히면 얼굴 상자가
-    #: 줄어 그 사이 옆 사람에게 넘어갔다(실측).
-    wearer_size_mem_ms: float = 5000.0
-    #: 착용자 머리만 지운다(gpu_segmenter._owner_mask). 끄면 화면 안 모든 머리가 지울 대상(예전 동작).
-    owner_mask: bool = True
-    #: 착용자 몸 덩어리를 이을 때 메우는 틈 (눈 간격 배수). 머리카락 사이/머리-어깨 사이 작은 배경 틈.
-    owner_gap: float = 0.3
     #: 진단용으로 되살리려면 HEDDY_SERVE_STATIC_ASSETS=1.
     serve_static_assets: bool = False
 

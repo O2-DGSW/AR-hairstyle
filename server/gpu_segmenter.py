@@ -205,7 +205,6 @@ class GpuFaceParser:
         self._lum_w = torch.tensor([0.114, 0.587, 0.299], device=self.device)   # BGR 휘도
         self._blender = None    # 증류 블렌더 (load_blender 로 주입)
         self._autofit = None    # 그룸 자동 맞춤 상태 (_update_autofit)
-        self._face_id = None    # 지금 착용자 (pose["face_id"]) - 바뀌면 사람별 상태를 비운다
         self._cgrid = None      # 크롭 좌표 그리드 캐시
         self.last_cls = None    # 마지막 프레임의 클래스맵 (GPU uint8) - 이마 갱신이 재사용
         self.last_cls_frame = None
@@ -243,7 +242,7 @@ class GpuFaceParser:
     _SESSION_STATE = {"_last_hair_px": 0, "_stat_cache": None, "_stat_frame": -999, "_last_coverage": None,
                       "_bg_pp": None, "_torso_cache": None, "_autofit": None,
                       "_hair_color": None, "_hair_std": None, "_groom_rgb": None, "_groom_rgb_src": None,
-                      "_hl_cache": None, "_face_id": None}
+                      "_hl_cache": None}
 
     def _use_session(self, plate):
         """세션별 상태를 plate 의 것으로 바꿔 낀다. 나가는 세션 것은 그 plate.seg_state 에 맡긴다."""
@@ -707,130 +706,6 @@ class GpuFaceParser:
             return None
         return x0, y0, x1, y1
 
-    def _owner_begin(self, cls, hair_a, eyes, pose):
-        """_owner_mask 의 GPU 쪽: 1/8 클래스맵 + 머리 비트를 비동기로 내려받기 시작한다. -> 핸들
-
-        여기서 바로 .cpu() 로 기다리면 그동안 그룸 렌더를 못 던져 프레임이 1~3ms 늘었다(실측). 결과는 처음 쓰는
-        곳(ROI 직전 - 거기서 어차피 한 번 동기화한다)에서 _owner_apply 가 받는다."""
-        q = 8
-        m = cls[::q, ::q].to(torch.uint8) | ((hair_a[::q, ::q] > 0.3).to(torch.uint8) << 5)
-        if m.device.type != "cuda":
-            return m.numpy(), None, eyes, pose
-        buf = getattr(self, "_owner_buf", None)
-        if buf is None or buf.shape != m.shape:
-            buf = self._owner_buf = torch.empty(m.shape, dtype=torch.uint8, pin_memory=True)
-        buf.copy_(m, non_blocking=True)
-        ev = torch.cuda.Event()
-        ev.record()
-        return buf, ev, eyes, pose
-
-    def _owner_apply(self, handle, hair_a, hair_cur, h: int, w: int):
-        """_owner_begin 결과로 착용자 몫만 남긴 (hair_a, hair_cur, None). 핸들이 없으면 그대로."""
-        if handle is None:
-            return hair_a, hair_cur, None
-        own = self._owner_mask(handle, h, w)
-        if own is not None:
-            hair_a, hair_cur = hair_a * own, hair_cur * own
-        return hair_a, hair_cur, None
-
-    def _owner_mask(self, handle, h: int, w: int):
-        """착용자 몫 머리 (h, w) 0~1, 또는 None(화면의 머리가 전부 착용자 것 - 곱할 필요 없음).
-
-        파서는 화면 안 모든 사람의 머리를 찍는다. 그대로 지우면 옆 사람 머리가 대신 씌울 헤어도 없이 지워져
-        뿌옇게 비었다(실측, 2인 합성 프레임). 1/8 해상도에서
-          (1) 착용자 얼굴에 이어진 사람(배경 아님 ∪ 머리) 덩어리만 남긴다 - 머리카락 사이 작은 틈은 owner_gap 으로 잇는다.
-          (2) 그 덩어리에 다른 얼굴이 붙어 있으면(어깨/머리가 맞닿은 두 사람 - 흔하다) 각 얼굴 크기로 나눈 거리가
-              더 가까운 쪽 몫으로 나눈다. 다른 얼굴은 파서가 찍은 코 - 랜드마커는 옆모습을 놓치는데 파서는 찍는다
-              (실측: 옆모습 사용자가 '다른 얼굴' 로 안 잡혀 머리가 지워짐). 랜드마커가 찾은 얼굴(pose["others"])
-              중 파서가 못 찍은 것도 보탠다.
-        CPU 로 읽는 건 1/8 클래스맵 한 장(1080p 세로 32KB)."""
-        buf, ev, eyes, pose = handle
-        if ev is not None:
-            ev.synchronize()
-        m = buf.numpy() if isinstance(buf, torch.Tensor) else buf
-        (lx, ly), (rx, ry) = eyes
-        d = float(np.hypot(rx - lx, ry - ly))
-        q = 8
-        c8, hair = m & 31, (m & 32) > 0
-        person = ((c8 != CLS_BG) | hair).astype(np.uint8)
-        k = 2 * max(1, int(round(CONFIG.owner_gap * d / q))) + 1
-        _, lab = cv2.connectedComponents(cv2.dilate(person, np.ones((k, k), np.uint8)), connectivity=8)
-        fb = pose.get("face_box") if pose is not None else None
-        cx, cy = (fb[0], fb[1]) if fb is not None else (0.5 * (lx + rx), 0.5 * (ly + ry))
-        hq, wq = lab.shape
-        # 착용자 덩어리: 얼굴 중심 칸의 라벨. 비었으면(안경 반사 등) 둘레 d 안에서 가장 많은 라벨
-        r = max(1, int(round(d / q)))
-        x8, y8 = int(np.clip(cx / q, 0, wq - 1)), int(np.clip(cy / q, 0, hq - 1))
-        win = lab[max(0, y8 - r):y8 + r + 1, max(0, x8 - r):x8 + r + 1]
-        win = win[win > 0]
-        if win.size == 0:
-            return None
-        main = lab[y8, x8] if lab[y8, x8] > 0 else int(np.bincount(win).argmax())
-        mine = lab == main
-
-        # 파서 얼굴들 (x, y, 크기) px. 얼굴(1~12) 덩어리 하나를 한 사람으로 세면 뺨을 맞댄 두 얼굴이 한 덩어리로
-        # 합쳐져 옆 사람이 통째로 착용자 몫이 됐다(실측). 그래서 코가 든 덩어리는 코 하나 = 얼굴 하나(크기는 면적을
-        # 코 수로 나눈 것의 제곱근)로 세고, 코에서 먼 쪽에 얼굴 하나만큼 남으면 코가 안 찍힌 옆모습 얼굴이 붙은
-        # 것으로 보고 그것도 센다. 코가 없는 덩어리는 눈/눈썹/입이 있으면 그 자체가 얼굴(옆모습은 코를 놓친다).
-        # 얼굴 덩어리는 한 칸 팽창해 앞머리/안경테로 갈린 조각을 잇는다. 크기는 착용자와 같은 잣대(면적 제곱근).
-        face8 = ((c8 >= CLS_SKIN) & (c8 < CLS_HAIR)).astype(np.uint8)
-        nf, flab, fst, fcen = cv2.connectedComponentsWithStats(cv2.dilate(face8, np.ones((3, 3), np.uint8)),
-                                                              connectivity=8)
-        nn, nlab, _, ncen = cv2.connectedComponentsWithStats((c8 == CLS_NOSE).astype(np.uint8), connectivity=8)
-        # 눈/눈썹/입술만 이목구비로 친다 - 안경(다리가 귀까지 간다)/귀가 든 옆머리 조각이 얼굴로 잡혔다(실측)
-        feat = np.bincount(flab[((c8 >= CLS_EYE_L) & (c8 <= CLS_BROW_R)) | ((c8 >= 10) & (c8 <= 12))], minlength=nf)
-        noses = {}
-        for i in range(1, nn):
-            noses.setdefault(int(flab[nlab == i][0]), []).append(((ncen[i][0] + 0.5) * q, (ncen[i][1] + 0.5) * q))
-        s_ref = 0.9 * fb[2] if fb is not None else 2.25 * d
-        faces = []
-        for b in range(1, nf):
-            area = fst[b, cv2.CC_STAT_AREA] * q * q
-            ns = noses.get(b, [])
-            if not ns:
-                if feat[b] > 0 and area >= 0.5 * d * d:
-                    faces.append(((fcen[b][0] + 0.5) * q, (fcen[b][1] + 0.5) * q, math.sqrt(area)))
-                continue
-            faces += [(nx, ny, math.sqrt(area / len(ns))) for nx, ny in ns]
-            if area >= 1.5 * s_ref * s_ref:
-                py, px_ = np.nonzero(flab == b)
-                py, px_ = (py + 0.5) * q, (px_ + 0.5) * q
-                far = np.ones(py.shape, bool)
-                for nx, ny in ns:
-                    far &= np.hypot(px_ - nx, py - ny) > 0.8 * s_ref
-                if far.sum() * q * q >= 0.6 * s_ref * s_ref:
-                    faces.append((float(px_[far].mean()), float(py[far].mean()), math.sqrt(far.sum()) * q))
-        faces = [f for f in faces if f[2] >= max(0.7 * d, 0.35 * s_ref)]
-        # 착용자 얼굴 = 얼굴 중심에서 얼굴 크기 안의 가장 가까운 것. 반경을 눈 간격(1.5d)으로 잡았더니 옆모습에서
-        # (눈 간격이 줄고, 랜드마커가 놓쳐 붙잡아 둔 포즈는 몇 프레임 전 자리라) 착용자 자신의 코가 '다른 얼굴'
-        # 이 되어 1인 화면에서 머리를 반쯤 안 지웠다(실측).
-        near_r = max(1.5 * d, s_ref)
-        me = min(faces, key=lambda f: math.hypot(f[0] - cx, f[1] - cy), default=None)
-        lm_others = pose.get("others") or [] if pose is not None else []
-        if me is not None and math.hypot(me[0] - cx, me[1] - cy) > near_r and (len(faces) > 1 or lm_others):
-            # 착용자 얼굴이 파서에 안 찍혔다(가림/고개 숙임). 단 화면에 얼굴이 그거 하나뿐이고 랜드마커도 다른
-            # 사람을 못 봤으면 착용자다 - 놓친 포즈를 붙잡아 쓰는 동안 머리가 움직여 멀어졌을 뿐.
-            me = None
-        # 그 밖에 착용자 얼굴 중심 가까이(얼굴 크기 0.75 배) 있는 건 착용자 얼굴 조각. 뺨을 맞댄 옆 사람 얼굴 중심은
-        # 얼굴 폭(~0.85 s_ref)쯤 떨어져 있다.
-        others = [f for f in faces if f is not me and math.hypot(f[0] - cx, f[1] - cy) > max(1.5 * d, 0.75 * s_ref)]
-        # 랜드마커가 찾은 얼굴 중 파서가 코를 못 찍은 것(작은/흐린 얼굴). 상자(윤곽 외접) 0.9 배 ≈ 면적 제곱근
-        for ox, oy, os_ in lm_others:
-            if all(math.hypot(ox - f[0], oy - f[1]) > 0.5 * f[2] for f in others):
-                others.append((ox, oy, 0.9 * os_))
-        s0 = s_ref if fb is not None or me is None else me[2]
-        touching = [o for o in others
-                    if lab[int(np.clip(o[1] / q, 0, hq - 1)), int(np.clip(o[0] / q, 0, wq - 1))] == main]
-        if touching:
-            ys, xs = (np.mgrid[0:hq, 0:wq].astype(np.float32) + 0.5) * q
-            dm = np.hypot(xs - cx, ys - cy) / max(s0, 1.0)
-            for ox, oy, os_ in touching:
-                mine &= dm <= np.hypot(xs - ox, ys - oy) / max(os_, 1.0)
-        if not (hair & ~mine).any():
-            return None
-        t = torch.from_numpy(mine.astype(np.float32)).to(self.device)[None, None]
-        return torch.nn.functional.interpolate(t, size=(h, w), mode="bilinear", align_corners=False)[0, 0]
-
     def _download_i420(self, out_f: torch.Tensor):
         """GPU BGR float (h,w,3) 0~255 -> numpy yuv420p (h*3/2, w) uint8, 또는 None (CPU / 홀수 크기).
 
@@ -1115,20 +990,14 @@ class GpuFaceParser:
             return a, b, "brow"
         return None, None, None
 
-    def _face_cent_t(self, cls, pose=None):
+    def _face_cent_t(self, cls):
         """분할 얼굴(피부~입술, 1~12 - 머리/목/옷 제외) 무게중심 [x, y, 면적] - GPU 텐서, 동기화 없음.
 
         눈 클래스만 쓰려 했는데 안경 쓴 사용자는 눈이 거의 다 '안경'(3)으로 찍혀 수 px 뿐이었다(실측).
-        얼굴 전체 덩어리는 크고 안정적이다. 1/4 간격으로 센다.
-        pose 에 착용자 얼굴 상자가 있으면 그 둘레(크기 x1.2)만 센다 - 옆 사람 얼굴까지 섞이면 그 사람이 움직일 때
-        재정렬(_reanchor_pose)이 착용자 헤어를 끌고 갔다."""
+        얼굴 전체 덩어리는 크고 안정적이다. 1/4 간격으로 센다."""
         c4 = cls[::4, ::4]
         ys, xs = self._ensure_grid(*c4.shape)
         m = ((c4 >= CLS_SKIN) & (c4 < CLS_HAIR)).float()
-        fb = pose.get("face_box") if pose is not None else None
-        if fb is not None:
-            r = 1.2 * fb[2] / 4.0
-            m = m * (((xs - fb[0] / 4.0) ** 2 + (ys - fb[1] / 4.0) ** 2) < r * r).float()
         n = m.sum()
         # 중심은 원래 해상도 px, 면적도 원래 해상도 px 수로
         return torch.stack([(m * xs).sum() * 4.0 / n.clamp(min=1.0), (m * ys).sum() * 4.0 / n.clamp(min=1.0),
@@ -1169,9 +1038,6 @@ class GpuFaceParser:
         for key in ("eye_l", "eye_r"):
             if p.get(key) is not None:
                 p[key] = np.asarray(p[key], np.float32) + dxy.astype(np.float32)
-        if p.get("face_box") is not None:
-            fb = p["face_box"]
-            p["face_box"] = (fb[0] + float(dxy[0]), fb[1] + float(dxy[1]), fb[2])
         return p, (float(dxy[0]), float(dxy[1]))
 
     # ---------- 추론 시간 측정 ----------
@@ -1372,7 +1238,7 @@ class GpuFaceParser:
             pose_ms = (time.perf_counter() - t_p) * 1000
         pose_shift = None
         if mode in ("remove", "tryon") and (pose_future is not None or self._pose_face_refs):
-            face_t = self._face_cent_t(cls, pose)
+            face_t = self._face_cent_t(cls)
             if pose_future is not None:
                 self._pose_face_refs.append((pose_future, face_t))
             if pose_fresh is None and pose is not None and CONFIG.pose_reanchor:
@@ -1380,17 +1246,6 @@ class GpuFaceParser:
                 # 붙잡아 둔 포즈). 그대로 그리면 빠르게 움직일 때 헤어가 몇 프레임 전 머리 자리에 남아
                 # 지금 머리(원래 머리 연장/지우기는 이 프레임 분할을 따른다)와 두 겹으로 보였다(사용자 피드백).
                 pose, pose_shift = self._reanchor_pose(pose, face_t, h, w)
-        fid = pose.get("face_id") if pose is not None else None
-        if fid is not None and fid != self._face_id:
-            if self._face_id is not None:
-                # 착용자가 다른 사람으로 바뀌었다(face_pose.pick_wearer). 앞 사람 자리에 남은 스프링/앵커 평활/자동 맞춤/
-                # 머리색이 새 사람에게 튀어 바뀌는 순간 헤어가 날아가고 새 착용자 머리만 지워졌다(실측, 서버 경로).
-                if smoother is not None:
-                    smoother.reset()
-                if dyn is not None:
-                    dyn[0].reset()
-                self._autofit = self._hair_color = self._hair_std = None
-            self._face_id = fid
         if dyn is not None and mode in ("remove", "tryon") and pose is not None and pose.get("matrix") is not None:
             # 랜드마커를 못 던진 프레임(pose_future 없음)에도 굴린다. 예전엔 그 프레임만 groom_dyn=None(강체)이
             # 되어 빠르게 움직이면 헤어가 강체 자리와 처진 자리를 번갈아 오갔다.
@@ -1429,7 +1284,6 @@ class GpuFaceParser:
         harmonized = False
         blended = False
         eyes = None
-        own_h = None               # 착용자 몫 머리 마스크 내려받기 핸들 (_owner_begin)
         new_rgb = new_a = None
         new_a_core = None          # 헤어 연장(_groom_extend) 전 알파 - 얼굴 zone 의 '그룸 아래' 판정용
         face_zone_m = None         # 지운 자리를 피부/이마 패치로 채운 얼굴 zone (h,w) - 헤어 그림자를 얹을 자리
@@ -1493,9 +1347,6 @@ class GpuFaceParser:
                             and not anchor_src.endswith("(폴백)")):
                         eye_l, eye_r = sm_l, sm_r
                 eyes = (eye_l, eye_r)
-            # 옆 사람 머리는 지울 대상에서 뺀다(_owner_mask). 아래 ROI/머리색/연장/지우기가 전부 hair_a·hair_cur
-            # 를 따르므로 그 첫 사용(ROI, 아니면 눈 보호) 직전에 _owner_apply 로 곱한다.
-            own_h = self._owner_begin(cls, hair_a, eyes, pose) if eyes is not None and CONFIG.owner_mask else None
 
             # 거리 보정은 위에서 앵커에 이미 들어갔다(eyes_scaled). 여기서 또
             # 곱하면 이중 적용이다. 세그멘테이션 폴백 경로는 pose 가 없어서
@@ -1590,7 +1441,6 @@ class GpuFaceParser:
                 # 전부 그룸·원래 머리·얼굴 주변에서만 값이 바뀌는데 전체 프레임을 돌아 1080p 에서 ~30ms 였다.
                 # 텐서를 자르고 눈 좌표를 그 원점으로 옮기면 아래 코드는 그대로 돈다(h, w 도 ROI 크기).
                 # 맨 끝에서 원본 프레임에 붙여 넣는다.
-                hair_a, hair_cur, own_h = self._owner_apply(own_h, hair_a, hair_cur, h, w)
                 ps = int(CONFIG.groom_post_scale)
                 if (new_rgb is not None and eyes is not None and CONFIG.groom_roi
                         and not self.keep_debug):
@@ -1754,8 +1604,6 @@ class GpuFaceParser:
         # 눈까지 통째로 덮어서 마네킹처럼 보인다. 파싱이 실제로 '눈'으로 분류한
         # 픽셀에만 적용되므로, 원래 앞머리에 가려 안 보이던 눈썹은 여기에 안 잡힌다
         # (애초에 관측된 적이 없어 되살릴 수 없다).
-        if own_h is not None:
-            hair_a, hair_cur, own_h = self._owner_apply(own_h, hair_a, hair_cur, h, w)
         protect = None
         if mode == "tryon" and (CONFIG.protect_eyes > 0 or CONFIG.protect_brows > 0):
             p = torch.zeros_like(hair_a)
@@ -1803,16 +1651,12 @@ class GpuFaceParser:
             #     누적되므로, 머리가 움직이면 이마 자리에 '벽'이 기록돼 있을 수 있다.
             #     그대로 채우면 이마에 벽이 뚫린 것처럼 보인다. 여기서는 피부톤을 쓴다.
             erase = hair_a
-            keep_orig = False
             if new_a is not None and not hair_off:
                 erase = erase * (1.0 - new_a.squeeze(-1))
             elif mode == "tryon" and groom is not None:
                 # 3D 그룸을 못 그린 프레임(포즈 없음): 대신할 헤어가 없는데 지우면 머리 자리가 비고 이마에
                 # 살색 조각만 남았다(실측: 고개 숙인 프레임). 원래 머리를 그대로 둔다.
                 erase = torch.zeros_like(hair_a)
-                # 아래 얼굴 zone 의 단단한 지우기(hard * zone)도 막는다. 그 눈 앵커는 분할 눈 무게중심 폴백이라 화면에
-                # 둘이면 옆 사람 눈에 잡혀, 착용자가 옆모습인 동안 옆 사람 이마 머리를 지우고 살색으로 칠했다(실측).
-                keep_orig = new_a is None
 
             pl_img, pl_seen = plate.plate, plate.seen
             if roi is not None:
@@ -2058,8 +1902,6 @@ class GpuFaceParser:
                 # 얼굴 영역은 플레이트 관측 여부와 무관하게 채울 수 있다
                 src_ok = torch.clamp(src_ok + zone, 0.0, 1.0)
 
-            if keep_orig:
-                erase = torch.zeros_like(erase)
             a = (erase * src_ok).unsqueeze(-1)
             out = frame_f * (1 - a) + fill * a
             erase_a = a
@@ -2572,10 +2414,7 @@ class GpuFaceParser:
         # 화면 끝 배경까지 '끼인 틈'으로 잡혀 헤어색으로 칠해졌다(사용자 피드백 "화면 끝에서 물방울처럼 번짐").
         # 0 이면 끝 근처의 닫힘이 줄어들 뿐이라(gap 은 0 아래로 자른다) 틈이 새로 생기지 않는다.
         closed = self._mink(self._maxk(u, k), k, outside=0.0)
-        # 헤어 곁의 틈만. 얼굴끼리만 둘러싼 구멍(옆 사람 이마 위 앞머리 자리 등)은 헤어와 얼굴 '사이'가 아닌데
-        # 닫힘이 같이 잡아 옆 사람 눈썹 위에 헤어색 얼룩을 칠했다(실측, 2인 프레임).
-        near = self._maxk((a > 0.5).float().unsqueeze(0).unsqueeze(0), 2 * k + 1)
-        gap = ((closed - u).clamp(0.0, 1.0) * near)[0, 0]
+        gap = (closed - u).clamp(0.0, 1.0)[0, 0]
         ys_, xs_ = self._ensure_grid(h, w)
         rows = ((ey + CONFIG.groom_gapfill_down * d_img - ys_) / (0.3 * d_img)).clamp(0.0, 1.0)
         # 이마 가운데는 뺀다: 짧은 앞머리 끝과 눈썹 사이 맨이마(원래 앞머리 자리)도 헤어와 얼굴 사이의

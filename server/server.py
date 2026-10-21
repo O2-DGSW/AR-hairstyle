@@ -274,7 +274,6 @@ class PeerState:
         self.forehead_built_at = 0.0   # 주기 갱신 기준 시각 (monotonic)
         self.forehead_prev = None      # 교체 직후 크로스페이드용 이전 패치 이름
         self.forehead_fade_at = 0.0
-        self.forehead_face_id = None   # 그 패치를 만든 착용자 (pose["face_id"]). 착용자가 바뀌면 다시 만든다
         self.hair_off = False          # 테스트 웹 '이마 인페인팅만 보기': 3D 헤어를 얹지 않는다
         # 옷 위로 내려온 긴 머리 마스크(segmenter.hair_confidence, 백그라운드로 몇 프레임 전 것)
         self.hair_low = None
@@ -905,13 +904,6 @@ class SegmentedVideoTrack(VideoStreamTrack):
                         and self._yaw_ema is not None
                         and abs(float(pose["yaw"]) - self._yaw_ema) < 5.0
                         and now_m - st.forehead_built_at > cfg.forehead_refresh_s):
-                    asyncio.ensure_future(build_forehead(st, quiet=True))
-                # 착용자가 다른 사람으로 바뀌었다(이전 사람이 화면을 떠남 - face_pose.pick_wearer): 이마 패치도
-                # 그 사람 것이라 새 착용자 얼굴에 남의 이마가 붙는다. 정면 조건 없이 바로(1초 간격) 다시 만든다.
-                if (st.forehead_name is not None and not st.forehead_building and pose is not None
-                        and pose.get("face_id") != st.forehead_face_id
-                        and now_m - st.forehead_built_at > 1.0):
-                    st.forehead_built_at = now_m
                     asyncio.ensure_future(build_forehead(st, quiet=True))
                 # 아직 패치가 없다: /offer 로 헤어를 받아 첫 프레임 전에 그룸이 걸렸거나(그때 _set_groom 의
                 # build_forehead 는 프레임이 없어 그냥 돌아간다) 얼굴을 못 찾았다. 얼굴이 보이면 1초 간격으로 다시.
@@ -2048,15 +2040,11 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         # (gpu_executor 에 6ms 작업을 끼워 넣지 않음), 랜드마크는 forehead_executor 에서 IMAGE
         # 모드로 - pose_executor 를 쓰면 그 사이 프레임의 포즈 대기가 25ms 까지 늘어난다.
         from face_pose import landmarks_image
-        # 화면에 여럿이면 실시간 경로가 헤어를 씌우는 사람(착용자)의 이마를 만든다
-        cur = getattr(state.track, "_last_pose", None) if state.track is not None else None
-        near = cur["face_box"][:2] if cur is not None and cur.get("face_box") is not None else None
-        face_id = cur.get("face_id") if cur is not None else None
 
         def _parse_and_landmarks(frame, cls_t):
             frame = frame.copy()
             cls = cls_t.cpu().numpy() if cls_t is not None else seg.class_map(frame)
-            return frame, cls, landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), near)
+            return frame, cls, landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
         # 세그멘터는 세션 공용이라 마지막 클래스맵이 **이 세션의** 프레임인지 확인한다(객체 동일성).
         # 다른 세션 프레임이면 파싱을 다시 한다(gpu_executor - 드문 경우라 비용 무시).
@@ -2066,7 +2054,7 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
             cls_np = await loop.run_in_executor(app.gpu_executor, seg.class_map, frame)
             frame, cls, lm = await loop.run_in_executor(
                 app.forehead_executor, lambda: (frame.copy(), cls_np,
-                                                landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), near)))
+                                                landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))))
         else:
             frame, cls, lm = await loop.run_in_executor(app.forehead_executor, _parse_and_landmarks, frame, cls_t)
         if lm is None:
@@ -2090,7 +2078,6 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         state.registry.add(asset)
         await loop.run_in_executor(app.gpu_executor, seg.warm_asset, asset)
         state.forehead_name = name
-        state.forehead_face_id = face_id
         state.forehead_built_at = time.monotonic()
         state.forehead_fade_at = state.forehead_built_at
         if stale:
