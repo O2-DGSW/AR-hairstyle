@@ -127,7 +127,8 @@ def landmarks_image(frame_rgb: np.ndarray, near=None):
     랜드마커는 한 번만 만들어 재사용한다(생성 비용이 크다). 프로세스당 하나이고
     IMAGE 모드는 상태가 없어 호출 순서에 영향받지 않는다.
 
-    near: (x, y) px - 여러 얼굴이면 얼굴 중심이 여기에 가장 가까운 사람(실시간 착용자). 없으면 가장 큰 얼굴.
+    near: (x, y) px - 여러 얼굴이면 얼굴 중심이 여기에 가장 가까운 사람(실시간 착용자). 없으면 pick_wearer 의
+    첫 선택과 같은 사람(크기 x 가운데) - 그냥 가장 큰 얼굴이면 첫 이마 패치를 옆 사람 얼굴로 만들 수 있다.
     """
     global _IMAGE_LM
     if _IMAGE_LM is None:
@@ -147,7 +148,7 @@ def landmarks_image(frame_rgb: np.ndarray, near=None):
     if near is not None:
         k = min(range(len(boxes)), key=lambda i: math.hypot(boxes[i][0] - near[0], boxes[i][1] - near[1]))
     else:
-        k = max(range(len(boxes)), key=lambda i: boxes[i][2])
+        k, _, _ = pick_wearer(boxes, None, 0, 0.0, 0.0, w, CONFIG.wearer_center_weight)
     pts = res.face_landmarks[k]
 
     def px(i):
