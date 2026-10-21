@@ -273,6 +273,14 @@ class TestPickWearer(unittest.TestCase):
         self.assertEqual(k, 1)
         self.assertTrue(new)
 
+    def test_wearer_tilting_back_does_not_lose_to_a_steady_face(self):
+        # 고개를 젖혀 얼굴 상자가 반토막 나도 최근 최대 크기로 비교한다
+        _, tr, _ = self.pick([(320, 240, 130), (520, 240, 110)], None, 0)
+        for t in range(33, 3000, 33):
+            k, tr, new = self.pick([(320, 240, 60), (520, 240, 110)], tr, t, switch_ratio=1.3, switch_ms=700)
+            self.assertEqual(k, 0)
+            self.assertFalse(new)
+
     def test_challenger_timer_resets_when_it_disappears(self):
         _, tr, _ = self.pick([(60, 240, 90)], None, 0)
         _, tr, _ = self.pick([(60, 240, 90), (320, 240, 130)], tr, 33)

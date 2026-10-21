@@ -75,10 +75,10 @@ def face_box(pts, w: int, h: int):
 
 
 def pick_wearer(boxes, track, ts_ms, hold_ms, max_jump, frame_w=None, center_w=0.0,
-                switch_ratio=1.3, switch_ms=700.0):
+                switch_ratio=1.3, switch_ms=700.0, size_mem_ms=5000.0):
     """화면의 얼굴들(face_box) 중 헤어를 씌울 사람. -> (인덱스 또는 None, 새 track, 새 사람인지)
 
-    track = (x, y, 크기, 마지막으로 본 ts_ms, 도전자가 나타난 ts_ms 또는 None) 또는 None.
+    track = (x, y, 크기, 마지막으로 본 ts_ms, 도전자가 나타난 ts_ms 또는 None, 기억 크기) 또는 None.
     랜드마커는 얼굴 순서를 보장하지 않고 num_faces=1 이면 아무나 하나를 잡는다 - 2인 프레임에서 옆 사람(사진)을
     잡아 그쪽에 헤어를 씌우고 정작 사용자 머리는 지웠다(실측).
       - 처음엔 점수(크기, 크기가 비슷하면 가운데 쪽 - center_w: 화면 끝이면 크기를 이만큼 깎는다)가 가장 높은 얼굴.
@@ -86,17 +86,20 @@ def pick_wearer(boxes, track, ts_ms, hold_ms, max_jump, frame_w=None, center_w=0
         넘기지 않는다(None) - 넘겼다 돌아오면 헤어가 두 사람 사이를 오간다.
       - 점수가 착용자의 switch_ratio 배를 넘는 얼굴이 switch_ms 동안 계속 보이면 그 사람으로 넘긴다. 착용자가 오래
         옆을 보는 사이 옆 사람에게 넘어간 뒤, 돌아온 착용자를 되찾는 길이다(실측: 이게 없으면 끝까지 옆 사람).
+        착용자 점수는 지금 크기가 아니라 최근 최대 크기(size_mem_ms 로 서서히 잊는다)로 잰다 - 고개를 젖히거나
+        숙이면 얼굴 상자가 반토막 나 그 사이 옆 사람에게 빼앗겼다(실측, 서버 경로).
     """
     if track is not None and ts_ms - track[3] > hold_ms:
         track = None
     if not boxes:
         return None, track, False
 
-    def score(b):
+    def score(b, size=None):
+        s = b[2] if size is None else size
         if not frame_w:
-            return b[2]
+            return s
         off = min(1.0, abs(b[0] - 0.5 * frame_w) / (0.5 * frame_w))
-        return b[2] * (1.0 - center_w * off)
+        return s * (1.0 - center_w * off)
 
     best = max(range(len(boxes)), key=lambda i: score(boxes[i]))
     chal = None
@@ -108,12 +111,14 @@ def pick_wearer(boxes, track, ts_ms, hold_ms, max_jump, frame_w=None, center_w=0
         if dist[k] > max_jump * track[2]:
             return None, track, False
         new = False
-        if best != k and score(boxes[best]) > switch_ratio * score(boxes[k]):
+        ref = max(boxes[k][2], track[5] * math.exp(-(ts_ms - track[3]) / max(size_mem_ms, 1.0)))
+        if best != k and score(boxes[best]) > switch_ratio * score(boxes[k], ref):
             chal = track[4] if track[4] is not None else ts_ms
             if ts_ms - chal >= switch_ms:
                 k, new, chal = best, True, None
     b = boxes[k]
-    return k, (b[0], b[1], b[2], ts_ms, chal), new
+    ref = b[2] if new else ref
+    return k, (b[0], b[1], b[2], ts_ms, chal, ref), new
 
 
 def landmarks_image(frame_rgb: np.ndarray, near=None):
@@ -255,7 +260,8 @@ class FacePose:
         boxes = [face_box(f, w, h) for f in res.face_landmarks]
         k, self._track, new = pick_wearer(boxes, self._track, ts_ms, CONFIG.wearer_hold_ms,
                                           CONFIG.wearer_max_jump, w, CONFIG.wearer_center_weight,
-                                          CONFIG.wearer_switch_ratio, CONFIG.wearer_switch_ms)
+                                          CONFIG.wearer_switch_ratio, CONFIG.wearer_switch_ms,
+                                          CONFIG.wearer_size_mem_ms)
         if k is None:
             return None
         if new:

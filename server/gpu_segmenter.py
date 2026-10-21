@@ -205,6 +205,7 @@ class GpuFaceParser:
         self._lum_w = torch.tensor([0.114, 0.587, 0.299], device=self.device)   # BGR 휘도
         self._blender = None    # 증류 블렌더 (load_blender 로 주입)
         self._autofit = None    # 그룸 자동 맞춤 상태 (_update_autofit)
+        self._face_id = None    # 지금 착용자 (pose["face_id"]) - 바뀌면 사람별 상태를 비운다
         self._cgrid = None      # 크롭 좌표 그리드 캐시
         self.last_cls = None    # 마지막 프레임의 클래스맵 (GPU uint8) - 이마 갱신이 재사용
         self.last_cls_frame = None
@@ -242,7 +243,7 @@ class GpuFaceParser:
     _SESSION_STATE = {"_last_hair_px": 0, "_stat_cache": None, "_stat_frame": -999, "_last_coverage": None,
                       "_bg_pp": None, "_torso_cache": None, "_autofit": None,
                       "_hair_color": None, "_hair_std": None, "_groom_rgb": None, "_groom_rgb_src": None,
-                      "_hl_cache": None}
+                      "_hl_cache": None, "_face_id": None}
 
     def _use_session(self, plate):
         """세션별 상태를 plate 의 것으로 바꿔 낀다. 나가는 세션 것은 그 plate.seg_state 에 맡긴다."""
@@ -1379,6 +1380,17 @@ class GpuFaceParser:
                 # 붙잡아 둔 포즈). 그대로 그리면 빠르게 움직일 때 헤어가 몇 프레임 전 머리 자리에 남아
                 # 지금 머리(원래 머리 연장/지우기는 이 프레임 분할을 따른다)와 두 겹으로 보였다(사용자 피드백).
                 pose, pose_shift = self._reanchor_pose(pose, face_t, h, w)
+        fid = pose.get("face_id") if pose is not None else None
+        if fid is not None and fid != self._face_id:
+            if self._face_id is not None:
+                # 착용자가 다른 사람으로 바뀌었다(face_pose.pick_wearer). 앞 사람 자리에 남은 스프링/앵커 평활/자동 맞춤/
+                # 머리색이 새 사람에게 튀어 바뀌는 순간 헤어가 날아가고 새 착용자 머리만 지워졌다(실측, 서버 경로).
+                if smoother is not None:
+                    smoother.reset()
+                if dyn is not None:
+                    dyn[0].reset()
+                self._autofit = self._hair_color = self._hair_std = None
+            self._face_id = fid
         if dyn is not None and mode in ("remove", "tryon") and pose is not None and pose.get("matrix") is not None:
             # 랜드마커를 못 던진 프레임(pose_future 없음)에도 굴린다. 예전엔 그 프레임만 groom_dyn=None(강체)이
             # 되어 빠르게 움직이면 헤어가 강체 자리와 처진 자리를 번갈아 오갔다.
@@ -1791,12 +1803,16 @@ class GpuFaceParser:
             #     누적되므로, 머리가 움직이면 이마 자리에 '벽'이 기록돼 있을 수 있다.
             #     그대로 채우면 이마에 벽이 뚫린 것처럼 보인다. 여기서는 피부톤을 쓴다.
             erase = hair_a
+            keep_orig = False
             if new_a is not None and not hair_off:
                 erase = erase * (1.0 - new_a.squeeze(-1))
             elif mode == "tryon" and groom is not None:
                 # 3D 그룸을 못 그린 프레임(포즈 없음): 대신할 헤어가 없는데 지우면 머리 자리가 비고 이마에
                 # 살색 조각만 남았다(실측: 고개 숙인 프레임). 원래 머리를 그대로 둔다.
                 erase = torch.zeros_like(hair_a)
+                # 아래 얼굴 zone 의 단단한 지우기(hard * zone)도 막는다. 그 눈 앵커는 분할 눈 무게중심 폴백이라 화면에
+                # 둘이면 옆 사람 눈에 잡혀, 착용자가 옆모습인 동안 옆 사람 이마 머리를 지우고 살색으로 칠했다(실측).
+                keep_orig = new_a is None
 
             pl_img, pl_seen = plate.plate, plate.seen
             if roi is not None:
@@ -2042,6 +2058,8 @@ class GpuFaceParser:
                 # 얼굴 영역은 플레이트 관측 여부와 무관하게 채울 수 있다
                 src_ok = torch.clamp(src_ok + zone, 0.0, 1.0)
 
+            if keep_orig:
+                erase = torch.zeros_like(erase)
             a = (erase * src_ok).unsqueeze(-1)
             out = frame_f * (1 - a) + fill * a
             erase_a = a
