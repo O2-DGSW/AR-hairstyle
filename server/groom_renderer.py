@@ -45,6 +45,78 @@ from config import CONFIG
 
 logger = logging.getLogger("groom")
 
+
+class _GLCuda:
+    """GL 텍스처 -> torch CUDA 텐서를 GPU 안에서 바로 복사한다 (CUDA-GL interop, ctypes 로 cudart 호출).
+
+    GL 결과를 CPU 로 읽어 다시 올리면(read_into + .to(cuda)) 1080p 그룸 프레임당 ~7ms 였다 - 그리기
+    자체(1.4ms)의 5배. 맵/언맵이 GL 명령과 CUDA 스트림 사이 순서를 드라이버가 맞춰 주므로 동기화가 따로
+    필요 없다. 텍스처는 처음 쓸 때 등록하고, fbo 를 다시 만들기 전에 forget() 으로 풀어야 한다.
+    """
+    _TEX_2D = 0x0DE1
+    _READ_ONLY = 1
+    _D2D = 3
+
+    def __init__(self):
+        import ctypes
+        import glob
+        self._c = ctypes
+        torch.cuda.init()
+        lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        names = (glob.glob(os.path.join(lib, "cudart64_*.dll")) if sys.platform == "win32" else
+                 glob.glob(os.path.join(lib, "libcudart.so*")) + ["libcudart.so.12", "libcudart.so"])
+        self._rt = None
+        for n in names:
+            try:
+                self._rt = ctypes.CDLL(n)
+                break
+            except OSError:
+                continue
+        if self._rt is None:
+            raise OSError("cudart 를 찾지 못했다")
+        vp, sz, ui = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint
+        rt = self._rt
+        rt.cudaGraphicsGLRegisterImage.argtypes = [ctypes.POINTER(vp), ui, ui, ui]
+        rt.cudaGraphicsMapResources.argtypes = [ctypes.c_int, ctypes.POINTER(vp), vp]
+        rt.cudaGraphicsUnmapResources.argtypes = [ctypes.c_int, ctypes.POINTER(vp), vp]
+        rt.cudaGraphicsSubResourceGetMappedArray.argtypes = [ctypes.POINTER(vp), vp, ui, ui]
+        rt.cudaMemcpy2DFromArrayAsync.argtypes = [vp, sz, vp, sz, sz, sz, sz, ctypes.c_int, vp]
+        rt.cudaGraphicsUnregisterResource.argtypes = [vp]
+        self._res = {}           # GL 텍스처 이름 -> cudaGraphicsResource
+
+    def _ok(self, err, what):
+        if err != 0:
+            raise RuntimeError(f"{what} 실패 (cudaError {err})")
+
+    def copy(self, tex, x0: int, y0: int, gw: int, gh: int, out: torch.Tensor, bpp: int):
+        """tex 의 (x0, y0, gw, gh) 를 out (행 = 텍스처 행, 픽셀당 bpp 바이트, 연속) 앞쪽부터 채운다.
+        out 이 더 넓으면 행 간격은 out 의 폭을 따른다 - 큰 버퍼 안의 같은 자리에 바로 쓸 수 있다."""
+        c, rt = self._c, self._rt
+        res = self._res.get(tex.glo)
+        if res is None:
+            res = c.c_void_p()
+            self._ok(rt.cudaGraphicsGLRegisterImage(c.byref(res), tex.glo, self._TEX_2D, self._READ_ONLY),
+                     "cudaGraphicsGLRegisterImage")
+            self._res[tex.glo] = res
+        stream = c.c_void_p(torch.cuda.current_stream().cuda_stream)
+        self._ok(rt.cudaGraphicsMapResources(1, c.byref(res), stream), "cudaGraphicsMapResources")
+        try:
+            arr = c.c_void_p()
+            self._ok(rt.cudaGraphicsSubResourceGetMappedArray(c.byref(arr), res, 0, 0),
+                     "cudaGraphicsSubResourceGetMappedArray")
+            self._ok(rt.cudaMemcpy2DFromArrayAsync(out.data_ptr(), out.stride(0) * out.element_size(), arr,
+                                                   x0 * bpp, y0, gw * bpp, gh, self._D2D, stream),
+                     "cudaMemcpy2DFromArrayAsync")
+        finally:
+            self._ok(rt.cudaGraphicsUnmapResources(1, c.byref(res), stream), "cudaGraphicsUnmapResources")
+
+    def forget(self):
+        """등록한 텍스처를 모두 푼다. GL 텍스처를 지우기 전에 불러야 한다."""
+        for res in self._res.values():
+            self._rt.cudaGraphicsUnregisterResource(res)
+        self._res.clear()
+
+
 #: MediaPipe face geometry 의 기본 가상 카메라. 이 값으로 PnP 를 풀었으니 이 값으로 투영한다.
 MP_VERTICAL_FOV_DEG = 63.0
 
@@ -300,6 +372,51 @@ def _head_profile(v: np.ndarray, faces: np.ndarray):
     return R, (cx, cz, y0, y1)
 
 
+def _hug_front(c: np.ndarray, ov: np.ndarray, faces: np.ndarray) -> np.ndarray | None:
+    """앞머리를 이마에 붙인다: 가닥 중심선 c (N,P,3) -> 옮긴 중심선 (같은 모양), 할 일 없으면 None.
+
+    Im2Haircut 은 정면 사진 한 장이라 깊이를 모른다 - 앞머리가 이마에서 2.5~4.7cm 떠 차양처럼 앞으로
+    뻗어(dandy-cut 은 코끝보다 2cm 앞) 옆모습에서 앞머리가 엄청 길어 보였다(사용자 피드백). groom_volume 은
+    두상 중심 기준 반지름이 뿌리보다 큰 만큼만 줄여서, 정수리 뿌리에서 이마 앞으로 내려온 앞머리
+    (반지름이 뿌리보다 작다)는 그대로였다. 얼굴 앞쪽 방위·이마 높이의 점마다 두상 표면 최근접점에서
+    뜬 거리를 knee(cm) 넘는 만큼 k 배로 줄인다 - 순서(겹)는 그대로라 결이 꼬이지 않는다."""
+    k = float(CONFIG.groom_front_hug)
+    knee = float(CONFIG.groom_front_hug_cm)
+    y_lo, y_full, y_off = (float(x) for x in CONFIG.groom_front_hug_y)
+    if k >= 0.999 or len(faces) == 0:
+        return None
+    from scipy.spatial import cKDTree
+    tri = ov[faces]
+    fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    fn /= np.linalg.norm(fn, axis=1, keepdims=True) + 1e-9
+    ctr = ov.mean(0)
+    fc = tri.mean(1)
+    fn *= np.where(((fc - ctr) * fn).sum(1) < 0, -1.0, 1.0)[:, None]       # 바깥쪽으로
+    rng = np.random.default_rng(0)
+    b = rng.dirichlet((1.0, 1.0, 1.0), size=(len(faces), 16)).astype(np.float32)
+    sp = np.einsum("fkj,fjc->fkc", b, tri).reshape(-1, 3)
+    sn = np.repeat(fn, 16, axis=0)
+    p = c.reshape(-1, 3)
+    cx = 0.5 * float(ov[:, 0].min() + ov[:, 0].max())
+    cz = 0.5 * float(ov[:, 2].min() + ov[:, 2].max())
+    az = np.degrees(np.abs(np.arctan2(p[:, 2] - cz, p[:, 0] - cx) - 0.5 * np.pi))
+    az = np.minimum(az, 360.0 - az)
+    w = 1.0 - np.clip((az - 40.0) / 30.0, 0.0, 1.0)                        # 앞 ±40° 전부, ±70° 에서 0
+    w *= np.clip((p[:, 1] - y_lo) / 2.0, 0.0, 1.0)                           # 코 아래로 늘어진 긴 머리는 그대로
+    w *= 1.0 - np.clip((p[:, 1] - y_full) / max(1e-3, y_off - y_full), 0.0, 1.0)   # 정수리 볼륨(포마드 등)은 그대로
+    sel = np.nonzero(w > 1e-3)[0]
+    if len(sel) == 0:
+        return None
+    d, i = cKDTree(sp).query(p[sel])
+    off = p[sel] - sp[i]
+    out = ((off * sn[i]).sum(1) > 0) & (d > knee)                          # 두상 속/가까운 점은 그대로
+    sel, d, i, off = sel[out], d[out], i[out], off[out]
+    g2 = d + (knee + (d - knee) * k - d) * w[sel]
+    q = p.copy()
+    q[sel] = sp[i] + off * (g2 / d)[:, None]
+    return q.reshape(c.shape).astype(np.float32)
+
+
 def _perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
     t = 1.0 / math.tan(math.radians(fov_y_deg) / 2.0)
     m = np.zeros((4, 4), np.float32)
@@ -356,6 +473,7 @@ class GroomRenderer:
         self.last_fit = None
         self.last_proj_m = None
         self._pins = {}          # 읽기용 고정 버퍼 (slot -> uint8 1D). _read_gpu
+        self._interop = None     # _GLCuda / 못 쓰면 False / 아직 안 해 봄 None (_gl_cuda)
 
     # ---- 컨텍스트 ----
     def _ensure_ctx(self):
@@ -383,6 +501,8 @@ class GroomRenderer:
         if self._fbo_size == (w, h):
             return
         ctx = self._ctx
+        if self._interop:
+            self._interop.forget()             # 등록한 텍스처를 지우기 전에 푼다
         for f in (self._fbo_ms, self._fbo, self._fbo_head):
             if f is not None:
                 f.release()
@@ -417,6 +537,11 @@ class GroomRenderer:
         occ = None          # (v, faces) - 두상 좌표 맵은 뿌리를 다 모은 뒤에 만든다
         all_roots = []
         all_v = []
+        og = scene.geometry.get("head_occluder")
+        occ0 = None         # 앞머리 붙이기(_hug_front)용 - 헤어보다 먼저 필요하다
+        if og is not None:
+            T = scene.graph.get("head_occluder")[0] if "head_occluder" in scene.graph.nodes_geometry else np.eye(4)
+            occ0 = (trimesh.transform_points(og.vertices, T).astype(np.float32), np.asarray(og.faces, np.int32))
         for gname, geom in scene.geometry.items():
             T = scene.graph.get(gname)[0] if gname in scene.graph.nodes_geometry else np.eye(4)
             v = trimesh.transform_points(geom.vertices, T).astype(np.float32)
@@ -448,6 +573,17 @@ class GroomRenderer:
                 side = np.asarray(va["_side"], np.float32).reshape(-1, 1)
                 halfw = np.asarray(va["_halfw"], np.float32).reshape(-1, 1)
                 rand = np.asarray(va.get("_rand", np.zeros(len(v))), np.float32).reshape(-1, 1)
+                if occ0 is not None and P > 0 and len(v) % (P * 2) == 0:
+                    c = center.reshape(-1, P, 2, 3)[:, :, 0, :]
+                    q = _hug_front(c, *occ0)
+                    if q is not None:
+                        dlt = np.repeat(q - c, 2, axis=1).reshape(-1, 3)
+                        center = center + dlt
+                        v = v + dlt
+                        all_v[-1] = v
+                        t = np.gradient(q, axis=1)              # strands_to_cards 와 같은 접선
+                        t /= np.linalg.norm(t, axis=-1, keepdims=True) + 1e-9
+                        tangent = np.repeat(t, 2, axis=1).reshape(-1, 3).astype(np.float32)
                 if P > 0 and len(v) % (P * 2) == 0:
                     # 뿌리는 중심선 기준으로 (구운 POSITION 은 폭 오프셋이 들어 있다)
                     r0 = center.reshape(-1, P, 2, 3)[:, 0, :, :].mean(axis=1)
@@ -512,30 +648,32 @@ class GroomRenderer:
 
     # ---- 렌더 ----
     @staticmethod
-    def _model(matrix, scale_mul, offset_up_cm, offset_fwd_cm, sx=1.0, sy=1.0):
+    def _model(matrix, scale_mul, offset_up_cm, offset_fwd_cm, sx=1.0, sy=1.0, sz=1.0):
         """정규 프레임 안의 사용자 보정을 붙인 모델 행렬. sx/sy 는 자동 맞춤의 가로/세로 상대 배율
-        (깊이는 둘의 평균) - 헤어를 만든 원래 인물과 사용자의 두상 비율이 다른 만큼."""
+        (깊이는 둘의 평균 x sz) - 헤어를 만든 원래 인물과 사용자의 두상 비율이 다른 만큼."""
         return np.asarray(matrix, np.float32).reshape(4, 4) @ GroomRenderer._fitmat(
-            scale_mul, offset_up_cm, offset_fwd_cm, sx, sy)
+            scale_mul, offset_up_cm, offset_fwd_cm, sx, sy, sz)
 
     @staticmethod
-    def _fitmat(scale_mul, offset_up_cm, offset_fwd_cm, sx=1.0, sy=1.0):
+    def _fitmat(scale_mul, offset_up_cm, offset_fwd_cm, sx=1.0, sy=1.0, sz=1.0):
         fit = np.eye(4, dtype=np.float32)
         s = float(scale_mul)
         fit[0, 0] = s * float(sx)
         fit[1, 1] = s * float(sy)
-        fit[2, 2] = s * 0.5 * (float(sx) + float(sy))
+        # 깊이: 정면에선 안 보여 가로/세로 평균을 쓰고, 옆모습에서 잰 상대 배율 sz 를 곱한다(자동 맞춤)
+        fit[2, 2] = s * 0.5 * (float(sx) + float(sy)) * float(sz)
         fit[1, 3] = float(offset_up_cm)
         fit[2, 3] = float(offset_fwd_cm)
         return fit
 
     def project_occ(self, groom: Groom, idx, matrix, w: int, h: int, scale_mul: float = 1.0,
-                    offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0, sx: float = 1.0, sy: float = 1.0):
+                    offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0, sx: float = 1.0, sy: float = 1.0,
+                    sz: float = 1.0):
         """오클루더 정점 idx 를 이미지 px 로 투영 (N,2). 오클루더가 없거나 FLAME 순서가 아니면 None. CPU."""
         ov = groom.occ_v
         if ov is None or len(ov) != 5023:
             return None
-        model = self._model(matrix, scale_mul, offset_up_cm, offset_fwd_cm, sx, sy)
+        model = self._model(matrix, scale_mul, offset_up_cm, offset_fwd_cm, sx, sy, sz)
         proj = _perspective(MP_VERTICAL_FOV_DEG, w / float(h), 1.0, 1000.0)
         p = np.c_[ov[np.asarray(idx)], np.ones(len(idx), np.float32)] @ (proj @ model).T
         ndc = p[:, :2] / p[:, 3:4]
@@ -544,7 +682,7 @@ class GroomRenderer:
     def render(self, groom: Groom, matrix: np.ndarray, w: int, h: int,
                scale_mul: float = 1.0, offset_up_cm: float = 0.0, offset_fwd_cm: float = 0.0,
                base_rgb=None, dyn: dict | None = None, head: bool = False, geom=None,
-               sx: float = 1.0, sy: float = 1.0, split_spec: bool = False):
+               sx: float = 1.0, sy: float = 1.0, split_spec: bool = False, sz: float = 1.0):
         """-> (rgb (h,w,3) BGR float 0~255, a (h,w,1) float 0~1) GPU 텐서, 또는 (None, None).
 
         split_spec: True 면 rgb 는 윤기를 뺀 확산 음영만(0~255 넘을 수 있음, 회색)이고 윤기는
@@ -565,7 +703,7 @@ class GroomRenderer:
         ctx, prog = self._ctx, self._prog
 
         # 정규 프레임 안에서의 사용자 보정: 두상 중심 기준 스케일 + 위/앞 이동 (hair3d.js 와 동일) + 자동 맞춤 sx/sy
-        fit = self._fitmat(scale_mul, offset_up_cm, offset_fwd_cm, sx, sy)
+        fit = self._fitmat(scale_mul, offset_up_cm, offset_fwd_cm, sx, sy, sz)
         model = np.asarray(matrix, np.float32).reshape(4, 4) @ fit
         # 셰이더의 상대좌표 변형은 정규 공간(fit 적용 전)에서 일어나므로 u_shift 는 스케일과 무관
         proj = _perspective(MP_VERTICAL_FOV_DEG, w / float(h), 1.0, 1000.0)
@@ -675,13 +813,27 @@ class GroomRenderer:
                 x1, y1 = min(w, x1), min(h, y1)
                 if x1 - x0 >= 4 and y1 - y0 >= 4:
                     gw, gh = x1 - x0, y1 - y0
-                    vp = (x0, y0, gw, gh)      # 프레임버퍼 행 = 이미지 행 (투영 y 반전)
-                    praw = fh.read(viewport=vp, components=4, dtype="f2", attachment=1)
-                    nraw = fh.read(viewport=vp, components=4, dtype="f1", attachment=2)
-                    pos = torch.frombuffer(bytearray(praw), dtype=torch.float16).view(gh, gw, 4).to(
-                        self.device, non_blocking=True).float()
-                    nrm = torch.frombuffer(bytearray(nraw), dtype=torch.uint8).view(gh, gw, 4).to(
-                        self.device, non_blocking=True).float()[:, :, :3] / 127.5 - 1.0
+                    pos = nrm = None
+                    ic = self._gl_cuda()
+                    if ic is not None:
+                        try:
+                            pos = torch.empty(gh, gw, 4, dtype=torch.float16, device=self.device)
+                            ic.copy(fh.color_attachments[1], x0, y0, gw, gh, pos, 8)
+                            nrm = torch.empty(gh, gw, 4, dtype=torch.uint8, device=self.device)
+                            ic.copy(fh.color_attachments[2], x0, y0, gw, gh, nrm, 4)
+                        except Exception as e:
+                            self._interop_failed(e)
+                            pos = nrm = None
+                    if pos is None:
+                        vp = (x0, y0, gw, gh)      # 프레임버퍼 행 = 이미지 행 (투영 y 반전)
+                        praw = fh.read(viewport=vp, components=4, dtype="f2", attachment=1)
+                        nraw = fh.read(viewport=vp, components=4, dtype="f1", attachment=2)
+                        pos = torch.frombuffer(bytearray(praw), dtype=torch.float16).view(gh, gw, 4).to(
+                            self.device, non_blocking=True)
+                        nrm = torch.frombuffer(bytearray(nraw), dtype=torch.uint8).view(gh, gw, 4).to(
+                            self.device, non_blocking=True)
+                    pos = pos.float()
+                    nrm = nrm.float()[:, :, :3] / 127.5 - 1.0
                     self.last_geom = (pos[:, :, :3], nrm, (x0, y0, x1, y1))
                 self.last_fit = fit
                 self.last_proj_m = proj
@@ -736,6 +888,17 @@ class GroomRenderer:
         덮어쓸 때쯤엔 합성 끝(gpu_segmenter._download)의 동기화로 이전 업로드가 끝나 있다."""
         x0, y0, x1, y1 = rect
         gw, gh = x1 - x0, y1 - y0
+        ic = self._gl_cuda()
+        if ic is not None:
+            try:
+                if (x0, y0, x1, y1) == (0, 0, w, h):
+                    full = torch.empty(h, w, 4, dtype=torch.uint8, device=self.device)
+                else:
+                    full = torch.zeros(h, w, 4, dtype=torch.uint8, device=self.device)
+                ic.copy(fbo.color_attachments[0], x0, y0, gw, gh, full[y0:, x0:], 4)
+                return full
+            except Exception as e:
+                self._interop_failed(e)
         pins = self._pins
         buf = pins.get(slot)
         if buf is None or buf.numel() < w * h * 4:
@@ -769,7 +932,29 @@ class GroomRenderer:
         facing = (nc * (-pc)).sum(-1).abs() / (nc.norm(dim=-1) * pc.norm(dim=-1)).clamp(min=1e-4)
         return grid, facing, rect
 
+    def _gl_cuda(self):
+        """CUDA-GL interop 도우미(_GLCuda), 못 쓰면 None. config.groom_gl_interop. 한 번 실패하면 다시 안 해 본다."""
+        if self._interop is None:
+            self._interop = False
+            if CONFIG.groom_gl_interop and str(self.device).startswith("cuda"):
+                try:
+                    self._interop = _GLCuda()
+                except Exception as e:
+                    logger.warning("CUDA-GL interop 을 못 쓴다 - GL 결과를 CPU 로 읽는다: %s", e)
+        return self._interop or None
+
+    def _interop_failed(self, e):
+        logger.warning("CUDA-GL interop 실패 - 이후 GL 결과를 CPU 로 읽는다: %s", e)
+        try:
+            self._interop.forget()
+        except Exception:
+            pass
+        self._interop = False
+
     def close(self):
+        if self._interop:
+            self._interop.forget()
+            self._interop = None
         for name in list(self._grooms):
             self.evict(name)
         for f in (self._fbo_ms, self._fbo, self._fbo_head):

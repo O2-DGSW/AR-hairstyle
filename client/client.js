@@ -99,6 +99,8 @@ el("forehead-refresh").addEventListener("click", () => {
   el("s-forehead").textContent = "맨이마 패치: 생성 중…";
   send({ type: "fit", forehead: "refresh" });
 });
+// 테스트: 3D 헤어를 얹지 않고 원래 머리를 지운 자리(맨이마 인페인팅/채움)만 본다. 스타일은 골라 둬야 한다.
+el("hair-off").addEventListener("change", () => send({ type: "fit", hair_off: el("hair-off").checked }));
 
 /* ---------- 사진 찍기 (GAN) ---------- */
 const shootBtn = el("shoot"), refSel = el("reference");
@@ -836,6 +838,7 @@ async function start() {
 
   channel = pc.createDataChannel("stats");
   channel.addEventListener("open", () => {
+    if (el("hair-off").checked) send({ type: "fit", hair_off: true });   // 재연결 때 체크 상태 유지
     pingTimer = setInterval(() => {
       if (channel.readyState === "open") {
         channel.send(JSON.stringify({ type: "ping", t_client: performance.now() }));
@@ -862,8 +865,10 @@ async function start() {
     const res = await fetch("/offer", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      // ?groom=crop-cut (또는 표시명 ?groom=크롭컷): 앱의 'AR 로 체험하기'처럼 연결 직후부터 그 헤어로 받는다.
       body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type,
-                             out_size: outSize() }),
+                             out_size: outSize(),
+                             groom: new URLSearchParams(location.search).get("groom") || undefined }),
     });
 
     // 상태 코드를 확인하지 않고 곧장 json 을 answer 로 넘기면, 서버가 보낸

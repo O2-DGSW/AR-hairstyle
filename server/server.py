@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 import urllib.parse
 import uuid
@@ -159,7 +160,10 @@ class AppState:
 
                 def _load():
                     from gpu_segmenter import GpuFaceParser
-                    return GpuFaceParser()
+                    import fused
+                    s = GpuFaceParser()
+                    fused.warm(s.device)       # 그룸 후처리 커널 컴파일 - 세션이 붙기 전에(수 초)
+                    return s
 
                 try:
                     seg = await loop.run_in_executor(self.gpu_executor, _load)
@@ -270,11 +274,17 @@ class PeerState:
         self.forehead_built_at = 0.0   # 주기 갱신 기준 시각 (monotonic)
         self.forehead_prev = None      # 교체 직후 크로스페이드용 이전 패치 이름
         self.forehead_fade_at = 0.0
+        self.forehead_face_id = None   # 그 패치를 만든 착용자 (pose["face_id"]). 착용자가 바뀌면 다시 만든다
+        self.hair_off = False          # 테스트 웹 '이마 인페인팅만 보기': 3D 헤어를 얹지 않는다
         # 옷 위로 내려온 긴 머리 마스크(segmenter.hair_confidence, 백그라운드로 몇 프레임 전 것)
         self.hair_low = None
         self.hair_low_at = 0.0         # 그 마스크의 프레임 시각 (monotonic)
         self.hair_low_future = None
         self.torso = None              # 그 프레임의 torso_net 결과 (LearnedTorso.run)
+        self.hair_low_eyes = None      # 그 프레임의 눈 (eye_l, eye_r) - 지금 위치로 옮길 때 기준 (_motion_warp)
+        self.hair_low_job_eyes = None  # 돌고 있는 작업의 눈
+        self.hair_low_ref = None       # 그 프레임의 1/8 축소본 - 지금 프레임과 달라진 자리는 마스크를 안 믿는다
+        self.hair_low_job_ref = None   # 돌고 있는 작업의 축소본
         self.livebank = None      # LiveBank: 세션 중 GAN 으로 각도별 헤어를 생성
         self.recording = False    # 학습 데이터용 원본 프레임 수집
         self.rec_dir = None
@@ -483,6 +493,8 @@ class SegmentedVideoTrack(VideoStreamTrack):
             st.hair_low_future = None
             try:
                 st.hair_low, st.hair_low_at, st.torso = fut.result()
+                st.hair_low_eyes = st.hair_low_job_eyes
+                st.hair_low_ref = st.hair_low_job_ref
             except Exception:
                 logger.exception("긴 머리 분할 실패")
                 st.hair_low, st.hair_low_at, st.torso = None, now, None   # 실패 직후 매 프레임 재시도하지 않게
@@ -491,10 +503,17 @@ class SegmentedVideoTrack(VideoStreamTrack):
             eyes = None
             if pose is not None and pose.get("eye_l") is not None:
                 eyes = (pose["eye_l"], pose["eye_r"], pose.get("oval"))
+            st.hair_low_job_eyes = eyes
+            st.hair_low_job_ref = cv2.resize(img, (max(1, img.shape[1] // 8), max(1, img.shape[0] // 8)),
+                                             interpolation=cv2.INTER_AREA)
             st.hair_low_future = st.app.hairseg_executor.submit(self._long_hair_job, st, frame, now, eyes, cfg)
         if st.hair_low is None or now - st.hair_low_at > cfg.long_hair_seg_max_age:
-            return None, None
-        return st.hair_low, st.torso
+            return None, None, None, None
+        # 늦은 결과를 지금 얼굴 위치로 옮기는 보정(_motion_warp)은 config.long_hair_motion_comp 일 때만 -
+        # 고개를 돌리면(yaw) 눈 가운데만 크게 움직이고 머리/어깨는 그대로라, 눈 기준으로 옮기면 채움 패치가
+        # 배경으로 밀려 머리 옆에 얼굴 모양 잔상이 새로 생겼다(오프라인 지연 시뮬레이션). 기본 끔.
+        lh_m = _motion_warp(st.hair_low_eyes, pose) if cfg.long_hair_motion_comp else None
+        return st.hair_low, st.torso, lh_m, st.hair_low_ref
 
     @staticmethod
     def _long_hair_job(st, frame, now, eyes, cfg):
@@ -838,7 +857,7 @@ class SegmentedVideoTrack(VideoStreamTrack):
 
         # 프레임 드롭. 버퍼는 지연을 줄이지 못한다 - 밀린 프레임을 계속
         # 처리하면 지연만 누적된다. 최신 프레임만 살리고 밀린 건 버린다.
-        if st.inflight + app.gpu_inflight >= cfg.max_inflight_frames:
+        if st.inflight >= 1 or app.gpu_inflight >= cfg.max_inflight_frames:
             st.dropped += 1
             app.metrics.frames_dropped_total += 1
             return None
@@ -887,16 +906,29 @@ class SegmentedVideoTrack(VideoStreamTrack):
                         and abs(float(pose["yaw"]) - self._yaw_ema) < 5.0
                         and now_m - st.forehead_built_at > cfg.forehead_refresh_s):
                     asyncio.ensure_future(build_forehead(st, quiet=True))
-            hair_low = torso = None
+                # 착용자가 다른 사람으로 바뀌었다(이전 사람이 화면을 떠남 - face_pose.pick_wearer): 이마 패치도
+                # 그 사람 것이라 새 착용자 얼굴에 남의 이마가 붙는다. 정면 조건 없이 바로(1초 간격) 다시 만든다.
+                if (st.forehead_name is not None and not st.forehead_building and pose is not None
+                        and pose.get("face_id") != st.forehead_face_id
+                        and now_m - st.forehead_built_at > 1.0):
+                    st.forehead_built_at = now_m
+                    asyncio.ensure_future(build_forehead(st, quiet=True))
+                # 아직 패치가 없다: /offer 로 헤어를 받아 첫 프레임 전에 그룸이 걸렸거나(그때 _set_groom 의
+                # build_forehead 는 프레임이 없어 그냥 돌아간다) 얼굴을 못 찾았다. 얼굴이 보이면 1초 간격으로 다시.
+                if (st.forehead_name is None and not st.forehead_building and pose is not None
+                        and now_m - st.forehead_built_at > 1.0):
+                    st.forehead_built_at = now_m
+                    asyncio.ensure_future(build_forehead(st))
+            hair_low = torso = lh_m = lh_ref = None
             if st.groom_obj is not None and st.mode == "tryon" and cfg.long_hair_seg_hz > 0:
-                hair_low, torso = self._long_hair_mask(st, img, cfg, pose)
+                hair_low, torso, lh_m, lh_ref = self._long_hair_mask(st, img, cfg, pose)
             processed, timings = await loop.run_in_executor(
                 app.gpu_executor, seg.process, img, st.plate, st.mode,
                 asset, st.scale_mul, st.offset_up, pose, st.harmonize, st.shadow,
                 st.blend, asset2, mix, st.smoother,
                 st.groom_obj, groom_fit, st.groom_color, groom_dyn,
                 pose_cf, (st.hair_dyn, st.dyn_amount, dyn_dt) if dyn_dt is not None else None, hair_low,
-                torso)
+                st.hair_off, torso, lh_m, lh_ref)
         finally:
             st.inflight -= 1
             app.gpu_inflight -= 1
@@ -983,6 +1015,21 @@ class SegmentedVideoTrack(VideoStreamTrack):
         self._last_out = processed
         self._last_i420 = i420
         return processed
+
+
+def _motion_warp(then_eyes, pose):
+    """지금 프레임 좌표 -> 긴 머리 마스크/torso_net 을 만든 (몇 프레임 전) 프레임 좌표. 2x3, 모르면 None.
+
+    그 작업은 셀피 분할 + torso_net 이라 ~0.2초 걸리고 3Hz 로 돌아, 쓰는 결과가 최대 ~0.5초 전 프레임 것이다.
+    그대로 쓰면 움직일 때 예전 머리 자리를 지우고 예전 어깨/배경 패치를 붙여 머리 뒤에 잔상이 남았다(사용자
+    피드백). 두 프레임의 두 눈 가운데 차이만큼 옮긴다 - 이동만: 눈 간격은 고개를 돌리면(cos yaw) 줄어 크기
+    추정이 틀리고, 고개 기울임은 어깨와 상관없어 회전도 뺀다."""
+    if then_eyes is None or pose is None or pose.get("eye_l") is None or pose.get("eye_r") is None:
+        return None
+    (l0, r0), l1, r1 = then_eyes[:2], pose["eye_l"], pose["eye_r"]
+    dx = 0.5 * (float(l0[0]) + float(r0[0])) - 0.5 * (float(l1[0]) + float(r1[0]))
+    dy = 0.5 * (float(l0[1]) + float(r0[1])) - 0.5 * (float(l1[1]) + float(r1[1]))
+    return np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], np.float32)
 
 
 def _asset_label(asset, asset2, mix):
@@ -1897,6 +1944,21 @@ def list_grooms():
     return out
 
 
+def _resolve_groom(value):
+    """요청의 헤어스타일 -> 그룸 이름, 없으면 None. 이름("crop-cut") 또는 json 표시명("크롭컷"), 공백·대소문자 무시."""
+    if not isinstance(value, str):
+        return None
+    key = value.strip()
+    grooms = list_grooms()
+    if key in grooms:
+        return key
+    norm = key.replace(" ", "").lower()
+    for name, meta in grooms.items():
+        if norm in (name.lower(), str(meta.get("label", "")).replace(" ", "").lower()):
+            return name
+    return None
+
+
 async def grooms_list(request):
     """hair3d.html 드롭다운용. 클라이언트에 필요한 것만 추린다(source_ply 같은 로컬 경로는 뺌)."""
     items = []
@@ -1986,11 +2048,15 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         # (gpu_executor 에 6ms 작업을 끼워 넣지 않음), 랜드마크는 forehead_executor 에서 IMAGE
         # 모드로 - pose_executor 를 쓰면 그 사이 프레임의 포즈 대기가 25ms 까지 늘어난다.
         from face_pose import landmarks_image
+        # 화면에 여럿이면 실시간 경로가 헤어를 씌우는 사람(착용자)의 이마를 만든다
+        cur = getattr(state.track, "_last_pose", None) if state.track is not None else None
+        near = cur["face_box"][:2] if cur is not None and cur.get("face_box") is not None else None
+        face_id = cur.get("face_id") if cur is not None else None
 
         def _parse_and_landmarks(frame, cls_t):
             frame = frame.copy()
             cls = cls_t.cpu().numpy() if cls_t is not None else seg.class_map(frame)
-            return frame, cls, landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            return frame, cls, landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), near)
 
         # 세그멘터는 세션 공용이라 마지막 클래스맵이 **이 세션의** 프레임인지 확인한다(객체 동일성).
         # 다른 세션 프레임이면 파싱을 다시 한다(gpu_executor - 드문 경우라 비용 무시).
@@ -2000,7 +2066,7 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
             cls_np = await loop.run_in_executor(app.gpu_executor, seg.class_map, frame)
             frame, cls, lm = await loop.run_in_executor(
                 app.forehead_executor, lambda: (frame.copy(), cls_np,
-                                                landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))))
+                                                landmarks_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), near)))
         else:
             frame, cls, lm = await loop.run_in_executor(app.forehead_executor, _parse_and_landmarks, frame, cls_t)
         if lm is None:
@@ -2024,6 +2090,7 @@ async def build_forehead(state: "SessionState", force: bool = False, quiet: bool
         state.registry.add(asset)
         await loop.run_in_executor(app.gpu_executor, seg.warm_asset, asset)
         state.forehead_name = name
+        state.forehead_face_id = face_id
         state.forehead_built_at = time.monotonic()
         state.forehead_fade_at = state.forehead_built_at
         if stale:
@@ -2406,6 +2473,40 @@ def _log_negotiated_codec(sdp: str, sid: str) -> None:
 _FORWARDED_HEADER = "X-Heddy-Forwarded"
 
 
+def _offer_reachable_from_remote(body: bytes) -> bool:
+    """원격(학교 서버)이 이 offer 의 후보 중 하나라도 닿을 수 있는가.
+
+    학교 서버는 도커 사설 주소(172.17.x) + 이 PC TURN 릴레이로만 나간다. 그래서
+    상대 후보에 공인 주소(srflx/relay, 또는 공인 IPv4 host)가 있어야 붙는다.
+    실제 사례: 시연용 폰(SM-S906N)이 LTE(464XLAT)에서 host 192.0.0.2 + IPv6 만
+    싣고 srflx 를 안 실었다. 이 PC 는 공인 IP 라 폰의 체크가 들어와(prflx) 붙지만
+    학교로 넘기면 상대가 없어 30초 뒤 ICE failed - 앱에선 타임아웃으로 보였다.
+    본문을 못 읽으면 판단하지 않고 넘긴다(True).
+    """
+    import ipaddress
+
+    try:
+        sdp = json.loads(body).get("sdp") or ""
+    except (ValueError, AttributeError):
+        return True
+    for line in sdp.splitlines():
+        if not line.startswith("a=candidate:"):
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        addr, typ = parts[4], parts[7]
+        if typ in ("srflx", "relay"):
+            return True
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:          # mDNS(.local) 이름
+            continue
+        if ip.version == 4 and ip.is_global:
+            return True
+    return False
+
+
 async def _forward_offer(app, body: bytes, user_agent: str):
     """꽉 찼을 때 cfg.remote_backends 를 순서대로 시도한다.
 
@@ -2447,6 +2548,11 @@ async def offer(request):
     # 30fps 가 무너진다. 조용히 전부 느려지는 것보다 명시적으로 거절하는 편이
     # 낫다 - 거절당한 쪽은 이유를 알고 나중에 다시 오면 된다.
     can_forward = cfg.remote_backends and not request.headers.get(_FORWARDED_HEADER)
+    if can_forward and not _offer_reachable_from_remote(await request.read()):
+        # 넘기면 30초 ICE 실패 확정이고 그동안 원격 슬롯까지 잡는다. 꽉 찼으면 바로 503.
+        logger.info("offer 에 공인 후보(srflx) 가 없어 원격으로 넘기지 않음 (UA=%s)",
+                    request.headers.get("User-Agent", "?"))
+        can_forward = False
     # prefer_remote: 원격(학교 서버)부터. 못 받으면 아래로 내려와 이 서버가 받는다.
     # 400(bad_offer) 도 그대로 돌려준다 - 같은 본문이면 여기서도 400 이다.
     if can_forward and cfg.prefer_remote and len(app.sessions) < cfg.max_sessions:
@@ -2521,6 +2627,18 @@ async def offer(request):
     app.sessions.add(state)
     app.metrics.sessions_total += 1
     logger.info("세션 시작 %s (활성 %d/%d)", state.sid, len(app.sessions), cfg.max_sessions)
+    # 앱의 'AR 로 체험하기': 고른 헤어스타일을 offer 에 실으면 연결 직후부터 그 헤어로 내보낸다
+    # (DataChannel 로 fit 을 따로 보낼 필요 없음). 이름("crop-cut") 또는 표시명("크롭컷").
+    groom_req = params.get("groom") or params.get("hairstyle")
+    groom_name = _resolve_groom(groom_req) if groom_req else None
+    if groom_req:
+        if groom_name is None:
+            logger.warning("offer 의 헤어스타일을 찾을 수 없음: %r (%s)", groom_req, state.sid)
+        else:
+            logger.info("offer 헤어스타일 %r -> %s (%s)", groom_req, groom_name, state.sid)
+            if params.get("groom_color"):
+                state.groom_color = _parse_bgr(params["groom_color"])
+            asyncio.ensure_future(_set_groom(state, groom_name))
 
     def _teardown():
         """세션 자원 해제 + 집합에서 제거. 어느 경로로 들어와도 한 번만 돈다."""
@@ -2528,9 +2646,22 @@ async def offer(request):
         app.sessions.discard(state)
         app.pcs.discard(pc)
 
+    t_offer = time.monotonic()
+
+    async def _connect_deadline():
+        await asyncio.sleep(cfg.connect_deadline_s)
+        if pc.connectionState in ("new", "connecting"):
+            logger.warning("세션 %s: %.0f초 안에 연결되지 않아 닫음 (상대가 ICE 체크를 안 보냄?)",
+                           state.sid, cfg.connect_deadline_s)
+            _teardown()
+            await pc.close()
+
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
         logger.info("connection state: %s (%s)", pc.connectionState, state.sid)
+        if pc.connectionState == "connected":
+            # connect_deadline_s 를 정할 근거 - 정상 세션이 붙기까지 실제로 몇 초 걸리는지.
+            logger.info("세션 %s 연결까지 %.1f초", state.sid, time.monotonic() - t_offer)
         if pc.connectionState in ("failed", "closed"):
             _teardown()
             await pc.close()
@@ -2602,6 +2733,8 @@ async def offer(request):
                     asyncio.ensure_future(build_forehead(state, force=True))
                 if "dyn" in data:
                     state.dyn_amount = max(0.0, min(2.0, float(data["dyn"])))
+                if "hair_off" in data:
+                    state.hair_off = bool(data["hair_off"])
                 if "groom_fwd" in data:
                     state.groom_fwd_cm = max(-15.0, min(15.0, float(data["groom_fwd"])))
                 if "groom_color" in data:
@@ -2651,10 +2784,14 @@ async def offer(request):
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     _log_negotiated_codec(pc.localDescription.sdp, state.sid)
+    if cfg.connect_deadline_s > 0:
+        asyncio.ensure_future(_connect_deadline())
 
     return web.json_response({
         "sdp": pc.localDescription.sdp,
         "type": pc.localDescription.type,
+        # offer 로 받은 헤어스타일을 무엇으로 걸었는지 (못 찾았거나 안 실었으면 null)
+        "groom": groom_name,
     })
 
 
@@ -2882,6 +3019,8 @@ async def _warm_gan(state: AppState):
 
 
 def main():
+    if CONFIG.gil_switch_ms > 0:
+        sys.setswitchinterval(CONFIG.gil_switch_ms / 1000.0)   # config.gil_switch_ms 주석
     # argparse 기본값을 CONFIG 에서 가져온다. CONFIG 는 이미 HEDDY_* 환경변수로
     # 덮어써져 있으므로 우선순위가 자동으로 명령행 > 환경변수 > 기본값이 된다.
     parser = argparse.ArgumentParser()
@@ -2910,7 +3049,7 @@ def main():
 
     self_ctx = _tls_ctx(CONFIG.tls_cert, CONFIG.tls_key)
     ts_ctx = _tls_ctx(CONFIG.tls_ts_cert, CONFIG.tls_ts_key)
-    ssl_ctx = self_ctx or ts_ctx
+    ssl_ctx = (self_ctx or ts_ctx) if CONFIG.tls_port > 0 else None
     if self_ctx is not None and ts_ctx is not None:
         def _sni(sock, server_name, _ctx):
             if server_name and server_name.lower().endswith(".ts.net"):

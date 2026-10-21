@@ -46,6 +46,7 @@ def main():
                     help="1: 셀피 분할 머리 마스크를 넘긴다(서버의 long_hair_seg - 옷 위 긴 머리 지우기)")
     ap.add_argument("--torso", type=int, default=1,
                     help="1: 그 지운 자리를 torso_net 으로 채운다(서버와 같은 프레임 결과, 0 이면 확산)")
+    ap.add_argument("--hair-off", action="store_true", help="3D 헤어를 얹지 않고 지운 자리만 본다")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -111,7 +112,7 @@ def main():
                 torso = lt["m"].run(img, conf6, pose["eye_l"], pose["eye_r"], pose.get("oval"), idx / 30)
         out, t = seg.process(img, plate, mode, fh_asset, 1.0, 0.0, pose, True, 0.35, 0.0,
                              None, 0.0, smoother, obj, (a.scale, a.up, a.fwd), color, dyn, hair_low=hair_low,
-                             torso=torso)
+                             hair_off=a.hair_off, torso=torso)
         return img, out, t, pose
 
     for i in range(min(a.warm, len(files))):

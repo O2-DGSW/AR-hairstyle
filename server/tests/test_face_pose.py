@@ -225,5 +225,67 @@ class TestModuleConstants(unittest.TestCase):
         self.assertEqual((fp.EYE_R_IN, fp.EYE_R_OUT), (362, 263))
 
 
+class TestPickWearer(unittest.TestCase):
+    """여러 얼굴 중 헤어를 씌울 사람 고르기 (face_pose.pick_wearer). 상자 = (x, y, 크기)."""
+
+    HOLD, JUMP, W = 1500.0, 0.6, 640
+
+    def pick(self, boxes, track, ts, **kw):
+        from face_pose import pick_wearer
+        return pick_wearer(boxes, track, ts, self.HOLD, self.JUMP, self.W, 0.5, **kw)
+
+    def test_first_pick_is_the_largest_face(self):
+        k, tr, new = self.pick([(320, 240, 80), (330, 250, 140)], None, 0)
+        self.assertEqual(k, 1)
+        self.assertTrue(new)
+
+    def test_similar_sizes_prefer_the_center(self):
+        k, _, _ = self.pick([(100, 240, 142), (350, 240, 135)], None, 0)
+        self.assertEqual(k, 1)
+
+    def test_keeps_following_the_wearer_even_if_another_face_is_bigger(self):
+        _, tr, _ = self.pick([(320, 240, 100)], None, 0)
+        k, tr, new = self.pick([(500, 240, 120), (330, 245, 100)], tr, 33)
+        self.assertEqual(k, 1)
+        self.assertFalse(new)
+
+    def test_lost_wearer_is_not_handed_to_someone_else_within_hold(self):
+        _, tr, _ = self.pick([(320, 240, 100)], None, 0)
+        k, tr, _ = self.pick([(100, 240, 100)], tr, 500)
+        self.assertIsNone(k)
+        k, _, _ = self.pick([(318, 242, 100)], tr, 900)
+        self.assertEqual(k, 0)
+
+    def test_after_hold_the_best_visible_face_takes_over(self):
+        _, tr, _ = self.pick([(320, 240, 100)], None, 0)
+        k, _, new = self.pick([(100, 240, 100)], tr, 2000)
+        self.assertEqual(k, 0)
+        self.assertTrue(new)
+
+    def test_a_clearly_better_face_takes_over_only_after_switch_ms(self):
+        # 착용자를 오래 놓쳐 옆 사람(화면 끝, 작음)으로 넘어간 뒤 가운데 큰 얼굴이 돌아왔다
+        _, tr, _ = self.pick([(60, 240, 90)], None, 0)
+        k, tr, _ = self.pick([(60, 240, 90), (320, 240, 130)], tr, 33, switch_ratio=1.3, switch_ms=700)
+        self.assertEqual(k, 0)
+        k, tr, _ = self.pick([(60, 240, 90), (320, 240, 130)], tr, 600, switch_ratio=1.3, switch_ms=700)
+        self.assertEqual(k, 0)
+        k, _, new = self.pick([(60, 240, 90), (320, 240, 130)], tr, 760, switch_ratio=1.3, switch_ms=700)
+        self.assertEqual(k, 1)
+        self.assertTrue(new)
+
+    def test_challenger_timer_resets_when_it_disappears(self):
+        _, tr, _ = self.pick([(60, 240, 90)], None, 0)
+        _, tr, _ = self.pick([(60, 240, 90), (320, 240, 130)], tr, 33)
+        _, tr, _ = self.pick([(60, 240, 90)], tr, 400)
+        k, _, _ = self.pick([(60, 240, 90), (320, 240, 130)], tr, 800)
+        self.assertEqual(k, 0)
+
+    def test_no_faces(self):
+        k, tr, new = self.pick([], None, 0)
+        self.assertIsNone(k)
+        self.assertIsNone(tr)
+        self.assertFalse(new)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,7 @@ class Config:
     #: (SNI 없음) 위 자체서명. 받기/갱신: server/tls/renew_ts_cert.sh (90일 만료)
     tls_ts_cert: str = os.path.join(ROOT, "tls", "ts.crt")
     tls_ts_key: str = os.path.join(ROOT, "tls", "ts.key")
+    #: 0 이면 HTTPS 를 안 연다(같은 PC 의 세션별 자식 서버 - 부모만 바깥을 받는다).
     tls_port: int = 8443
     #: 다른 출처에서 이 서버를 부를 수 있는 출처(포트 무시). 웹뷰 앱(Capacitor) 의 페이지 출처는
     #: capacitor://localhost 라 시그널링/참고사진 요청이 전부 교차 출처다 - 없으면 OPTIONS 사전
@@ -72,6 +73,10 @@ class Config:
     prefer_remote: bool = False
     #: 원격 /offer 한 번의 제한 시간(초). ICE 수집(STUN)까지 기다리므로 너무 짧으면 안 된다.
     remote_offer_timeout_s: float = 15.0
+    #: answer 를 보낸 뒤 이 시간(초) 안에 연결(connected)되지 않은 세션은 닫아 자리를 비운다. 0 이면 끔.
+    #: iOS 앱이 answer 를 받고도 ICE 체크를 안 보내고 버린 세션이 aioice 가 포기할 때까지(~30초)
+    #: 상한 슬롯을 잡아, 11~21초 뒤 앱의 재시도가 원격으로 넘쳐 또 실패하거나 503 이 났다(2026-10-21).
+    connect_deadline_s: float = 10.0
     #: WebRTC ICE 서버(쉼표 구분). 기본은 aiortc 기본값과 같은 구글 STUN - NAT 뒤 서버(학교 도커)는
     #: 이걸로 공인 주소를 알아내야 폰이 붙는다. 랜카드에 공인 IP 가 직접 붙은 서버는 STUN 결과가
     #: host 후보와 같아 쓸모가 없는데, 닿지 않는 인터페이스(Tailscale/Hyper-V/IPv6)마다 5초 타임아웃을
@@ -164,6 +169,9 @@ class Config:
     groom_roi: bool = True
     groom_roi_pad: float = 0.75
     groom_roi_hair: float = 0.02
+    #: 3D 그룸 ROI 후처리(지우기/채우기/연장/틈/속/그림자/라이트 랩)를 1/이 값 해상도로 돌린다(gpu_segmenter._lo_paste).
+    #: 1 = 원래 해상도. 2 면 1080p 에서 픽셀 1/4 - 헤어 렌더·머리색 맞춤·가닥 디테일·그레인·원본 화면은 원래 해상도.
+    groom_post_scale: int = 1
 
     # ---------- 세그멘테이션 ----------
     model_id: str = "jonathandinu/face-parsing"
@@ -240,6 +248,15 @@ class Config:
     #: 배경 플레이트 기록에서 사람(배경 아닌 것) 둘레를 빼는 폭(프레임 높이 배수). 빠르게 움직이면 번진 머리
     #: 끝을 파서가 배경으로 찍어 플레이트에 머리색이 쌓였고, 지운 자리를 채울 때 원래 머리 잔상으로 나왔다.
     plate_margin: float = 0.012
+    #: 플레이트 픽셀을 마지막으로 본 뒤 카메라가 이만큼(프레임 높이 배수) 움직이면 버린다 (0=끔). 폰을 손에 들면
+    #: 배경이 밀려 예전 위치의 배경이 지운 자리에 어긋난 잔상으로 남았다. 0.006 ≈ 1298 세로에서 8px.
+    plate_drift: float = 0.006
+    #: 지운 머리 자리를 플레이트(지난 프레임에서 본 배경)로 채우나. 끄면 torso_net(크롭 안: 얼굴 옆~가슴) + 지금
+    #: 프레임 배경/옷 확산(그 밖, body_fill 경로)만 쓴다 - 지난 프레임 정보가 없어 움직일 때 잔상이 원리상 없다.
+    #: 대신 실제로 드러났던 배경 모서리(문틀 등)는 덜 정확하다. 2026-10-20 사용자 요청으로 끔.
+    plate_fill: bool = False
+    #: 그 카메라 이동을 재는 간격(프레임). 재는 데 작은 GPU 커널 ~40개라 매 프레임은 아깝다.
+    plate_drift_every: int = 3
     #: 랜드마크 얼굴 타원 중 이 비율 넘게 '배경'으로 찍힌 프레임은 플레이트를 갱신하지 않는다(파서 실패 -
     #: 고개를 젖히면 얼굴/목이 통째로 배경으로 찍혀 얼굴 잔상이 됐다). 1 이면 끈다.
     plate_face_bg_max: float = 0.2
@@ -251,6 +268,12 @@ class Config:
     #: 이마 패치 둘레를 얼굴(지우는 자리)로 넓히는 폭 (눈 간격 배수, 0=끔). 패치가 오클루더 실루엣에서
     #: 끊긴 관자놀이의 앞머리 옆 끝을 피부톤 평면으로 이어 지운다.
     face_patch_grow: float = 0.25
+    #: 이마 패치 밖 지운 자리(패치 둘레·관자놀이·정수리)를 피부톤 평면 대신 패치 속 + 실제 피부 색의 확산으로
+    #: 채운다(gpu_segmenter). 평면은 패치와 색이 달라 이마 패치 둘레에 살색 띠가 둘러졌다.
+    face_fill_extend: bool = True
+    #: False 면 이마 패치가 있을 때 패치 자리만 얼굴(피부)로 채우고, 눈 타원 zone·패치 둘레 띠는 피부로 칠하지
+    #: 않는다(배경 플레이트로). 패치 둘레 살색 띠를 없애 본 것(사용자 요청).
+    face_fill_band: bool = False
     #: 지운 머리 자리를 채울 때 상수 살색 대신 **휘도 평면**(L=a+bx+cy)을 피팅해
     #: 그라디언트를 살린다. 실제 이마는 중앙이 밝고 관자놀이로 어두워지는데
     #: 상수로 덮으면 스티커처럼 보인다. 0 이면 예전 상수 살색.
@@ -286,6 +309,23 @@ class Config:
     #: 이 프레임 포즈가 없을 때(타임아웃/얼굴 놓침) 직전 포즈를 그대로 쓰지 않고, 분할 얼굴 위치가 그 포즈를
     #: 잰 프레임에서 지금까지 움직인 만큼 옮겨 쓴다(gpu_segmenter._reanchor_pose). 끄면 예전처럼 그대로.
     pose_reanchor: bool = True
+    #: 랜드마커가 찾을 최대 얼굴 수. 2 이상이면 화면에 여럿일 때 가장 큰 얼굴을 착용자로 잡아 계속 따라간다
+    #: (face_pose.pick_wearer). 1 이면 예전처럼 랜드마커가 잡은 아무 얼굴 하나 - 옆 사람에게 씌울 수 있다.
+    max_faces: int = 2
+    #: 착용자를 이 시간(ms) 넘게 못 보면 그때 보이는 가장 큰 얼굴로 넘긴다. 그 전엔 옆 사람에게 안 넘긴다.
+    wearer_hold_ms: float = 1500.0
+    #: 직전 착용자 얼굴 중심에서 (얼굴 크기 x 이 값) 안의 얼굴만 같은 사람으로 본다.
+    wearer_max_jump: float = 0.6
+    #: 처음 착용자를 고를 때 화면 가운데를 얼마나 우대할지. 얼굴 크기에 (1 - 이 값 x 가운데에서 벗어난 정도 0~1)
+    #: 를 곱해 비교한다 - 크기가 비슷한 두 사람이면 가운데 사람.
+    wearer_center_weight: float = 0.5
+    #: 그 점수가 착용자의 이 배수를 넘는 얼굴이 wearer_switch_ms 동안 계속 보이면 착용자를 넘긴다.
+    wearer_switch_ratio: float = 1.3
+    wearer_switch_ms: float = 700.0
+    #: 착용자 머리만 지운다(gpu_segmenter._owner_mask). 끄면 화면 안 모든 머리가 지울 대상(예전 동작).
+    owner_mask: bool = True
+    #: 착용자 몸 덩어리를 이을 때 메우는 틈 (눈 간격 배수). 머리카락 사이/머리-어깨 사이 작은 배경 틈.
+    owner_gap: float = 0.3
     #: 진단용으로 되살리려면 HEDDY_SERVE_STATIC_ASSETS=1.
     serve_static_assets: bool = False
 
@@ -328,6 +368,13 @@ class Config:
     #: 기존 머리를 지울 때 눈 위에 살색을 안 칠하는 보호(erase 쪽)는 이 값과 무관하게 그대로다.
     groom_protect_eyes: float = 0.0
     groom_volume: float = 0.6
+    #: 앞머리 붙이기 (groom_renderer._hug_front, 그룸 로드 때 1회): 얼굴 앞쪽(방위 ±40°, ±70° 에서 0)
+    #: 가닥 점이 두상 표면에서 groom_front_hug_cm 넘게 뜬 만큼을 이 배율로 줄인다(1=끔). 정면 사진 한 장
+    #: 재구성이라 앞머리가 이마에서 2.5~4.7cm 떠 옆모습에서 차양처럼 길게 뻗었다(사용자 피드백 dandy-cut).
+    #: y = (이 높이 아래 0 - 2cm 램프, 이 높이까지 전부, 이 높이에서 0) 정규 cm. 정수리 볼륨(포마드)은 그대로.
+    groom_front_hug: float = 0.3
+    groom_front_hug_cm: float = 0.6
+    groom_front_hug_y: tuple[float, ...] = (-1.0, 9.0, 12.0)
     #: 그룸 자동 맞춤 (gpu_segmenter._update_autofit): 정면 포즈에서 얼굴 랜드마크와 그룸 두상의 대응점으로
     #: 가로/세로 배율과 이마 높이를 사용자에게 맞춘다. range 는 배율 한계, alpha 는 프레임당 EMA.
     #: 헤어 안쪽과 얼굴 사이에 끼인 틈(뒤 배경이 비침)을 헤어 그늘색으로 메우는 세기(0=끔). k 는 메울 수
@@ -339,11 +386,25 @@ class Config:
     groom_autofit: bool = True
     #: 그룸 렌더 결과를 머리 둘레 사각형만 GL 에서 읽는다(groom_renderer._read_rect). 끄면 전체 프레임.
     groom_read_crop: bool = True
+    #: GL 렌더 결과(헤어 색/두상 좌표/얼굴 위치·노멀)를 CUDA-GL interop 로 GPU 안에서 바로 가져온다(groom_renderer._GLCuda).
+    #: 끄거나 실패하면 예전처럼 CPU 로 읽어 다시 올린다 - 1080p 에서 프레임당 ~7ms(그리기 1.4ms 의 5배).
+    groom_gl_interop: bool = True
+    #: 그룸 후처리의 원소별 식 묶음을 torch.compile(Triton)로 합친다(fused.py). 기동 때 수 초 컴파일.
+    #: 끄거나 컴파일이 안 되면(triton/컴파일러 없음) 같은 식을 eager 로 돈다. 기본 끔: 실측 이득 2~4ms 뿐이고
+    #: 텐서 모양/메모리 배치가 바뀔 때 세션 중 재컴파일(수백 ms 멈춤)이 아직 남아 있다(2026-10-20).
+    fused_compile: bool = False
     groom_autofit_max_yaw: float = 15.0
     groom_autofit_max_pitch: float = 15.0
     groom_autofit_range: tuple[float, ...] = (0.75, 1.35)
     groom_autofit_max_up_cm: float = 4.0
     groom_autofit_alpha: float = 0.1
+    #: 깊이 맞춤(gpu_segmenter._update_autofit_depth): 이 yaw(도) 구간의 옆모습에서 두상 깊이 배율 sz 와 앞뒤
+    #: 오프셋(cm)을 랜드마크에 맞춘다. 정면 맞춤은 깊이를 못 봐 옆모습에서 헤어가 얼굴 앞으로 떴다.
+    #: sz/fz 는 (하한, 상한).
+    groom_autofit_depth: bool = True
+    groom_autofit_depth_yaw: tuple[float, ...] = (18.0, 55.0)
+    groom_autofit_depth_sz: tuple[float, ...] = (0.8, 1.4)
+    groom_autofit_depth_fz: tuple[float, ...] = (-3.0, 2.0)
     #: 두상 정규 좌표 y(cm, 두상 중심 기준 +위) 가 이보다 위면 두피 - 얼굴면/피부 채움에서 뺀다.
     groom_face_top_cm: float = 5.0
     groom_volume_y0: float = -1.0
@@ -374,7 +435,12 @@ class Config:
     groom_body_k: float = 0.25
     groom_body_lohi: tuple[float, ...] = (0.30, 0.55)
     #: 카메라 선명도 맞춤 흐림 σ(px, 눈 간격 60px 기준). 가닥 디더 노이즈(뜨개실 느낌)를 누른다. 0=끔.
-    groom_soften: float = 0.7
+    #: 0.7 은 헤어 고주파가 실제 머리의 절반(실측 σ 2.0 vs 3.9~4.6, 피부 4~6)이라 화면에서 가장 매끈한 층이 돼
+    #: "3D 모델 위에 뭔가 씌운 느낌"(사용자 피드백) + 윤곽 회색 번짐이 났다. 0.3 이 3.6 으로 실제 머리에 가깝다.
+    groom_soften: float = 0.3
+    #: 진단용: 3D 헤어 후처리 층(두피/몸통 채움·흐림·연장·틈 메우기·속 채움·페더·그림자·라이트 랩·그레인)을 전부
+    #: 끄고 렌더+색 맞춤만 얹는다. 원래 머리 지우기와 이마 인페인팅은 그대로. HEDDY_GROOM_BARE=1
+    groom_bare: bool = False
     #: 라이트 랩 세기(0=끔): 헤어 가장자리에 뒤 장면 색을 섞는다.
     groom_light_wrap: float = 0.35
     #: 두피/몸통 베이스 밝기 배율(뿌리/안쪽 결은 가닥 그늘에 있어 더 어둡다).
@@ -396,8 +462,15 @@ class Config:
     long_hair_seg_hz: float = 3.0
     #: 그 마스크가 이 시간(초)보다 오래되면 안 쓴다.
     long_hair_seg_max_age: float = 1.0
+    #: 늦은 긴 머리 마스크/torso_net 결과를 두 눈 이동만큼 옮겨 쓴다(server._motion_warp). 고개 돌리기에서 역효과라 기본 끔.
+    long_hair_motion_comp: bool = False
     #: 늦게 온 마스크를 움직임만큼 팽창하는 폭 (프레임 높이 배수).
     long_hair_grow: float = 0.015
+    #: 그 마스크를 만든 프레임과 지금 프레임의 색 차이(1/8 해상도, 밝기 정규화, 0~255)가 (lo, hi) 사이에서 커지는
+    #: 만큼 '배경' 자리에서는 마스크를 버린다. 머리가 떠나 벽이 드러난 자리를 묵은 마스크가 지우고 확산색으로 칠해
+    #: 머리 뒤에 흐린 덩어리 잔상이 따라다녔다(짧은 머리에서도 - 셀피 분할은 머리 전체를 찍는다). 옷/목 위는 그대로.
+    #: hi <= lo 면 끈다.
+    long_hair_stale_diff: tuple[float, ...] = (10.0, 25.0)
     #: 긴 머리 지운 자리 중 플레이트가 못 본 곳을 학습 인페인터(torso_net, models/torso_net.pt)로 채운다. 긴 머리
     #: 분할과 같은 백그라운드 작업에서 같은 프레임으로 돈다(포즈 + 넷, CPU ~70ms + GPU ~10ms). 가중치가 없거나
     #: 실패하면 위 확산 그대로. HEDDY_TORSO_NET=0 으로 끈다.
@@ -637,9 +710,17 @@ class Config:
     log_every: int = 31
     #: 학습 데이터 수집 시 이 프레임 수마다 한 장씩 저장.
     rec_every: int = 5
-    #: GPU 워커 대기열이 이만큼 밀려 있으면 새 프레임을 버린다(최신 우선).
-    #: 버퍼는 지연을 줄이지 못한다 - 밀린 프레임을 계속 처리하면 지연만 누적된다.
-    max_inflight_frames: int = 1
+    #: GPU 워커 대기열이 전 세션 합쳐 이만큼 밀려 있으면 새 프레임을 버린다(최신 우선).
+    #: 세션 하나는 늘 1장까지만 - 버퍼는 지연을 줄이지 못한다(밀린 프레임을 계속 처리하면 지연만 누적).
+    #: 예전 1 은 "GPU 에 다른 세션 프레임이 있으면 버림"이라, 2세션 1080p 에서 GPU 40%·CPU 32% 인데
+    #: 세션당 새 프레임이 10.8/7.3fps(3세션 2.0/2.8/13.3)로 무너지고 차례를 못 받은 세션만 굶었다(실측).
+    #: 세션 수 이상이면 각 세션이 1장씩 줄을 서서 gpu_executor 가 차례로 처리한다.
+    max_inflight_frames: int = 4
+    #: 파이썬 GIL 을 스레드 사이에 넘기는 주기(ms, sys.setswitchinterval). 0 이면 파이썬 기본(5ms).
+    #: 합성(gpu_executor)은 프레임당 커널 ~2,400개를 파이썬에서 내는데, aiortc 루프·포즈·디코더 스레드가 GIL 을
+    #: 잡으면 매번 최대 5ms 씩 기다린다. 1080p 그룸 합성 49ms 가 40% 바쁜 파이썬 스레드 1개 옆에서 58ms,
+    #: 2개 옆에서 112ms 였고, 0.2ms 로 줄이면 51/54ms 였다(오프라인 실측). 서버 안 75ms vs 밖 52ms 의 주원인.
+    gil_switch_ms: float = 0.2
     #: 이번 프레임을 인코딩하는 동안 다음 프레임을 미리 합성한다(server.SegmentedVideoTrack.recv).
     #: 끄면 예전처럼 받기 -> 합성 -> 인코딩이 한 줄로 이어진다.
     pipeline_frames: bool = True
